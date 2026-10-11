@@ -2,6 +2,7 @@
 
 #include "gx_fmt.hpp"
 #include "texture.hpp"
+#include "../gfx/backend.hpp"
 
 #include <bit>
 #include <cmath>
@@ -12,8 +13,8 @@ constexpr Module Log{"aurora::gx::fifo"};
 
 struct RegHandler {
   using Fn = void (*)(u8 reg, u32 value) noexcept;
-  Fn decode = nullptr; // if null: no decoded state, shadow only
-  u8 dirty = 0;
+  Fn decode = nullptr;       // if null: no decoded state, shadow only
+  u16 dirty = 0;             // U16, see DirtyFlag
   bool alwaysHandle = false; // handler has side effects (e.g. EFB copy trigger, stub logging)
 };
 
@@ -508,6 +509,7 @@ void bp_unhandled(u8 reg, u32 value) noexcept {
 #endif
 }
 
+// A register feeding the uniforms dirties its uniform piece (DirtyFlag), not the whole block.
 constexpr auto kBpRegs = [] {
   std::array<RegHandler, 0x100> regs{};
   for (auto& reg : regs) {
@@ -515,7 +517,7 @@ constexpr auto kBpRegs = [] {
   }
   regs[0x00] = {bp_gen_mode, DirtyPipeline};
   for (u8 r = 0x06; r <= 0x0E; ++r) {
-    regs[r] = {bp_ind_mtx, DirtyUniform};
+    regs[r] = {bp_ind_mtx, DirtyView};
   }
   regs[0x0F] = {}; // Indirect texture map mask
   for (u8 r = 0x10; r <= 0x1F; ++r) {
@@ -523,7 +525,7 @@ constexpr auto kBpRegs = [] {
   }
   regs[0x20] = {bp_scissor};
   regs[0x21] = {bp_scissor};
-  regs[0x22] = {bp_line_point_size, DirtyUniform};
+  regs[0x22] = {bp_line_point_size}; // Line and point draws push the view piece
   regs[0x25] = {bp_ind_scale, DirtyPipeline};
   regs[0x26] = {bp_ind_scale, DirtyPipeline};
   regs[0x27] = {bp_ind_ref, DirtyPipeline};
@@ -531,7 +533,7 @@ constexpr auto kBpRegs = [] {
     regs[r] = {bp_tref, DirtyPipeline};
   }
   for (u8 r = 0x30; r <= 0x3F; ++r) {
-    regs[r] = {bp_su_scale, DirtyUniform};
+    regs[r] = {bp_su_scale, DirtyMaterial}; // Line and point draws push the line offsets
   }
   regs[0x40] = {bp_z_mode, DirtyPipeline};
   regs[0x41] = {bp_cmode0, DirtyPipeline};
@@ -559,17 +561,17 @@ constexpr auto kBpRegs = [] {
     regs[r + 1] = {bp_tev_alpha, DirtyPipeline};
   }
   for (u8 r = 0xE0; r <= 0xE7; ++r) {
-    regs[r] = {bp_tev_reg, DirtyUniform};
+    regs[r] = {bp_tev_reg, DirtyMaterial};
   }
-  regs[0xE8] = {bp_fog_range_base, DirtyUniform};
+  regs[0xE8] = {bp_fog_range_base, DirtyView};
   for (u8 r = 0xE9; r <= 0xED; ++r) {
-    regs[r] = {bp_fog_range_k, DirtyUniform};
+    regs[r] = {bp_fog_range_k, DirtyView};
   }
-  regs[0xEE] = {bp_fog0, DirtyUniform};
-  regs[0xEF] = {bp_fog1, DirtyUniform};
-  regs[0xF0] = {bp_fog2, DirtyUniform};
-  regs[0xF1] = {bp_fog3, DirtyPipeline | DirtyUniform}; // fog.type affects shader
-  regs[0xF2] = {bp_fog_color, DirtyUniform};
+  regs[0xEE] = {bp_fog0, DirtyView};
+  regs[0xEF] = {bp_fog1, DirtyView};
+  regs[0xF0] = {bp_fog2, DirtyView};
+  regs[0xF1] = {bp_fog3, DirtyPipeline | DirtyView}; // fog.type affects shader
+  regs[0xF2] = {bp_fog_color, DirtyView};
   regs[0xF3] = {bp_alpha_compare, DirtyPipeline};
   for (u8 r = 0xF6; r <= 0xFD; ++r) {
     regs[r] = {bp_ksel, DirtyPipeline};
@@ -743,6 +745,7 @@ void xf_chan_ctrl(u8 reg, u32 value) noexcept {
   bool bit9 = reg_get(value, 1, 9) != 0;
   bool bit10 = reg_get(value, 1, 10) != 0;
   u32 lightsHi = reg_get(value, 4, 11);
+  chan.lightMask = lightsLo | (lightsHi << 4); // In the shader key as well as the uniform
   if (!bit10) {
     chan.attnFn = GX_AF_SPEC;
   } else if (!bit9) {
@@ -750,7 +753,12 @@ void xf_chan_ctrl(u8 reg, u32 value) noexcept {
   } else {
     chan.attnFn = GX_AF_SPOT;
   }
-  g_gxState.colorChannelState[chanId].lightMask = GX::LightMask{lightsLo | (lightsHi << 4)};
+  // The WGSL reads the light masks from the lights piece, so a new mask dirties it.
+  const GX::LightMask lightMask{lightsLo | (lightsHi << 4)};
+  if (g_gxState.colorChannelState[chanId].lightMask != lightMask) {
+    g_gxState.dirty |= DirtyLights;
+  }
+  g_gxState.colorChannelState[chanId].lightMask = lightMask;
 }
 
 // Matrix index A (0x18)
@@ -830,6 +838,7 @@ void xf_unhandled(u8 reg, u32 value) noexcept {
 #endif
 }
 
+// A register feeding the uniforms dirties its uniform piece (DirtyFlag), not the whole block.
 constexpr auto kXfRegs = [] {
   std::array<RegHandler, XfRegCount> regs{};
   for (auto& reg : regs) {
@@ -838,11 +847,11 @@ constexpr auto kXfRegs = [] {
   regs[0x08] = {}; // vertex specs (numColors/numNormals/numTexCoords)
   regs[0x09] = {xf_num_chans};
   for (u8 r = 0x0A; r <= 0x0D; ++r) {
-    regs[r] = {xf_chan_color, DirtyUniform};
+    regs[r] = {xf_chan_color, DirtyView};
   }
   for (u8 r = 0x0E; r <= 0x11; ++r) {
     // Writes both the channel config (shader) and the light mask (uniform)
-    regs[r] = {xf_chan_ctrl, DirtyPipeline | DirtyUniform};
+    regs[r] = {xf_chan_ctrl, DirtyPipeline};
   }
   regs[0x18] = {xf_mtx_index_a, DirtyImmediates};
   regs[0x19] = {xf_mtx_index_b, DirtyPipeline};
@@ -924,7 +933,7 @@ void xf_load_projection(const u8* data) noexcept {
     proj.m1[2] = p3;
     proj.m3[2] = -1.0f;
   }
-  g_gxState.dirty |= DirtyUniform;
+  g_gxState.dirty |= DirtyView;
 }
 
 // Compare raw bits instead of floats
@@ -993,7 +1002,7 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
       changed |= store_xf_f32(flat[i], read_bits<u32>(data + i * 4, e));
     }
     if (changed) {
-      g_gxState.dirty |= DirtyUniform;
+      g_gxState.dirty |= DirtyPosMtx;
     }
     return true;
   }
@@ -1012,12 +1021,24 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
       changed |= store_xf_f32(flat[i], read_bits<u32>(data + i * 4, e));
     }
     if (changed) {
-      g_gxState.dirty |= DirtyUniform;
+      g_gxState.dirty |= DirtyView;
+    }
+    // Rows from 30 are also position matrix slots past the tenth when MaxPnMtx allows them.
+    const u32 pnIdx = addr / 12;
+    if (len == 12 && pnIdx < MaxPnMtx) {
+      f32* pnFlat = reinterpret_cast<f32*>(&g_gxState.pnMtx[pnIdx].pos);
+      bool mirrored = false;
+      for (u32 i = 0; i < len; i++) {
+        mirrored |= store_xf_f32(pnFlat[i], read_bits<u32>(data + i * 4, e));
+      }
+      if (mirrored) {
+        g_gxState.dirty |= DirtyPosMtx;
+      }
     }
     return true;
   }
-  if (addr >= 0x400 && addr < 0x45A) {
-    // Normal matrices (0x400-0x459)
+  if (addr >= 0x400 && addr < 0x400 + MaxPnMtx * 9) {
+    // Normal matrices (0x400-0x459 for the SDK's ten)
     u32 nrmBase = addr - 0x400;
     u32 mtxIdx = nrmBase / 9;
     u32 startOffset = nrmBase % 9;
@@ -1032,7 +1053,7 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
       changed |= store_xf_f32(flat[row * 4 + col], read_bits<u32>(data + i * 4, e));
     }
     if (changed) {
-      g_gxState.dirty |= DirtyUniform;
+      g_gxState.dirty |= DirtyNrmMtx;
     }
     return true;
   }
@@ -1049,7 +1070,7 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
       changed |= store_xf_f32(flat[i], read_bits<u32>(data + i * 4, e));
     }
     if (changed) {
-      g_gxState.dirty |= DirtyUniform;
+      g_gxState.dirty |= DirtyView;
     }
     return true;
   }
@@ -1116,7 +1137,16 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
       }
     }
     if (changed) {
-      g_gxState.dirty |= DirtyUniform;
+      g_gxState.dirty |= DirtyLights;
+    }
+    if (changed && gfx::backend::limits().unitLightTerms) {
+      // A light whose spot or distance coefficients become, or stop being, (1, 0, 0) changes its programs.
+      const auto unit = [](const Vec4<float>& v) { return v[0] == 1.f && v[1] == 0.f && v[2] == 0.f; };
+      const u8 terms = (unit(light.cosAtt) ? 1 : 0) | (unit(light.distAtt) ? 2 : 0);
+      if (g_gxState.unitLightTerms[lightIdx] != terms) {
+        g_gxState.unitLightTerms[lightIdx] = terms;
+        g_gxState.dirty |= DirtyPipeline;
+      }
     }
     return true;
   }

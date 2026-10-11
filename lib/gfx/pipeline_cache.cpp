@@ -1,6 +1,7 @@
 #include "pipeline_cache.hpp"
 
 #include "clear.hpp"
+#include "frame.hpp"
 #include "frame_packet.hpp"
 #include "resources.hpp"
 #include "hash.hpp"
@@ -8,9 +9,10 @@
 #include "../io.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
+// RmlUi draws only with Dawn.
+#include "../webgpu/backend.hpp"
 #endif
 #include "../sqlite_utils.hpp"
-#include "../webgpu/gpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +26,7 @@
 #include <ranges>
 #include <variant>
 #include <thread>
+#include <vector>
 
 #include <SDL3/SDL_iostream.h>
 #include <absl/container/flat_hash_map.h>
@@ -80,7 +83,7 @@ constexpr size_t BuildPipelinesPerFrame = 5;
 #else
 constexpr size_t BuildPipelinesPerFrame = 1;
 #endif
-static std::thread g_pipelineThread;
+static std::vector<std::thread> g_pipelineThreads;
 static std::atomic_bool g_pipelineThreadEnd = false;
 static std::condition_variable g_pipelineQueueCv;
 static std::condition_variable g_pipelineReadyCv;
@@ -331,8 +334,8 @@ static bool register_sdl_vfs() {
 }
 
 #if defined(__cpp_lib_atomic_ref)
-static std::atomic_ref queuedPipelines{detail::resources().stats.queuedPipelines};
-static std::atomic_ref createdPipelines{detail::resources().stats.createdPipelines};
+static std::atomic_ref queuedPipelines{detail::stats().queuedPipelines};
+static std::atomic_ref createdPipelines{detail::stats().createdPipelines};
 #else
 struct AtomicStatRef {
   uint32_t& ref;
@@ -345,9 +348,10 @@ struct AtomicStatRef {
     __atomic_store_n(&ref, val, __ATOMIC_RELAXED);
     return val;
   }
+  uint32_t load() const { return __atomic_load_n(&ref, __ATOMIC_RELAXED); }
 };
-static AtomicStatRef queuedPipelines{detail::resources().stats.queuedPipelines};
-static AtomicStatRef createdPipelines{detail::resources().stats.createdPipelines};
+static AtomicStatRef queuedPipelines{detail::stats().queuedPipelines};
+static AtomicStatRef createdPipelines{detail::stats().createdPipelines};
 #endif
 
 template <typename PipelineConfig>
@@ -430,7 +434,7 @@ static void notify_pipeline_ready(bool queued, uint32_t pipelineCount) {
   createdPipelines += pipelineCount;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
     // Prune GPU cache entries after fully loading the pipeline cache.
-    webgpu::cache_prune();
+    backend::pipelines_loaded();
   }
   g_pipelineReadyCv.notify_all();
 }
@@ -528,14 +532,16 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
 static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& config, const RenderTargetLayout& layout,
                                     PipelinePriority priority) {
   const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
-  return find_pipeline_impl(runtimeKey, [config, layout] { return create_pipeline(config, layout); }, priority);
+  return find_pipeline_impl(
+      runtimeKey, [config, layout] { return backend::create_pipeline(config, layout); }, priority);
 }
 
 static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig& config,
                                     const RenderTargetLayout& layout, PipelinePriority priority) {
   const auto runtimeKey = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(type)));
   return find_pipeline_impl(
-      runtimeKey, [config, layout] { return CompiledPipeline{.main = create_pipeline(config, layout)}; }, priority);
+      runtimeKey, [config, layout] { return CompiledPipeline{.main = backend::create_pipeline(config, layout)}; },
+      priority);
 }
 
 #ifdef AURORA_ENABLE_RMLUI
@@ -543,7 +549,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const rmlui::PipelineConfig
                                     PipelinePriority priority) {
   return find_pipeline_impl(
       xxh3_hash(config, static_cast<HashType>(type)),
-      [config] { return CompiledPipeline{.main = rmlui::create_pipeline(config)}; }, priority);
+      [config] { return CompiledPipeline{.main = webgpu::make_pipeline(rmlui::create_pipeline(config))}; }, priority);
 }
 #endif
 
@@ -960,17 +966,14 @@ static void pipeline_worker() {
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
 
-  bool hasMore = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
     {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
-        if (!hasMore) {
-          g_pipelineQueueCv.wait(lock, [] {
-            return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
-          });
-        }
+        // Every pass, under the lock: another worker may have taken what this one last saw queued.
+        g_pipelineQueueCv.wait(
+            lock, [] { return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd; });
       } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
         return;
       }
@@ -987,7 +990,6 @@ static void pipeline_worker() {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, std::move(result));
       g_pendingPipelines.erase(pending.hash);
-      hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
     }
     if (!g_hasPipelineThread) {
       g_pipelinesPerFrame += std::max(1u, pipelineCount);
@@ -1106,7 +1108,7 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
 
 void rebuild_pipeline_cache() {
   ZoneScoped;
-  const auto scene = scene_render_target_layout();
+  const auto scene = backend::efb_layout();
   auto offscreen = scene;
   offscreen.colorAttachmentCount = 1;
   offscreen.sampleCount = 1;
@@ -1140,11 +1142,25 @@ void initialize_pipeline_cache() {
   g_pipelineThreadEnd = false;
   g_gpuCachePrunePending = false;
 
-  if (webgpu::g_backendType == wgpu::BackendType::WebGPU) {
+  if (!backend::limits().pipelineThreads) {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;
-    g_pipelineThread = std::thread(pipeline_worker);
+    // Automatic leaves the main and render threads two cores.
+    constexpr uint32_t MaxPipelineJobs = 16;
+    const uint32_t cores = std::max(std::thread::hardware_concurrency(), 1u);
+    const uint32_t limit = std::min(cores, MaxPipelineJobs);
+    uint32_t jobs = g_config.pipelineJobs;
+    if (jobs == 0) {
+      jobs = cores > 4 ? std::min(cores - 2, 8u) : 2u;
+    } else if (jobs > limit) {
+      Log.warn("Pipeline compilation: {} threads asked for, capped at {}", jobs, limit);
+      jobs = limit;
+    }
+    Log.info("Pipeline compilation: {} at a time", jobs);
+    for (uint32_t i = 0; i < jobs; ++i) {
+      g_pipelineThreads.emplace_back(pipeline_worker);
+    }
   }
 
   const size_t loadedCount = load_pipeline_cache();
@@ -1163,7 +1179,10 @@ void shutdown_pipeline_cache() {
     g_pipelineThreadEnd = true;
     g_pipelineQueueCv.notify_all();
     g_pipelineReadyCv.notify_all();
-    g_pipelineThread.join();
+    for (auto& thread : g_pipelineThreads) {
+      thread.join();
+    }
+    g_pipelineThreads.clear();
   }
   g_hasPipelineThread = false;
 
@@ -1187,7 +1206,7 @@ void begin_pipeline_frame() {
   if (!g_hasPipelineThread) {
     g_pipelinesPerFrame = 0;
   }
-  if (g_pipelineLayoutKey != scene_render_target_layout().key) {
+  if (g_pipelineLayoutKey != backend::efb_layout().key) {
     rebuild_pipeline_cache();
   }
 }
@@ -1196,6 +1215,11 @@ void end_pipeline_frame() {
   if (!g_hasPipelineThread) {
     pipeline_worker();
   }
+}
+
+void get_pipeline_counts(uint32_t& queued, uint32_t& created) {
+  queued = queuedPipelines.load();
+  created = createdPipelines.load();
 }
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {

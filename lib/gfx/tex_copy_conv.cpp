@@ -4,6 +4,7 @@
 
 #include "../internal.hpp"
 #include "../gx/gx.hpp"
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #include "texture.hpp"
@@ -521,7 +522,7 @@ void initialize() {
       ShaderPreamble, g_bindGroupLayout);
   for (const auto& conv : ConvPipelines) {
     g_pipelines[conv.fmt] = create_pipeline(conv, ShaderPreamble, g_bindGroupLayout);
-    if (conv.outputFormat != to_wgpu(conv.fmt)) {
+    if (conv.outputFormat != webgpu::to_wgpu(upload_format(conv.fmt))) {
       Log.fatal("Output format mismatch for {}", conv.fmt);
     }
   }
@@ -529,7 +530,7 @@ void initialize() {
   if (webgpu::g_hasCoreFeatures) {
     for (const auto& conv : DepthConvPipelines) {
       g_pipelines[conv.fmt] = create_pipeline(conv, DepthShaderPreamble, g_depthBindGroupLayout);
-      if (conv.outputFormat != to_wgpu(conv.fmt)) {
+      if (conv.outputFormat != webgpu::to_wgpu(upload_format(conv.fmt))) {
         Log.fatal("Output format mismatch for {}", conv.fmt);
       }
     }
@@ -625,7 +626,7 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
 
   const std::array colorAttachments{
       wgpu::RenderPassColorAttachment{
-          .view = req.dst->attachmentTextureView,
+          .view = req.dst->gpu->attachmentTextureView,
           .loadOp = wgpu::LoadOp::Clear,
           .storeOp = wgpu::StoreOp::Store,
           .clearValue = {0.0, 0.0, 0.0, 0.0},

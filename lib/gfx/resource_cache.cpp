@@ -2,6 +2,7 @@
 
 #include "frame.hpp"
 #include "hash.hpp"
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 
 #include <cstddef>
@@ -37,6 +38,8 @@ constexpr Module Log{"aurora::gfx"};
 struct CachedBindGroup {
   wgpu::BindGroup bindGroup;
   uint32_t lastUsedFrame = 0;
+  // A GX draw's bind group holds the textures whose addresses make up its key, so none is reused while cached.
+  TextureSet textures;
 };
 
 constexpr uint32_t BindGroupCacheRetainFrames = 32;
@@ -96,6 +99,22 @@ BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
   }
   return id;
 }
+
+namespace backend {
+void prepare_textures(BindGroupRef ref, const TextureSet& set) noexcept {
+  std::lock_guard lock{g_bindGroupCacheMutex};
+  const auto it = g_cachedBindGroups.find(ref);
+  if (it == g_cachedBindGroups.end()) {
+    g_cachedBindGroups.emplace(ref, CachedBindGroup{
+                                        .bindGroup = gx::create_texture_bind_group(set),
+                                        .lastUsedFrame = current_frame(),
+                                        .textures = set,
+                                    });
+  } else {
+    it->second.lastUsedFrame = current_frame();
+  }
+}
+} // namespace backend
 
 wgpu::BindGroup find_bind_group(BindGroupRef id) {
   std::lock_guard lock{g_bindGroupCacheMutex};

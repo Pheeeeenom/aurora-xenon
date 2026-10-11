@@ -13,6 +13,49 @@ option(AURORA_ENABLE_CARD "Enable CARD implementation based on kabufuda" ON)
 option(AURORA_ENABLE_THP "Enable THP decoder" ON)
 option(AURORA_ENABLE_RMLUI "Enable HTML/CSS Based UI Library for use in end-user UI development." OFF)
 option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
+# Timers and peaks a game's benchmark reads through extern "C" calls: the FIFO and render workers' busy time, each
+# frame's path through its stages and, where the backend reports them, the GPU's frame time, the swapchain acquire
+# and memory peaks.
+option(AURORA_ENABLE_DIAGNOSTICS "Time Aurora's workers, the GPU and each frame's path, and keep memory peaks" OFF)
+set(AURORA_GX_MAX_PNMTX 10 CACHE STRING
+  "Position/normal matrix slots in GX matrix memory: 10 (the SDK's GX_PNMTX0-9) to 21, for a game that loads more")
+set(AURORA_GFX_BACKEND "dawn" CACHE STRING
+  "What draws GX: dawn (WebGPU) or null (nothing: frames are recorded and discarded, with no window or GPU)")
+set_property(CACHE AURORA_GFX_BACKEND PROPERTY STRINGS dawn null)
+if (NOT AURORA_GFX_BACKEND MATCHES "^(dawn|null)$")
+  message(FATAL_ERROR "AURORA_GFX_BACKEND is ${AURORA_GFX_BACKEND}; it must be dawn or null")
+endif ()
+if (AURORA_ENABLE_GX AND AURORA_GFX_BACKEND STREQUAL "dawn")
+  set(AURORA_USE_DAWN ON)
+else ()
+  set(AURORA_USE_DAWN OFF)
+endif ()
+if (AURORA_ENABLE_RMLUI AND NOT AURORA_USE_DAWN)
+  message(FATAL_ERROR "AURORA_ENABLE_RMLUI needs AURORA_GFX_BACKEND=dawn: RmlUi draws with WebGPU")
+endif ()
+# The streaming pools a frame records into, in bytes; Dawn keeps several copies of them for staging. Overflowing the
+# first four aborts, so a game sizes them from its peaks. The defaults are 24, 5, 2, 8 and 24 MiB.
+set(AURORA_UNIFORM_POOL_SIZE 25165824 CACHE STRING "Bytes of uniform data a frame can record")
+set(AURORA_VERTEX_POOL_SIZE 5242880 CACHE STRING "Bytes of vertex data a frame can record")
+set(AURORA_INDEX_POOL_SIZE 2097152 CACHE STRING "Bytes of index data a frame can record")
+set(AURORA_STORAGE_POOL_SIZE 8388608 CACHE STRING "Bytes of storage data a frame can record")
+set(AURORA_TEXTURE_UPLOAD_POOL_SIZE 25165824 CACHE STRING
+  "Bytes of texture uploads a frame stages in its pool; larger ones are staged apart")
+# Frames recorded or drawing at once, each slot with its own copy of the pools.
+set(AURORA_FRAME_SLOT_COUNT 2 CACHE STRING "Frames recorded or drawing at once")
+# Quad, strip, fan, line and point draws of up to this many vertices take their indices from patterns built once, which
+# every frame's draws share, instead of having them built into the frame's index pool; larger draws, and a draw another
+# is merged into, still build theirs. 0, the default, builds every draw's.
+set(AURORA_INDEX_PATTERN_VERTICES 0 CACHE STRING "Vertices up to which a draw takes its indices from prebuilt patterns")
+# The GX command stream's memory, in 64 KiB chunks the game thread writes while the FIFO processor reads those before
+# them; the game thread waits when every chunk holds commands not yet processed. The default is 2 MiB.
+set(AURORA_FIFO_RING_BYTES 2097152 CACHE STRING "Bytes of memory for the GX command stream")
+# The GX texture caches, in bytes: converted textures kept for reuse, and the background pre-conversion's results
+# waiting to be drawn and sources queued for it. The defaults are 128, 128 and 64 MiB.
+set(AURORA_TEXTURE_CONTENT_CACHE_BYTES 134217728 CACHE STRING "Bytes of converted textures kept for reuse")
+set(AURORA_TEXTURE_PRECONVERT_READY_BYTES 134217728 CACHE STRING
+  "Bytes of pre-converted textures waiting for their first draw")
+set(AURORA_TEXTURE_PRECONVERT_QUEUE_BYTES 67108864 CACHE STRING "Bytes of textures queued for pre-conversion")
 
 include(CMakeDependentOption)
 cmake_dependent_option(AURORA_ENABLE_EXAMPLES "Enable examples" ON "CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR" OFF)
@@ -51,6 +94,24 @@ set(AURORA_NOD_LINKAGE "${_default_linkage}" CACHE STRING "nod linkage type pref
 set_property(CACHE AURORA_NOD_LINKAGE PROPERTY STRINGS shared static)
 
 add_subdirectory(extern)
+
+if (AURORA_ENABLE_DIAGNOSTICS)
+  add_compile_definitions(AURORA_DIAGNOSTICS)
+endif ()
+# Sizes GX state, the uniform block and the shaders' matrix arrays, so every Aurora source and test sees the same value.
+add_compile_definitions(AURORA_GX_MAX_PNMTX=${AURORA_GX_MAX_PNMTX})
+# The same for the pools.
+add_compile_definitions(
+  AURORA_UNIFORM_POOL_SIZE=${AURORA_UNIFORM_POOL_SIZE}
+  AURORA_VERTEX_POOL_SIZE=${AURORA_VERTEX_POOL_SIZE}
+  AURORA_INDEX_POOL_SIZE=${AURORA_INDEX_POOL_SIZE}
+  AURORA_STORAGE_POOL_SIZE=${AURORA_STORAGE_POOL_SIZE}
+  AURORA_TEXTURE_UPLOAD_POOL_SIZE=${AURORA_TEXTURE_UPLOAD_POOL_SIZE}
+  AURORA_FRAME_SLOT_COUNT=${AURORA_FRAME_SLOT_COUNT}
+  AURORA_TEXTURE_CONTENT_CACHE_BYTES=${AURORA_TEXTURE_CONTENT_CACHE_BYTES}
+  AURORA_TEXTURE_PRECONVERT_READY_BYTES=${AURORA_TEXTURE_PRECONVERT_READY_BYTES}
+  AURORA_TEXTURE_PRECONVERT_QUEUE_BYTES=${AURORA_TEXTURE_PRECONVERT_QUEUE_BYTES}
+)
 
 include(cmake/aurora_core.cmake)
 include(cmake/aurora_os.cmake)

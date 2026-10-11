@@ -21,6 +21,7 @@
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 #include "../gfx/render_worker.hpp"
+#include "../gfx/resource_cache.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
@@ -28,6 +29,11 @@
 #ifdef WEBGPU_DAWN
 #include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
+#if defined(DAWN_ENABLE_BACKEND_OPENGL) && defined(__linux__) && !defined(__ANDROID__)
+#include <dawn/native/OpenGLBackend.h>
+#include <dlfcn.h>
+#define AURORA_LINUX_EGL_PROC
+#endif
 #endif
 
 namespace aurora::gx {
@@ -68,6 +74,7 @@ static wgpu::SurfaceCapabilities g_surfaceCapabilities;
 bool g_hasCoreFeatures = false;
 bool g_dualSourceBlendingSupported = false;
 bool g_bcTexturesSupported = false;
+bool g_cmprAsBc1 = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 static std::atomic_bool g_initialized = false;
@@ -214,7 +221,9 @@ wgpu::TextureFormat best_surface_format() {
       return format;
     }
   }
-  return g_surfaceCapabilities.formats[0];
+  // The EFB takes the surface's format, and gfx::TextureFormat has only these two for it.
+  Log.fatal("Surface offers neither RGBA8Unorm nor BGRA8Unorm for the EFB (first offered: {})",
+            magic_enum::enum_name(g_surfaceCapabilities.formats[0]));
 }
 
 uint32_t sampler_mode(AuroraSampler sampler) noexcept {
@@ -674,6 +683,10 @@ const TextureWithSampler& resample_present_source(const wgpu::CommandEncoder& en
   const auto& source = present_source();
   const uint32_t width = viewport_extent(viewport.width);
   const uint32_t height = viewport_extent(viewport.height);
+  // At 1:1 the resample is an identity copy, so the present blit reads the frame buffer itself.
+  if (source.size.width == width && source.size.height == height) {
+    return source;
+  }
   if (!g_resampledFrameBuffer.view || g_resampledFrameBuffer.size.width != width ||
       g_resampledFrameBuffer.size.height != height || g_resampledFrameBuffer.format != source.format) {
     g_resampledFrameBuffer = create_render_texture(width, height, false);
@@ -815,12 +828,27 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     return false;
   }
   {
-    const wgpu::RequestAdapterOptions options{
+    wgpu::RequestAdapterOptions options{
         .featureLevel = wgpu::FeatureLevel::Compatibility,
         .powerPreference = wgpu::PowerPreference::HighPerformance,
         .backendType = backend,
         .compatibleSurface = g_surface,
     };
+#ifdef AURORA_LINUX_EGL_PROC
+    // Dawn's GL backend opens "libEGL.so", which only EGL's development package installs; it gets libEGL.so.1's
+    // eglGetProcAddress instead.
+    dawn::native::opengl::RequestAdapterOptionsGetGLProc glProc;
+    if (backend == wgpu::BackendType::OpenGL || backend == wgpu::BackendType::OpenGLES) {
+      static void* const libEGL = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
+      if (libEGL != nullptr) {
+        glProc.getProc = reinterpret_cast<dawn::native::opengl::EGLGetProcProc>(dlsym(libEGL, "eglGetProcAddress"));
+        glProc.display = nullptr;
+        if (glProc.getProc != nullptr) {
+          options.nextInChain = &glProc;
+        }
+      }
+    }
+#endif
     Log.info("Requesting adapter\n  Feature level: {}\n  Power preference: {}\n  Backend: {}\n  Compatible surface: {}",
              magic_enum::enum_name(options.featureLevel), magic_enum::enum_name(options.powerPreference),
              magic_enum::enum_name(options.backendType), static_cast<bool>(options.compatibleSurface));
@@ -1076,7 +1104,6 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
           },
       .depthFormat = wgpu::TextureFormat::Depth32Float,
       .msaaSamples = g_config.msaa,
-      .textureAnisotropy = g_config.maxTextureAnisotropy,
   };
   create_copy_pipeline();
   create_resample_pipeline();
@@ -1133,6 +1160,7 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   if (sizeChanged) {
     gx::clear_copy_texture_cache();
     gfx::clear_caches();
+    gfx::detail::clear_bind_group_cache();
   }
   g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
   g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
@@ -1194,4 +1222,9 @@ void aurora_enable_vsync(const bool enabled) {
   aurora::webgpu::g_graphicsConfig.surfaceConfiguration.presentMode =
       aurora::webgpu::select_present_mode(aurora::webgpu::g_surfaceCapabilities);
   aurora::window::push_custom_event(aurora::window::CustomEvent::RefreshSurface);
+}
+
+bool aurora_present_waits_for_vblank() {
+  const auto mode = aurora::webgpu::g_graphicsConfig.surfaceConfiguration.presentMode;
+  return mode == wgpu::PresentMode::Fifo || mode == wgpu::PresentMode::FifoRelaxed;
 }

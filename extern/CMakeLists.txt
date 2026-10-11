@@ -13,7 +13,7 @@ function(aurora_find_package_global)
   find_package(${ARGV} GLOBAL)
 endfunction()
 
-if (AURORA_ENABLE_GX)
+if (AURORA_USE_DAWN)
   include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
   set(AURORA_DAWN_IS_SHARED "${AURORA_DAWN_IS_SHARED}" PARENT_SCOPE)
 endif ()
@@ -151,47 +151,50 @@ if (AURORA_ENABLE_GX)
     )
   endif ()
 
-  if (NOT TARGET PNG::PNG)
-    if (TARGET png_shared AND _USE_SHARED)
-      add_library(PNG::PNG ALIAS png_shared)
-    elseif (TARGET png_static)
-      add_library(PNG::PNG ALIAS png_static)
-    else ()
-      aurora_find_package_global(PNG QUIET)
-      if (NOT TARGET PNG::PNG)
-        find_package(PkgConfig)
-        if (PkgConfig_FOUND)
-          pkg_check_modules(libpng IMPORTED_TARGET GLOBAL libpng)
-          if (TARGET PkgConfig::libpng)
-            target_link_libraries(PkgConfig::libpng INTERFACE ZLIB::ZLIB)
-            add_library(PNG::PNG ALIAS PkgConfig::libpng)
+  # Only the Dawn backend's texture packs read PNGs.
+  if (AURORA_USE_DAWN)
+    if (NOT TARGET PNG::PNG)
+      if (TARGET png_shared AND _USE_SHARED)
+        add_library(PNG::PNG ALIAS png_shared)
+      elseif (TARGET png_static)
+        add_library(PNG::PNG ALIAS png_static)
+      else ()
+        aurora_find_package_global(PNG QUIET)
+        if (NOT TARGET PNG::PNG)
+          find_package(PkgConfig)
+          if (PkgConfig_FOUND)
+            pkg_check_modules(libpng IMPORTED_TARGET GLOBAL libpng)
+            if (TARGET PkgConfig::libpng)
+              target_link_libraries(PkgConfig::libpng INTERFACE ZLIB::ZLIB)
+              add_library(PNG::PNG ALIAS PkgConfig::libpng)
+            endif ()
           endif ()
         endif ()
       endif ()
     endif ()
-  endif ()
-  if (NOT TARGET PNG::PNG)
-    message(STATUS "aurora: Fetching libpng")
-    set(PNG_SHARED ${_USE_SHARED} CACHE BOOL "Build libpng as a shared library" FORCE)
-    set(PNG_TESTS OFF CACHE BOOL "Build the libpng tests" FORCE)
-    set(PNG_TOOLS OFF CACHE BOOL "Build the libpng tools" FORCE)
-    FetchContent_Declare(
-      PNG
-      URL https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz
-      URL_HASH SHA256=A9D4DF463D36A6E5F9C29BD6F4967312D17E996C1854F3511F833924EB1993CF
-      DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      EXCLUDE_FROM_ALL
-    )
-    FetchContent_MakeAvailable(PNG)
-    if (TARGET png_shared AND _USE_SHARED)
-      add_library(PNG::PNG ALIAS png_shared)
-    elseif (TARGET png_static)
-      add_library(PNG::PNG ALIAS png_static)
+    if (NOT TARGET PNG::PNG)
+      message(STATUS "aurora: Fetching libpng")
+      set(PNG_SHARED ${_USE_SHARED} CACHE BOOL "Build libpng as a shared library" FORCE)
+      set(PNG_TESTS OFF CACHE BOOL "Build the libpng tests" FORCE)
+      set(PNG_TOOLS OFF CACHE BOOL "Build the libpng tools" FORCE)
+      FetchContent_Declare(
+        PNG
+        URL https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz
+        URL_HASH SHA256=A9D4DF463D36A6E5F9C29BD6F4967312D17E996C1854F3511F833924EB1993CF
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+        EXCLUDE_FROM_ALL
+      )
+      FetchContent_MakeAvailable(PNG)
+      if (TARGET png_shared AND _USE_SHARED)
+        add_library(PNG::PNG ALIAS png_shared)
+      elseif (TARGET png_static)
+        add_library(PNG::PNG ALIAS png_static)
+      else ()
+        message(FATAL_ERROR "Failed to make libpng available")
+      endif ()
     else ()
-      message(FATAL_ERROR "Failed to make libpng available")
+      message(STATUS "aurora: Using existing libpng")
     endif ()
-  else ()
-    message(STATUS "aurora: Using existing libpng")
   endif ()
 
   aurora_find_package_global(Freetype QUIET)
@@ -241,14 +244,17 @@ if (AURORA_ENABLE_GX)
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 
-    add_library(imgui_backends STATIC
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
-    )
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
-    target_link_libraries(imgui PUBLIC imgui_backends)
+    # Only the Dawn backend draws ImGui, through these.
+    if (AURORA_USE_DAWN)
+      add_library(imgui_backends STATIC
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+      )
+      target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+      target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
+      target_link_libraries(imgui PUBLIC imgui_backends)
+    endif ()
 
     if (TARGET Freetype::Freetype)
       target_sources(imgui PRIVATE ${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp)
@@ -297,7 +303,8 @@ if (AURORA_ENABLE_GX)
     target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
   endif ()
 
-  if (AURORA_CACHE_USE_ZSTD)
+  # Only Dawn's shader cache is compressed.
+  if (AURORA_USE_DAWN AND AURORA_CACHE_USE_ZSTD)
     aurora_find_package_global(zstd CONFIG QUIET)
     if (NOT TARGET zstd::libzstd)
       find_package(PkgConfig QUIET)

@@ -2,6 +2,11 @@
 
 #define IMGUI_DISABLE_DEFAULT_FILE_FUNCTIONS 1
 
+#if defined(__SWITCH__)
+// The default URL opener needs fork and execvp, which Horizon lacks.
+#define IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS 1
+#endif
+
 typedef struct SDL_IOStream SDL_IOStream;
 typedef SDL_IOStream* ImFileHandle;
 typedef unsigned long long ImU64;

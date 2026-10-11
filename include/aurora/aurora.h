@@ -86,9 +86,13 @@ typedef struct {
   const char* resourcesPath;
   AuroraBackend desiredBackend;
   uint32_t msaa;
+  /* Pipeline compilation threads; 0 picks a number from the core count. */
+  uint32_t pipelineJobs;
   uint16_t maxTextureAnisotropy;
   bool vsync;
   bool startFullscreen;
+  /* Opens the window maximized; windowWidth and windowHeight are the size it restores to. */
+  bool startMaximized;
   bool allowJoystickBackgroundEvents;
   bool pauseOnFocusLost;
   bool allowTextureDumps;
@@ -128,6 +132,17 @@ typedef struct {
 
 AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config);
 void aurora_shutdown();
+/* The window as it is now, read each call. A move between displays of different backing scale may arrive as a scale
+ * change, a resize, both or neither (macOS), so a game that follows the window polls it. */
+AuroraWindowSize aurora_window_size();
+/* Rebuilds the framebuffer from the window and the locked aspect now, not at the next event pump, whose deferred
+ * rebuild shows one frame of bars. Call it between frames; it does nothing when nothing changed. */
+void aurora_apply_frame_buffer_resize();
+/* Writes the frame being recorded to `path` as a binary PPM once it is presented. */
+void aurora_capture_frame(const char* path);
+/* GPU time per frame, from queue submit to OnSubmittedWorkDone: an upper bound, which includes any wait behind work
+ * queued earlier, and on Metal not GPU execution time. Timestamp queries read back zero on tile-based renderers. */
+void aurora_gpu_frame_time(uint64_t* lastNs, uint64_t* meanNs, uint64_t* maxNs, uint64_t* count);
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();

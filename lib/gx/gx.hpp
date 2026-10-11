@@ -64,18 +64,45 @@ constexpr u32 MaxTevSwap = GX_MAX_TEVSWAP;
 constexpr u32 MaxIndStages = GX_MAX_INDTEXSTAGE;
 constexpr u32 MaxIndTexMtxs = 3;
 constexpr u32 MaxVtxFmt = GX_MAX_VTXFMT;
-constexpr u32 MaxPnMtx = (GX_PNMTX9 / 3) + 1;
+// Position/normal matrix slots, the CMake setting AURORA_GX_MAX_PNMTX. The SDK names ten (GX_PNMTX0-9), but matrix
+// memory is one 64-row block that GXLoadPosMtxImm and PNMTXIDX can address anywhere, so a game may park matrices above
+// row 27. Slots past the tenth alias texture matrix memory from row 30, which copy_xf_data mirrors into them.
+#ifndef AURORA_GX_MAX_PNMTX
+#define AURORA_GX_MAX_PNMTX 10
+#endif
+constexpr u32 MaxPnMtx = AURORA_GX_MAX_PNMTX;
+static_assert(MaxPnMtx >= (GX_PNMTX9 / 3) + 1 && MaxPnMtx <= 64 / 3, "AURORA_GX_MAX_PNMTX must be 10 to 21");
 constexpr u32 MaxIndexAttr = 12; // VA_POS -> VA_TEX7
-constexpr u32 MaxUniformSize = 3840;
 constexpr u32 XfRegCount = 0x58; // 0x1000-0x1057
 
-enum DirtyFlag : u8 {
+// The uniform block in five pieces, each a uniform buffer of its own, so that a draw pushes only the pieces whose state
+// changed, split by how often their parts change from draw to draw: the position matrices most, then the lights,
+// the normal matrices, the material and the rest.
+enum UniformPiece : u8 {
+  UniformView,     // ViewUniform
+  UniformPosMtx,   // PosMtxUniform
+  UniformNrmMtx,   // NrmMtxUniform
+  UniformLights,   // LightsUniform
+  UniformMaterial, // MaterialUniform
+  UniformPieceCount,
+};
+constexpr u8 AllUniformPieces = (1 << UniformPieceCount) - 1;
+
+// U16 for a dirty bit per uniform piece, DirtyView shifted by its UniformPiece.
+enum DirtyFlag : u16 {
   DirtyPipeline = 1 << 0,
   DirtyTextures = 1 << 1,
-  DirtyUniform = 1 << 2,
   DirtyImmediates = 1 << 3,
+  DirtyView = 1 << 4,
+  DirtyPosMtx = 1 << 5,
+  DirtyNrmMtx = 1 << 6,
+  DirtyLights = 1 << 7,
+  DirtyMaterial = 1 << 8,
+  DirtyUniform = DirtyView | DirtyPosMtx | DirtyNrmMtx | DirtyLights | DirtyMaterial,
   DirtyAll = DirtyPipeline | DirtyTextures | DirtyUniform | DirtyImmediates,
 };
+constexpr u32 DirtyUniformShift = 4;
+static_assert(DirtyMaterial == DirtyView << UniformMaterial);
 
 struct DrawImmediateData {
   u32 vtxStart = 0;
@@ -86,8 +113,6 @@ struct DrawImmediateData {
 };
 static_assert(std::has_unique_object_representations_v<DrawImmediateData>);
 static_assert(sizeof(DrawImmediateData) == 64);
-
-extern wgpu::BindGroup g_emptyTextureBindGroup;
 
 template <typename Arg, Arg Default>
 struct TevPass {
@@ -157,9 +182,10 @@ struct ColorChannelConfig {
   GXDiffuseFn diffFn = GX_DF_NONE;
   GXAttnFn attnFn = GX_AF_NONE;
   bool lightingEnabled = false;
-  u8 _p1 = 0;
-  u8 _p2 = 0;
-  u8 _p3 = 0;
+  u8 lightMask = 0; // In the key, so a lit channel's program can sum only these lights
+  // Lights in the mask whose spot, and distance, coefficients are exactly (1, 0, 0), with Limits::unitLightTerms.
+  u8 unitSpotLights = 0;
+  u8 unitDistanceLights = 0;
 
   bool operator==(const ColorChannelConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
   bool operator!=(const ColorChannelConfig& rhs) const { return !(*this == rhs); }
@@ -294,6 +320,43 @@ struct Fog {
   std::array<Vec4<float>, 3> rangeK;
 };
 static_assert(sizeof(Fog) == 80);
+// The uniform pieces' layouts (UniformPiece), which gx/shader.cpp's WGSL and each backend's own programs
+// declare member for member. Each holds all its state whatever the shader reads, so no pipeline changes it.
+struct ViewUniform {
+  Vec2<float> renderViewportSize;
+  Vec2<float> logicalViewportSize;
+  f32 lineWidth = 0.f;
+  f32 lineAspectY = 0.f;
+  f32 lineTexOffset = 0.f;
+  u32 lineTexCoordMask = 0;
+  Mat4x4<float> proj;
+  std::array<Mat3x4<float>, MaxTexMtx> texMtxs;
+  // Channels 0 and 1 in turn: ambient, material, alpha ambient and alpha material.
+  std::array<Vec4<float>, 8> channelColors;
+  std::array<Mat3x4<float>, MaxPTTexMtx> postMtxs;
+  Fog fog;
+  std::array<Vec4<float>, MaxIndTexMtxs * 2> indTexMtxs;
+};
+static_assert(sizeof(ViewUniform) == 1840);
+using PosMtxUniform = std::array<Mat3x4<float>, MaxPnMtx>;
+using NrmMtxUniform = std::array<Mat3x4<float>, MaxPnMtx>;
+struct LightsUniform {
+  std::array<Light, GX::MaxLights> lights;
+  std::array<u32, MaxColorChannels> lightMasks; // colour 0 and 1, then alpha 0 and 1
+};
+static_assert(sizeof(LightsUniform) == 656);
+struct MaterialUniform {
+  std::array<Vec4<float>, MaxTevRegs> tevRegs; // TEVPREV, then TEVREG0-2
+  std::array<Vec4<float>, MaxKColors> kcolors;
+  std::array<Vec4<float>, MaxTexCoord> texCoordScales;
+  std::array<Vec4<float>, MaxTextures> textureSizeBias; // zero for maps the shader doesn't sample
+};
+static_assert(sizeof(MaterialUniform) == 384);
+constexpr std::array<u32, UniformPieceCount> UniformPieceSizes{
+    sizeof(ViewUniform), sizeof(PosMtxUniform), sizeof(NrmMtxUniform), sizeof(LightsUniform), sizeof(MaterialUniform),
+};
+// The largest piece, which every draw's dynamic offset leaves room for.
+constexpr u32 MaxUniformSize = sizeof(ViewUniform);
 struct AttrArray {
   const void* data;
   u32 size;
@@ -358,6 +421,8 @@ struct GXState {
   std::array<ColorChannelConfig, MaxColorChannels> colorChannelConfig;
   std::array<ColorChannelState, MaxColorChannels> colorChannelState;
   std::array<Light, GX::MaxLights> lights;
+  // Per light, 1 when its spot coefficients are exactly (1, 0, 0) and 2 when its distance ones are (regs.cpp).
+  std::array<u8, GX::MaxLights> unitLightTerms{};
   std::array<TevStage, MaxTevStages> tevStages;
   std::array<GXTexObj_, MaxTextures> loadedTextures;
   std::array<GXTlutObj_, MaxTluts> loadedTluts;
@@ -392,8 +457,10 @@ struct GXState {
   f32 backScale = 0.0f;
   f32 clamp = 0.0f;
 
-  // View state
+  // View state. The policy and the VI mode's framebuffer size are the game thread's, as of the frame's start
+  // (GX_AURORA_BEGIN_FRAME) or a VIConfigure during it (GX_AURORA_SET_VI_SIZE).
   AuroraViewportPolicy viewportPolicy = AURORA_VIEWPORT_FIT;
+  Vec2<uint32_t> viSize{640, 480};
   gfx::Viewport logicalViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
   gfx::Viewport renderViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
   gfx::ClipRect logicalScissor{0, 0, 640, 480};
@@ -413,7 +480,7 @@ struct GXState {
   std::array<gfx::TextureBind, MaxTextures> textures;
   u16 lastVtxSize = 0;
   GXVtxFmt lastVtxFmt = GX_MAX_VTXFMT;
-  u8 dirty = DirtyAll;
+  u16 dirty = DirtyAll; // U16, see DirtyFlag
 
   // Shadow registers
   std::array<u32, 0x100> bpRegCache = [] {
@@ -432,10 +499,12 @@ struct GXState {
 extern GXState g_gxState;
 struct ShaderInfo;
 
-void initialize() noexcept;
 void shutdown() noexcept;
+// Game thread, between frames: applies a new viewport policy to the window.
 void update() noexcept;
 void set_viewport_policy(AuroraViewportPolicy policy) noexcept;
+// Game thread: the frame in `slot` begins in the command stream, with the viewport policy and VI mode it records under.
+void begin_frame(size_t slot) noexcept;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;
 void evict_copy_texture(const void* dest) noexcept;
@@ -449,6 +518,8 @@ void set_render_viewport(const gfx::Viewport& viewport) noexcept;
 void set_logical_scissor(const gfx::ClipRect& scissor) noexcept;
 void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
+// Clears the copy source as copy_tex(dest, GX_TRUE) does, and copies nothing (GX_AURORA_CLEAR_COPY_SRC).
+void clear_copy_src() noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
 void resolve_sampled_textures(const ShaderInfo& info) noexcept;
 
@@ -529,7 +600,7 @@ struct ShaderInfo {
   std::bitset<MaxIndStages> usedIndStages;
   std::bitset<MaxTextures> sampledIndTextures;
   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
-  u32 uniformSize = 0;
+  u8 uniformPieces = 0; // The UniformPiece bits the shaders read
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   u8 lineMode : 2 = 0;
@@ -538,13 +609,6 @@ struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
-wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
-                                    const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
-                                    wgpu::ShaderModule shader, const char* label) noexcept;
-std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
-                                uint32_t normalAttachment = UINT32_MAX) noexcept;
-wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,
-                                DstAlphaMode dstAlphaMode) noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;

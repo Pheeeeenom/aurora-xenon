@@ -80,6 +80,12 @@ extern "C" {
 #define GX_AURORA_END_OFFSCREEN 0x003A
 
 /**
+ * Clears the copy source as an EFB copy with clear would, and copies nothing (GXClearTexCopySrc).
+ * Followed by nothing.
+ */
+#define GX_AURORA_CLEAR_COPY_SRC 0x003B
+
+/**
  * Draw primitives with the vertex count derived from a byte length, as written by
  * GXBegin(prim, fmt, GX_AUTO). Must be followed by a u8 draw opcode (vtxfmt|prim),
  * a u32 vertex data byte length, then that many bytes of vertex data. The byte length
@@ -95,6 +101,32 @@ extern "C" {
  * is always host-endian regardless of stream endianness.
  */
 #define GX_AURORA_DRAW_INDEXED 0x0041
+
+/**
+ * Calls a display list by reference, as written by GXCallDisplayList. Must be followed by the list's
+ * u64 address and u32 byte count. The processor reads the list's bytes from that address when it
+ * reaches the command, as the GPU reads a list GX_CMD_CALL_DL names when it reaches it, so the game
+ * keeps the list unchanged until it has been drawn, as GX requires.
+ */
+#define GX_AURORA_CALL_DISPLAY_LIST 0x0042
+
+/**
+ * Begins recording a frame, as written by Aurora at the frame's start. Must be followed by a u8 frame slot, a u8
+ * viewport policy (AuroraViewportPolicy) and the VI mode's u32 framebuffer width and height, which apply from here on.
+ */
+#define GX_AURORA_BEGIN_FRAME 0x0043
+
+/**
+ * Ends the frame being recorded, as written by Aurora at the frame's end. Must be followed by a u8 frame slot and a u8
+ * flag: 1 closes the frame, 0 leaves closing it to whoever drained the stream.
+ */
+#define GX_AURORA_END_FRAME 0x0044
+
+/**
+ * Sets the VI mode's framebuffer size, as written by VIConfigure during a frame. Must be followed by a u32 width and a
+ * u32 height.
+ */
+#define GX_AURORA_SET_VI_SIZE 0x0045
 
 #define GX2_SET_POLYGON_OFFSET 0x1000
 
@@ -156,6 +188,16 @@ void GXSetScissorRender(u32 left, u32 top, u32 wd, u32 ht);
 void GX2SetPolygonOffset(f32 mFrontOffset, f32 mFrontScale, f32 mBackOffset, f32 mBackScale, f32 mClamp);
 
 /**
+ * Room for `size` bytes of the vertex data of the draw GXBegin began, which the caller writes in the stream's byte
+ * order (big-endian), then hands back with GXCommitVertexData and the end of what it wrote. The bytes are the ones the
+ * GXPosition, GXNormal, GXColor and GXTexCoord calls for those values would write, with one room check for all of them
+ * instead of one a value. Nothing else may write GX commands in between. NULL while a display list is recorded: there,
+ * write the values with those calls.
+ */
+u8* GXReserveVertexData(u32 size);
+void GXCommitVertexData(const u8* end);
+
+/**
  * Load an arbitrary 4x4 projection matrix, avoiding the 6-parameter hardware encoding.
  */
 void GXSetProjectionFull(const void* mtx);
@@ -172,6 +214,13 @@ void GXCreateFrameBuffer(u32 width, u32 height);
  * Must be called after GXCreateFrameBuffer() to resume normal rendering.
  */
 void GXRestoreFrameBuffer(void);
+
+/**
+ * Clears the copy source (GXSetTexCopySrc) as GXCopyTex(dest, GX_TRUE) would, under the same colour, alpha and depth
+ * updates and GXSetCopyClear values, and copies nothing: for a game that copies only to clear, into memory it never
+ * reads as a texture.
+ */
+void GXClearTexCopySrc(void);
 
 #if __cplusplus
 }

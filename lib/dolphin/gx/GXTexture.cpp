@@ -2,6 +2,7 @@
 #include "__gx.h"
 
 #include "../../gfx/texture.hpp"
+#include "../../gx/texture.hpp"
 #include "dolphin/gx/GXAurora.h"
 
 #include <algorithm>
@@ -78,26 +79,19 @@ void init_texobj_common(GXTexObj_& obj, const void* data, u16 width, u16 height,
 }
 
 void emit_loaded_texobj_metadata(const GXTexObj_& obj, GXTexMapID id) {
-  GX_WRITE_AURORA(GX_AURORA_LOAD_TEXOBJ);
-  GX_WRITE_U8(static_cast<u8>(id));
-  GX_WRITE_U64(reinterpret_cast<u64>(obj.data));
-  GX_WRITE_U32(obj.width());
-  GX_WRITE_U32(obj.height());
-  GX_WRITE_U32(obj.format());
-  GX_WRITE_U32(static_cast<u32>(obj.tlut));
-  GX_WRITE_U8(static_cast<u8>(obj.has_mips()));
-  GX_WRITE_U32(obj.texObjId);
-  GX_WRITE_U32(obj.texDataVersion);
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(GX_AURORA), static_cast<uint16_t>(GX_AURORA_LOAD_TEXOBJ),
+                                  static_cast<uint8_t>(id), static_cast<uint64_t>(reinterpret_cast<u64>(obj.data)),
+                                  static_cast<uint32_t>(obj.width()), static_cast<uint32_t>(obj.height()),
+                                  static_cast<uint32_t>(obj.format()), static_cast<uint32_t>(obj.tlut),
+                                  static_cast<uint8_t>(obj.has_mips()), static_cast<uint32_t>(obj.texObjId),
+                                  static_cast<uint32_t>(obj.texDataVersion));
 }
 
 void emit_loaded_tlut_metadata(const GXTlutObj_& obj, u32 idx) {
-  GX_WRITE_AURORA(GX_AURORA_LOAD_TLUT);
-  GX_WRITE_U8(static_cast<u8>(idx));
-  GX_WRITE_U64(reinterpret_cast<u64>(obj.data));
-  GX_WRITE_U32(static_cast<u32>(obj.format));
-  GX_WRITE_U16(obj.numEntries);
-  GX_WRITE_U32(obj.tlutObjId);
-  GX_WRITE_U32(obj.tlutDataVersion);
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(GX_AURORA), static_cast<uint16_t>(GX_AURORA_LOAD_TLUT),
+                                  static_cast<uint8_t>(idx), static_cast<uint64_t>(reinterpret_cast<u64>(obj.data)),
+                                  static_cast<uint32_t>(obj.format), static_cast<uint16_t>(obj.numEntries),
+                                  static_cast<uint32_t>(obj.tlutObjId), static_cast<uint32_t>(obj.tlutDataVersion));
 }
 } // namespace
 
@@ -134,6 +128,8 @@ void GXInitTexObjLOD(GXTexObj* obj_, GXTexFilter minFilt, GXTexFilter magFilt, f
   const auto clampedMax = std::clamp(maxLod, 0.0f, 10.0f);
   SET_REG_FIELD(0, obj->mode1, 8, 0, static_cast<u8>(16.0f * clampedMin));
   SET_REG_FIELD(0, obj->mode1, 8, 8, static_cast<u8>(16.0f * clampedMax));
+  // The object is complete once its LOD range is set, so its conversion can start.
+  aurora::gx::texture::preconvert_texture(*obj);
 }
 
 void GXInitTexObjData(GXTexObj* obj_, const void* data) {

@@ -321,7 +321,7 @@ std::optional<MipTail> slice_mip_tail(ArrayRef<uint8_t> bytes, const ParsedDDS& 
   std::memcpy(data.data(), bytes.data() + layout->dataOffset, data.size());
   return MipTail{
       .texture =
-          ConvertedTexture{
+          ReplacementTexture{
               .format = dds.format,
               .width = layout->width,
               .height = layout->height,
@@ -332,7 +332,7 @@ std::optional<MipTail> slice_mip_tail(ArrayRef<uint8_t> bytes, const ParsedDDS& 
   };
 }
 
-std::optional<ConvertedTexture> parse_dds_bytes(ArrayRef<uint8_t> bytes) noexcept {
+std::optional<ReplacementTexture> parse_dds_bytes(ArrayRef<uint8_t> bytes) noexcept {
   const auto dds = parse_dds_header(bytes);
   if (!dds.has_value()) {
     return std::nullopt;
@@ -346,7 +346,7 @@ std::optional<ConvertedTexture> parse_dds_bytes(ArrayRef<uint8_t> bytes) noexcep
 
   ByteBuffer data{static_cast<size_t>(expectedSize)};
   std::memcpy(data.data(), bytes.data() + dds->dataOffset, data.size());
-  return ConvertedTexture{
+  return ReplacementTexture{
       .format = dds->format,
       .width = dds->width,
       .height = dds->height,
@@ -355,7 +355,7 @@ std::optional<ConvertedTexture> parse_dds_bytes(ArrayRef<uint8_t> bytes) noexcep
   };
 }
 
-std::optional<ConvertedTexture> load_dds_file(const std::filesystem::path& path) noexcept {
+std::optional<ReplacementTexture> load_dds_file(const std::filesystem::path& path) noexcept {
   const auto bytes = io::read_file(path);
   if (!bytes.has_value()) {
     return std::nullopt;
@@ -400,7 +400,7 @@ std::optional<MipTail> load_dds_mip_tail(const std::filesystem::path& path, uint
   }
   return MipTail{
       .texture =
-          ConvertedTexture{
+          ReplacementTexture{
               .format = dds->format,
               .width = layout->width,
               .height = layout->height,

@@ -2,6 +2,7 @@
 #include "../gfx/types.hpp"
 
 #include "../internal.hpp"
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 #include "gx.hpp"
 #include "gx_fmt.hpp"
@@ -184,45 +185,45 @@ std::string color_arg_reg(GXTevColorArg arg, size_t stageIdx, const ShaderConfig
     case GX_TEV_KCSEL_1_8:
       return "vec3f(1.0/8.0)";
     case GX_TEV_KCSEL_K0:
-      return "ubuf.kcolor0.rgb";
+      return "umat.kcolor0.rgb";
     case GX_TEV_KCSEL_K1:
-      return "ubuf.kcolor1.rgb";
+      return "umat.kcolor1.rgb";
     case GX_TEV_KCSEL_K2:
-      return "ubuf.kcolor2.rgb";
+      return "umat.kcolor2.rgb";
     case GX_TEV_KCSEL_K3:
-      return "ubuf.kcolor3.rgb";
+      return "umat.kcolor3.rgb";
     case GX_TEV_KCSEL_K0_R:
-      return "vec3f(ubuf.kcolor0.r)";
+      return "vec3f(umat.kcolor0.r)";
     case GX_TEV_KCSEL_K1_R:
-      return "vec3f(ubuf.kcolor1.r)";
+      return "vec3f(umat.kcolor1.r)";
     case GX_TEV_KCSEL_K2_R:
-      return "vec3f(ubuf.kcolor2.r)";
+      return "vec3f(umat.kcolor2.r)";
     case GX_TEV_KCSEL_K3_R:
-      return "vec3f(ubuf.kcolor3.r)";
+      return "vec3f(umat.kcolor3.r)";
     case GX_TEV_KCSEL_K0_G:
-      return "vec3f(ubuf.kcolor0.g)";
+      return "vec3f(umat.kcolor0.g)";
     case GX_TEV_KCSEL_K1_G:
-      return "vec3f(ubuf.kcolor1.g)";
+      return "vec3f(umat.kcolor1.g)";
     case GX_TEV_KCSEL_K2_G:
-      return "vec3f(ubuf.kcolor2.g)";
+      return "vec3f(umat.kcolor2.g)";
     case GX_TEV_KCSEL_K3_G:
-      return "vec3f(ubuf.kcolor3.g)";
+      return "vec3f(umat.kcolor3.g)";
     case GX_TEV_KCSEL_K0_B:
-      return "vec3f(ubuf.kcolor0.b)";
+      return "vec3f(umat.kcolor0.b)";
     case GX_TEV_KCSEL_K1_B:
-      return "vec3f(ubuf.kcolor1.b)";
+      return "vec3f(umat.kcolor1.b)";
     case GX_TEV_KCSEL_K2_B:
-      return "vec3f(ubuf.kcolor2.b)";
+      return "vec3f(umat.kcolor2.b)";
     case GX_TEV_KCSEL_K3_B:
-      return "vec3f(ubuf.kcolor3.b)";
+      return "vec3f(umat.kcolor3.b)";
     case GX_TEV_KCSEL_K0_A:
-      return "vec3f(ubuf.kcolor0.a)";
+      return "vec3f(umat.kcolor0.a)";
     case GX_TEV_KCSEL_K1_A:
-      return "vec3f(ubuf.kcolor1.a)";
+      return "vec3f(umat.kcolor1.a)";
     case GX_TEV_KCSEL_K2_A:
-      return "vec3f(ubuf.kcolor2.a)";
+      return "vec3f(umat.kcolor2.a)";
     case GX_TEV_KCSEL_K3_A:
-      return "vec3f(ubuf.kcolor3.a)";
+      return "vec3f(umat.kcolor3.a)";
     }
   }
   case GX_CC_ZERO:
@@ -286,37 +287,37 @@ std::string alpha_arg_reg(GXTevAlphaArg arg, size_t stageIdx, const ShaderConfig
     case GX_TEV_KASEL_1_8:
       return "(1.0/8.0)";
     case GX_TEV_KASEL_K0_R:
-      return "ubuf.kcolor0.r";
+      return "umat.kcolor0.r";
     case GX_TEV_KASEL_K1_R:
-      return "ubuf.kcolor1.r";
+      return "umat.kcolor1.r";
     case GX_TEV_KASEL_K2_R:
-      return "ubuf.kcolor2.r";
+      return "umat.kcolor2.r";
     case GX_TEV_KASEL_K3_R:
-      return "ubuf.kcolor3.r";
+      return "umat.kcolor3.r";
     case GX_TEV_KASEL_K0_G:
-      return "ubuf.kcolor0.g";
+      return "umat.kcolor0.g";
     case GX_TEV_KASEL_K1_G:
-      return "ubuf.kcolor1.g";
+      return "umat.kcolor1.g";
     case GX_TEV_KASEL_K2_G:
-      return "ubuf.kcolor2.g";
+      return "umat.kcolor2.g";
     case GX_TEV_KASEL_K3_G:
-      return "ubuf.kcolor3.g";
+      return "umat.kcolor3.g";
     case GX_TEV_KASEL_K0_B:
-      return "ubuf.kcolor0.b";
+      return "umat.kcolor0.b";
     case GX_TEV_KASEL_K1_B:
-      return "ubuf.kcolor1.b";
+      return "umat.kcolor1.b";
     case GX_TEV_KASEL_K2_B:
-      return "ubuf.kcolor2.b";
+      return "umat.kcolor2.b";
     case GX_TEV_KASEL_K3_B:
-      return "ubuf.kcolor3.b";
+      return "umat.kcolor3.b";
     case GX_TEV_KASEL_K0_A:
-      return "ubuf.kcolor0.a";
+      return "umat.kcolor0.a";
     case GX_TEV_KASEL_K1_A:
-      return "ubuf.kcolor1.a";
+      return "umat.kcolor1.a";
     case GX_TEV_KASEL_K2_A:
-      return "ubuf.kcolor2.a";
+      return "umat.kcolor2.a";
     case GX_TEV_KASEL_K3_A:
-      return "ubuf.kcolor3.a";
+      return "umat.kcolor3.a";
     }
   }
   case GX_CA_ZERO:
@@ -795,7 +796,7 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
       ambSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i));
     }
   } else if (cc.ambSrc == GX_SRC_REG) {
-    ambSrc = fmt::format("ubuf.cc{0}{1}_amb", i, alpha ? "a"sv : ""sv);
+    ambSrc = fmt::format("uview.cc{0}{1}_amb", i, alpha ? "a"sv : ""sv);
   }
   if (cc.matSrc == GX_SRC_VTX) {
     if (UsePerPixelLighting) {
@@ -804,7 +805,7 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
       matSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i));
     }
   } else if (cc.matSrc == GX_SRC_REG) {
-    matSrc = fmt::format("ubuf.cc{0}{1}_mat", i, alpha ? "a"sv : ""sv);
+    matSrc = fmt::format("uview.cc{0}{1}_mat", i, alpha ? "a"sv : ""sv);
   }
   if (!cc.lightingEnabled) {
     return fmt::format("\n    {0}{2} = {1}{2};", outVar, matSrc, swizzle);
@@ -814,8 +815,11 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   if (cc.attnFn == GX_AF_NONE) {
     lightAttnFn = "attn = 1.0;"s;
   } else if (cc.attnFn == GX_AF_SPOT) {
+    // The cosine is clamped to [0, 1], NaN-safe. A point light leaves its direction words unset, which the hardware
+    // cancels with a zero coefficient; in f32, cosine * cosine can overflow and 0.0 * inf is NaN.
     lightAttnFn = fmt::format(R"""(
-          var cosine = max(0.0, dot(ldir, light.dir));
+          var cosraw = dot(ldir, light.dir);
+          var cosine = select(0.0, min(cosraw, 1.0), cosraw > 0.0);
           var cos_attn = dot(light.cos_att, vec3f(1.0, cosine, cosine * cosine));
           var dist_attn = dot(light.dist_att, vec3f(1.0, dist, dist2));
           attn = max(0.0, cos_attn / dist_attn);)""");
@@ -824,8 +828,10 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     std::string dist_attn = diffFn != GX_DF_NONE
                                 ? "max(0.0, dot(normalize(light.dist_att), vec3f(1.0, attn, attn * attn)));"
                                 : "max(0.0, dot(light.dist_att, vec3f(1.0, attn, attn * attn)));";
+    // The same clamp as GX_AF_SPOT's.
     lightAttnFn = fmt::format(R"""(
-          attn = select(0.0, max(0.0, dot({0}, light.dir)), dot({0}, ldir) >= 0.0);
+          var cosraw = dot({0}, light.dir);
+          attn = select(0.0, min(cosraw, 1.0), cosraw > 0.0 && dot({0}, ldir) >= 0.0);
           var cos_attn = dot(light.cos_att, vec3f(1.0, attn, attn * attn));
           var dist_attn = {1};
           attn = max(0.0, cos_attn / dist_attn);)""",
@@ -851,8 +857,8 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     {{
       var lighting = {5};
       for (var i = 0u; i < {1}u; i++) {{
-          if ((ubuf.lightState{0}{9} & (1u << i)) == 0u) {{ continue; }}
-          var light = ubuf.lights[i];
+          if ((ulights.lightState{0}{9} & (1u << i)) == 0u) {{ continue; }}
+          var light = ulights.lights[i];
           var ldir = light.pos - {6};
           var dist2 = dot(ldir, ldir);
           var dist = sqrt(dist2);
@@ -868,6 +874,88 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
 }
 
 absl::flat_hash_set<gfx::ShaderRef> s_seenShaders;
+
+// Gx.hpp's uniform pieces, member for member, each at its UniformPiece's binding.
+std::string uniform_pieces() {
+  std::string material;
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    material += fmt::format("\n    tex{}_size_bias: vec4f,", i);
+  }
+  return fmt::format(R"""(
+struct Light {{
+    pos: vec3f,
+    dir: vec3f,
+    color: vec4f,
+    cos_att: vec3f,
+    dist_att: vec3f,
+}};
+struct Fog {{
+    color: vec4f,
+    a: f32,
+    b: f32,
+    c: f32,
+    range_center: f32,
+    range_k: array<vec4f, 3>,
+}};
+struct View {{
+    render_viewport_size: vec2f,
+    logical_viewport_size: vec2f,
+    line_width: f32,
+    line_aspect_y: f32,
+    line_tex_offset: f32,
+    line_texcoord_mask: u32,
+    proj: mat4x4f,
+    tex_mtx: array<mat3x4f, {0}>,
+    cc0_amb: vec4f,
+    cc0_mat: vec4f,
+    cc0a_amb: vec4f,
+    cc0a_mat: vec4f,
+    cc1_amb: vec4f,
+    cc1_mat: vec4f,
+    cc1a_amb: vec4f,
+    cc1a_mat: vec4f,
+    postmtx: array<mat3x4f, {1}>,
+    fog: Fog,
+    ind_mtx: array<mat2x4f, {2}>,
+}};
+struct PosMtx {{
+    mtx: array<mat3x4f, {3}>,
+}};
+struct NrmMtx {{
+    mtx: array<mat3x4f, {3}>,
+}};
+struct Lights {{
+    lights: array<Light, {4}>,
+    lightState0: u32,
+    lightState1: u32,
+    lightState0a: u32,
+    lightState1a: u32,
+}};
+struct Material {{
+    tevprev: vec4f,
+    tevreg0: vec4f,
+    tevreg1: vec4f,
+    tevreg2: vec4f,
+    kcolor0: vec4f,
+    kcolor1: vec4f,
+    kcolor2: vec4f,
+    kcolor3: vec4f,
+    texcoord_scale: array<vec4f, {5}>,{6}
+}};
+@group(1) @binding({7})
+var<uniform> uview: View;
+@group(1) @binding({8})
+var<uniform> upos: PosMtx;
+@group(1) @binding({9})
+var<uniform> unrm: NrmMtx;
+@group(1) @binding({10})
+var<uniform> ulights: Lights;
+@group(1) @binding({11})
+var<uniform> umat: Material;)""",
+                     MaxTexMtx, MaxPTTexMtx, MaxIndTexMtxs, MaxPnMtx, GX::MaxLights, MaxTexCoord, material,
+                     underlying(UniformView), underlying(UniformPosMtx), underlying(UniformNrmMtx),
+                     underlying(UniformLights), underlying(UniformMaterial));
+}
 } // namespace
 
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
@@ -943,8 +1031,6 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     }
   }
 
-  std::string uniformPre;
-  std::string uniBufAttrs;
   std::string texBindings;
   std::string vtxOutAttrs;
   std::string vtxInAttrs;
@@ -956,18 +1042,13 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   std::string_view vidxAttr = "vidx"sv;
   if (config.lineMode != 0) {
     vtxInAttrs += ",\n    @builtin(instance_index) iidx: u32";
-    uniBufAttrs +=
-        "\n    line_width: f32,"
-        "\n    line_aspect_y: f32,"
-        "\n    line_tex_offset: f32,"
-        "\n    line_texcoord_mask: u32,";
     if (config.lineMode == 3) {
       // GX_POINTS: each instance = one vertex, expand to quad
       vtxXfrAttrsPre += fmt::format(
           "\n    let in_vidx = iidx;"
           "\n    let in_pos = {};"
           "\n    let in_pnmtxidx = {};"
-          "\n    let mv_pos = vec4f(in_pos, 1.0) * ubuf.postex_mtx[in_pnmtxidx];",
+          "\n    let mv_pos = vec4f(in_pos, 1.0) * upos.mtx[in_pnmtxidx];",
           attr_load(config, GX_VA_POS, "in_vidx"sv), attr_load(config, GX_VA_PNMTXIDX, "in_vidx"sv));
     } else {
       // GX_LINES / GX_LINESTRIP: each instance = two vertices, expand to quad
@@ -982,8 +1063,8 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "\n    let pnmtxidx_a = {};"
           "\n    let pnmtxidx_b = {};"
           "\n    let in_pnmtxidx = select(pnmtxidx_a, pnmtxidx_b, use_b);"
-          "\n    let mv_pos_a = vec4f(pos_a, 1.0) * ubuf.postex_mtx[pnmtxidx_a];"
-          "\n    let mv_pos_b = vec4f(pos_b, 1.0) * ubuf.postex_mtx[pnmtxidx_b];"
+          "\n    let mv_pos_a = vec4f(pos_a, 1.0) * upos.mtx[pnmtxidx_a];"
+          "\n    let mv_pos_b = vec4f(pos_b, 1.0) * upos.mtx[pnmtxidx_b];"
           "\n    let mv_pos = select(mv_pos_a, mv_pos_b, use_b);",
           config.lineMode == 1 ? 2 : 1, attr_load(config, GX_VA_POS, "vidx_a"sv),
           attr_load(config, GX_VA_POS, "vidx_b"sv), attr_load(config, GX_VA_PNMTXIDX, "vidx_a"sv),
@@ -1026,39 +1107,39 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 
   if (config.lineMode == 0) {
     vtxXfrAttrsPre += fmt::format(
-        "\n    let mv_pos = vec4f({}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
-        "\n    out.pos = vec4f(mv_pos, 1.0) * ubuf.proj;",
+        "\n    let mv_pos = vec4f({}, 1.0) * upos.mtx[in_pnmtxidx];"
+        "\n    out.pos = vec4f(mv_pos, 1.0) * uview.proj;",
         vtx_attr(config, GX_VA_POS));
   } else if (config.lineMode == 3) {
     // GX_POINTS: expand single vertex to axis-aligned screen-space square
     vtxXfrAttrsPre +=
-        "\n    let clip = vec4f(mv_pos, 1.0) * ubuf.proj;"
-        "\n    let viewport_scale = ubuf.render_viewport_size / max(ubuf.logical_viewport_size, vec2f(1.0));"
-        "\n    let point_size = ubuf.line_width * min(viewport_scale.x, viewport_scale.y);"
+        "\n    let clip = vec4f(mv_pos, 1.0) * uview.proj;"
+        "\n    let viewport_scale = uview.render_viewport_size / max(uview.logical_viewport_size, vec2f(1.0));"
+        "\n    let point_size = uview.line_width * min(viewport_scale.x, viewport_scale.y);"
         "\n    let x_sign = select(-1.0, 1.0, (vidx & 1u) != 0u);"
         "\n    let y_sign = select(-1.0, 1.0, vidx >= 2u);"
         "\n    let offset_px = vec2f(x_sign, y_sign) * (point_size / 2.0);"
-        "\n    let offset_ndc = (offset_px * 2.0) / ubuf.render_viewport_size;"
+        "\n    let offset_ndc = (offset_px * 2.0) / uview.render_viewport_size;"
         "\n    out.pos = vec4f(clip.xy + offset_ndc * clip.w, clip.zw);";
   } else {
     // GX_LINES / GX_LINESTRIP: expand line segment perpendicular to direction
     vtxXfrAttrsPre +=
-        "\n    let clip_a = vec4f(mv_pos_a, 1.0) * ubuf.proj;"
-        "\n    let clip_b = vec4f(mv_pos_b, 1.0) * ubuf.proj;"
+        "\n    let clip_a = vec4f(mv_pos_a, 1.0) * uview.proj;"
+        "\n    let clip_b = vec4f(mv_pos_b, 1.0) * uview.proj;"
         "\n    let ndc_a = clip_a.xy / clip_a.w;"
         "\n    let ndc_b = clip_b.xy / clip_b.w;"
-        "\n    let viewport_scale = ubuf.render_viewport_size / max(ubuf.logical_viewport_size, vec2f(1.0));"
-        "\n    let delta_px = (ndc_b - ndc_a) / 2.0 * ubuf.render_viewport_size;"
+        "\n    let viewport_scale = uview.render_viewport_size / max(uview.logical_viewport_size, vec2f(1.0));"
+        "\n    let delta_px = (ndc_b - ndc_a) / 2.0 * uview.render_viewport_size;"
         "\n    let dir_px = select(vec2f(1.0, 0.0), normalize(delta_px), dot(delta_px, delta_px) > 1e-10);"
         "\n    let perp_px = vec2f(-dir_px.y, dir_px.x);"
-        "\n    let line_width = ubuf.line_width * min(viewport_scale.x, viewport_scale.y);"
+        "\n    let line_width = uview.line_width * min(viewport_scale.x, viewport_scale.y);"
         "\n    let offset_px = perp_px * (line_width / 2.0) * select(-1.0, 1.0, (vidx & 1u) != 0u);"
-        "\n    let offset_ndc = (offset_px * 2.0) / ubuf.render_viewport_size;"
+        "\n    let offset_ndc = (offset_px * 2.0) / uview.render_viewport_size;"
         "\n    let clip_base = select(clip_a, clip_b, use_b);"
         "\n    out.pos = vec4f(clip_base.xy + offset_ndc * clip_base.w, clip_base.zw);";
   }
   vtxXfrAttrsPre += fmt::format(
-      "\n    let nrm_tmp = vec4f({}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+      "\n    let nrm_tmp = vec4f({}, 0.0) * unrm.mtx[in_pnmtxidx];"
       "\n    let mv_nrm = select(nrm_tmp, normalize(nrm_tmp), dot(nrm_tmp, nrm_tmp) > 1e-10);",
       vtx_attr(config, GX_VA_NRM));
   if constexpr (EnableNormalVisualization) {
@@ -1071,9 +1152,6 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     vtxXfrAttrsPre += "\n    out.mv_nrm = mv_nrm;";
   }
 
-  uniBufAttrs += "\n    proj: mat4x4f,";
-  uniBufAttrs += fmt::format("\n    postex_mtx: array<mat3x4f, {}>,", MaxPnMtx + MaxTexMtx);
-  uniBufAttrs += fmt::format("\n    nrm_mtx: array<mat3x4f, {}>,", MaxPnMtx);
   std::string fragmentFnPre;
   std::string fragmentFn;
 
@@ -1125,37 +1203,19 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   }
 
   if (info.loadsTevReg.test(0)) {
-    uniBufAttrs += "\n    tevprev: vec4f,";
-    fragmentFnPre += "\n    var prev = ubuf.tevprev;";
+    fragmentFnPre += "\n    var prev = umat.tevprev;";
   } else {
     fragmentFnPre += "\n    var prev: vec4f;";
   }
   for (int i = 1 /* Skip TEVPREV */; i < info.loadsTevReg.size(); ++i) {
     if (info.loadsTevReg.test(i)) {
-      uniBufAttrs += fmt::format("\n    tevreg{}: vec4f,", i - 1);
-      fragmentFnPre += fmt::format("\n    var tevreg{0} = ubuf.tevreg{0};", i - 1);
+      fragmentFnPre += fmt::format("\n    var tevreg{0} = umat.tevreg{0};", i - 1);
     } else if (info.writesTevReg.test(i)) {
       fragmentFnPre += fmt::format("\n    var tevreg{0}: vec4f;", i - 1);
     }
   }
 
   if (info.lightingEnabled) {
-    uniBufAttrs += fmt::format(FMT_STRING(R"""(
-    lights: array<Light, {}>,
-    lightState0: u32,
-    lightState1: u32,
-    lightState0a: u32,
-    lightState1a: u32,)"""),
-                               GX::MaxLights);
-    uniformPre +=
-        "\n"
-        "struct Light {\n"
-        "    pos: vec3f,\n"
-        "    dir: vec3f,\n"
-        "    color: vec4f,\n"
-        "    cos_att: vec3f,\n"
-        "    dist_att: vec3f,\n"
-        "};";
     if (UsePerPixelLighting) {
       vtxOutAttrs += fmt::format("\n    @location({}) mv_pos: vec3f,", vtxOutIdx++);
       vtxOutAttrs += fmt::format("\n    @location({}) mv_nrm: vec3f,", vtxOutIdx++);
@@ -1172,18 +1232,6 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
 
     const auto& cc = config.colorChannels[i];
     const auto& cca = config.colorChannels[i + GX_ALPHA0];
-    if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
-      uniBufAttrs += fmt::format("\n    cc{0}_amb: vec4f,", i);
-    }
-    if (cc.matSrc == GX_SRC_REG) {
-      uniBufAttrs += fmt::format("\n    cc{0}_mat: vec4f,", i);
-    }
-    if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
-      uniBufAttrs += fmt::format("\n    cc{0}a_amb: vec4f,", i);
-    }
-    if (cca.matSrc == GX_SRC_REG) {
-      uniBufAttrs += fmt::format("\n    cc{0}a_mat: vec4f,", i);
-    }
 
     // Output vertex color if necessary
     if (UsePerPixelLighting) {
@@ -1205,11 +1253,6 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       fragmentFnPre += fmt::format("\n    var rast{0} = in.cc{0};", i);
     }
   }
-  for (int i = 0; i < info.sampledKColors.size(); ++i) {
-    if (info.sampledKColors.test(i)) {
-      uniBufAttrs += fmt::format("\n    kcolor{}: vec4f,", i);
-    }
-  }
   for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
     if (!info.sampledTexCoords.test(i)) {
       continue;
@@ -1224,9 +1267,9 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       // Emboss bump: offset the source texcoord by the light projected onto tangent/binormal
       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
       vtxXfrAttrs += fmt::format(
-          "\n    let bump_ldir{0} = normalize(ubuf.lights[{1}].pos - mv_pos);"
-          "\n    let bump_tan{0} = vec4f(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
-          "\n    let bump_bin{0} = vec4f(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+          "\n    let bump_ldir{0} = normalize(ulights.lights[{1}].pos - mv_pos);"
+          "\n    let bump_tan{0} = vec4f(in_tangent, 0.0) * unrm.mtx[in_pnmtxidx];"
+          "\n    let bump_bin{0} = vec4f(in_binrm, 0.0) * unrm.mtx[in_pnmtxidx];"
           "\n    out.tex{0}_uv = tc{2}_proj.xy + vec2f(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, "
           "bump_bin{0}));",
           i, lightIdx, tcg.embossSrc);
@@ -1240,10 +1283,17 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_attr(config, GX_VA_POS));
     } else if (tcg.src == GX_TG_NRM) {
       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, vtx_attr(config, GX_VA_NRM));
-    } else if (tcg.src == GX_TG_COLOR0) {
-      vtxXfrAttrs += fmt::format("\n    var tc{} = {};", i, vtx_attr(config, GX_VA_CLR0));
-    } else if (tcg.src == GX_TG_COLOR1) {
-      vtxXfrAttrs += fmt::format("\n    var tc{} = {};", i, vtx_attr(config, GX_VA_CLR1));
+    } else if (tcg.src == GX_TG_COLOR0 || tcg.src == GX_TG_COLOR1) {
+      // A colour-source texgen takes the channel's rasterized output, the lit result, not the vertex colour.
+      const u32 ch = tcg.src == GX_TG_COLOR0 ? 0 : 1;
+      const auto vtxSrc = vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + ch));
+      // Per-pixel lighting computes the channel in the fragment stage, out of a vertex-stage texgen's reach, so it
+      // falls back to the attribute there.
+      if (!UsePerPixelLighting && info.sampledColorChannels.test(ch)) {
+        vtxXfrAttrs += fmt::format("\n    var tc{} = out.cc{};", i, ch);
+      } else {
+        vtxXfrAttrs += fmt::format("\n    var tc{} = {};", i, vtxSrc);
+      }
     } else if (tcg.src == GX_TG_BINRM) {
       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, nbt_slice_local(NbtSlice::B));
     } else if (tcg.src == GX_TG_TANGENT) {
@@ -1251,13 +1301,20 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     } else
       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+      // Rows below GX_TEXMTX0 are position matrices, in the position matrix piece, and the rest texture matrices, in
+      // the view piece. Each index is clamped, since select reads both.
       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
+        vtxXfrAttrs += fmt::format(
+            "\n    var tc{0}_tmp = select(tc{0} * upos.mtx[min(in_texmtxidx{0} / 3u, {1}u)], "
+            "tc{0} * uview.tex_mtx[min((in_texmtxidx{0} - {2}u) / 3u, {3}u)], "
+            "in_texmtxidx{0} >= {2}u);",
+            i, MaxPnMtx - 1, static_cast<u32>(GX_TEXMTX0), MaxTexMtx - 1);
       } else if (tcg.mtx == GX_IDENTITY) {
         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0}.xyz;", i);
+      } else if (tcg.mtx >= GX_TEXMTX0) {
+        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * uview.tex_mtx[{1}];", i, (tcg.mtx - GX_TEXMTX0) / 3);
       } else {
-        u32 texMtxIdx = (tcg.mtx) / 3;
-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
+        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * upos.mtx[{1}];", i, tcg.mtx / 3);
       }
       if (tcg.type == GX_TG_MTX2x4) {
         vtxXfrAttrs += fmt::format("\n    tc{0}_tmp.z = 1.0f;", i);
@@ -1273,22 +1330,22 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     } else {
       u32 postMtxIdx = (tcg.postMtx - GX_PTTEXMTX0) / 3;
       vtxXfrAttrs +=
-          fmt::format("\n    var tc{0}_proj = vec4f(tc{0}_tmp.xyz, 1.0) * ubuf.postmtx[{1}];", i, postMtxIdx);
+          fmt::format("\n    var tc{0}_proj = vec4f(tc{0}_tmp.xyz, 1.0) * uview.postmtx[{1}];", i, postMtxIdx);
     }
     // Apply line/point tex offset
     if (config.lineMode == 3) {
       // GX_POINTS: offset S for right columns, T for bottom rows
       vtxXfrAttrs += fmt::format(
-          "\n    if ((ubuf.line_texcoord_mask & (1u << {0})) != 0u) {{"
-          "\n        if ((vidx & 1u) != 0u) {{ tc{0}_proj.x += ubuf.line_tex_offset; }}"
-          "\n        if (vidx >= 2u) {{ tc{0}_proj.y += ubuf.line_tex_offset; }}"
+          "\n    if ((uview.line_texcoord_mask & (1u << {0})) != 0u) {{"
+          "\n        if ((vidx & 1u) != 0u) {{ tc{0}_proj.x += uview.line_tex_offset; }}"
+          "\n        if (vidx >= 2u) {{ tc{0}_proj.y += uview.line_tex_offset; }}"
           "\n    }}",
           i);
     } else if (config.lineMode != 0) {
       // GX_LINES / GX_LINESTRIP: offset one axis for perpendicular side
       vtxXfrAttrs += fmt::format(
-          "\n    if ((ubuf.line_texcoord_mask & (1u << {0})) != 0u && (vidx & 1u) != 0u) {{"
-          "\n        tc{0}_proj.y += ubuf.line_tex_offset;"
+          "\n    if ((uview.line_texcoord_mask & (1u << {0})) != 0u && (vidx & 1u) != 0u) {{"
+          "\n        tc{0}_proj.y += uview.line_tex_offset;"
           "\n    }}",
           i);
     }
@@ -1337,12 +1394,12 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     // The shader carries normalized UVs, so convert that texel-space result back
     // into normalized coordinates for the indirect texture sample.
     const auto scaleExpr =
-        fmt::format("tex{0}_uv * ubuf.texcoord_scale[{0}].xy * vec2f({1}, {2}) / ubuf.tex{3}_size_bias.xy", texCoordId,
+        fmt::format("tex{0}_uv * umat.texcoord_scale[{0}].xy * vec2f({1}, {2}) / umat.tex{3}_size_bias.xy", texCoordId,
                     ind_scale(indStage.scaleS), ind_scale(indStage.scaleT), texMapId);
     fragmentFnPre += fmt::format(
         "\n    // Indirect stage {0}"
         "\n    var t_IndTexCoord{0} = 255.0 * textureSampleBias(tex{1}, tex{1}_samp, {2}, "
-        "ubuf.tex{1}_size_bias.z).abg;",
+        "umat.tex{1}_size_bias.z).abg;",
         i, texMapId, scaleExpr);
   }
   if (info.usedIndStages.any()) {
@@ -1414,8 +1471,8 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           // Static 2x3 matrix: dot(mat_row, vec3(S,T,U)) * scale
           u32 mtxIdx = stage.indTexMtxId - GX_ITM_0;
           fragmentFnPre += fmt::format(
-              "\n    let ind{0}_c0 = ubuf.ind_mtx[{1}][0];"
-              "\n    let ind{0}_c1 = ubuf.ind_mtx[{1}][1];",
+              "\n    let ind{0}_c0 = uview.ind_mtx[{1}][0];"
+              "\n    let ind{0}_c1 = uview.ind_mtx[{1}][1];",
               i, mtxIdx);
           indirectOffsetTexel = fmt::format(
               "vec2f("
@@ -1428,16 +1485,16 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           u32 mtxIdx = stage.indTexMtxId - GX_ITM_S0;
           u32 regTexCoord = underlying(stage.texCoordId);
           indirectOffsetTexel = fmt::format(
-              "tex{1}_uv * ubuf.texcoord_scale[{1}].xy * ind{0}_coord.x"
-              " * ubuf.ind_mtx[{2}][1][2] / 256.0",
+              "tex{1}_uv * umat.texcoord_scale[{1}].xy * ind{0}_coord.x"
+              " * uview.ind_mtx[{2}][1][2] / 256.0",
               i, regTexCoord, mtxIdx);
         } else if (stage.indTexMtxId >= GX_ITM_T0 && stage.indTexMtxId <= GX_ITM_T2 && hasBaseCoord) {
           // Dynamic T: result = scaled texcoord * ind_coord.y * scale / 256
           u32 mtxIdx = stage.indTexMtxId - GX_ITM_T0;
           u32 regTexCoord = underlying(stage.texCoordId);
           indirectOffsetTexel = fmt::format(
-              "tex{1}_uv * ubuf.texcoord_scale[{1}].xy * ind{0}_coord.y"
-              " * ubuf.ind_mtx[{2}][1][2] / 256.0",
+              "tex{1}_uv * umat.texcoord_scale[{1}].xy * ind{0}_coord.y"
+              " * uview.ind_mtx[{2}][1][2] / 256.0",
               i, regTexCoord, mtxIdx);
         }
       }
@@ -1473,7 +1530,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           baseCoordExpr = fmt::format("tex{}_uv", texCoordId);
         } else {
           fragmentFnPre +=
-              fmt::format("\n    var ind{0}_texel = tex{1}_uv * ubuf.texcoord_scale[{1}].xy;", i, texCoordId);
+              fmt::format("\n    var ind{0}_texel = tex{1}_uv * umat.texcoord_scale[{1}].xy;", i, texCoordId);
           baseCoordExpr = fmt::format("ind{}_texel", i);
         }
       }
@@ -1504,7 +1561,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           if (useSimpleCoords) {
             fragmentFnPre += fmt::format("\n    var ind{0}_uv = t_TexCoord;", i);
           } else {
-            fragmentFnPre += fmt::format("\n    var ind{0}_uv = t_TexCoord / ubuf.tex{1}_size_bias.xy;", i, texMapId);
+            fragmentFnPre += fmt::format("\n    var ind{0}_uv = t_TexCoord / umat.tex{1}_size_bias.xy;", i, texMapId);
           }
           uvIn = fmt::format("ind{0}_uv", i);
         }
@@ -1521,36 +1578,21 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       uvIn = fmt::format("tex{0}_uv", underlying(stage.texCoordId));
     }
     fragmentFnPre +=
-        fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
+        fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, umat.tex{1}_size_bias.z);", i,
                     underlying(stage.texMapId), uvIn);
   }
-  if (info.usesPTTexMtx.any()) {
-    uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
-  }
   if (info.usesFog) {
-    uniformPre +=
-        "\n"
-        "struct Fog {\n"
-        "    color: vec4f,\n"
-        "    a: f32,\n"
-        "    b: f32,\n"
-        "    c: f32,\n"
-        "    range_center: f32,\n"
-        "    range_k: array<vec4f, 3>,\n"
-        "}";
-    uniBufAttrs += "\n    fog: Fog,";
-
     const std::string_view fogDepth = UseReversedZ ? "(1.0 - in.pos.z)" : "in.pos.z";
     if ((config.fogType & 0x08) != 0) {
-      fragmentFn += fmt::format("\n    // Orthographic fog\n    var fogBase = ubuf.fog.a * {};", fogDepth);
+      fragmentFn += fmt::format("\n    // Orthographic fog\n    var fogBase = uview.fog.a * {};", fogDepth);
     } else {
       fragmentFn +=
-          fmt::format("\n    // Perspective fog\n    var fogBase = ubuf.fog.a / (ubuf.fog.b - {});", fogDepth);
+          fmt::format("\n    // Perspective fog\n    var fogBase = uview.fog.a / (uview.fog.b - {});", fogDepth);
     }
     if (config.fogRangeEnabled) {
       fragmentFn += "\n        fogBase *= bitcast<f32>(abuf[imm.fog_range_base + u32(in.pos.x)]);";
     }
-    fragmentFn += "\n    var fogF = clamp(fogBase - ubuf.fog.c, 0.0, 1.0);";
+    fragmentFn += "\n    var fogF = clamp(fogBase - uview.fog.c, 0.0, 1.0);";
     switch (config.fogType) {
       DEFAULT_FATAL("invalid fog type {}", config.fogType);
     case GX_FOG_PERSP_LIN:
@@ -1576,17 +1618,12 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
           "\n    var fogZ = exp2(-8.0 * fogF * fogF);";
       break;
     }
-    fragmentFn += "\n    prev = vec4f(mix(prev.rgb, ubuf.fog.color.rgb, clamp(fogZ, 0.0, 1.0)), prev.a);";
-  }
-  uniBufAttrs += fmt::format("\n    texcoord_scale: array<vec4f, {}>,", MaxTexCoord);
-  if (info.usedIndTexMtxs.any()) {
-    uniBufAttrs += fmt::format("\n    ind_mtx: array<mat2x4f, {}>,", MaxIndTexMtxs);
+    fragmentFn += "\n    prev = vec4f(mix(prev.rgb, uview.fog.color.rgb, clamp(fogZ, 0.0, 1.0)), prev.a);";
   }
   for (int i = 0; i < info.sampledTextures.size(); ++i) {
     if (!info.sampledTextures.test(i)) {
       continue;
     }
-    uniBufAttrs += fmt::format("\n    tex{}_size_bias: vec4f,", i);
     texBindings += fmt::format(
         "\n@group(2) @binding({1})\n"
         "var tex{0}: texture_2d<f32>;\n"
@@ -1672,8 +1709,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
   }
 
-  auto shaderSource =
-      fmt::format(R"""(
+  auto shaderSource = fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -2000,7 +2036,6 @@ fn tev_overflow_vec4f(in: vec4f) -> vec4f {{
   return (byte_space - floor(byte_space / 256.0) * 256.0) / 255.0;
 }}
 
-{8}
 
 struct Immediate {{
     vtx_start: u32,
@@ -2013,16 +2048,11 @@ struct Immediate {{
 }};
 var<immediate> imm: Immediate;
 
-struct Uniform {{
-    render_viewport_size: vec2f,
-    logical_viewport_size: vec2f,{0}
-}};
+{0}
 @group(0) @binding(0)
 var<storage, read> vbuf: array<u32>;
 @group(0) @binding(1)
-var<storage, read> abuf: array<u32>;
-@group(1) @binding(0)
-var<uniform> ubuf: Uniform;{1}
+var<storage, read> abuf: array<u32>;{1}
 
 struct VertexOutput {{
     @builtin(position) pos: vec4f,{2}
@@ -2036,13 +2066,13 @@ fn vs_main(
     return out;
 }}
 
-{9}
+{8}
 @fragment
-fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
+fn fs_main(in: VertexOutput) -> {9} {{{6}{5}{10}
 }}
 )""",
-                  uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn, fragmentFnPre,
-                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn);
+                                  uniform_pieces(), texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
+                                  fragmentFnPre, vtxXfrAttrsPre, fragmentOutput, fragmentOutputType, fragmentReturn);
   if (dstAlphaMode == DstAlphaMode::DualSource) {
     shaderSource.insert(0, "enable dual_source_blending;\n");
   }

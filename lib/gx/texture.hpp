@@ -23,8 +23,13 @@ struct TextureStats {
 
 const TextureStats& texture_stats() noexcept;
 
+// The converted-texture content cache's budget in bytes: the CMake setting AURORA_TEXTURE_CONTENT_CACHE_BYTES.
+#ifndef AURORA_TEXTURE_CONTENT_CACHE_BYTES
+#define AURORA_TEXTURE_CONTENT_CACHE_BYTES 134217728
+#endif
+
 namespace texture {
-constexpr uint64_t ContentCacheBudgetBytes = 128ull * 1024ull * 1024ull;
+constexpr uint64_t ContentCacheBudgetBytes = AURORA_TEXTURE_CONTENT_CACHE_BYTES;
 constexpr uint64_t ObjectCacheIdleFrames = 600;
 constexpr bool AsyncTextureReplacements = true;
 constexpr uint32_t ReplacementThumbnailDim = 64;
@@ -36,7 +41,14 @@ size_t tlut_source_size(u16 numEntries) noexcept;
 void invalidate_bindings() noexcept;
 uint64_t current_bind_generation() noexcept;
 void invalidate_replacement(uint64_t replacementId) noexcept;
+// The last frame a texture drawn with this replacement was bound in, 0 for none.
+uint64_t replacement_last_used_frame(uint64_t replacementId) noexcept;
+uint64_t current_frame() noexcept;
 void end_frame() noexcept;
+// Queues a background conversion of this texture's current contents, once its mip count is known.
+void preconvert_texture(const GXTexObj_& obj) noexcept;
+// True once every queued pre-conversion has finished. Tests only.
+bool preconversion_idle_for_testing() noexcept;
 void shutdown() noexcept;
 void set_content_cache_budget_for_testing(uint64_t bytes) noexcept;
 

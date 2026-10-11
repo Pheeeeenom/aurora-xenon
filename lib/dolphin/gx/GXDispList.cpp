@@ -2,6 +2,7 @@
 #include "__gx.h"
 
 #include "../../gx/fifo.hpp"
+#include "dolphin/gx/GXAurora.h"
 
 #include <cstring>
 
@@ -57,8 +58,18 @@ void GXCallDisplayList(const void* data, u32 nbytes) {
     __GXSendFlushPrim();
   }
 
-  // Write display list contents to the FIFO
-  aurora::gx::fifo::write_data(data, nbytes);
+  // A call inside a list being recorded can't name another list (GX has no nested calls), so its
+  // bytes go into the recording.
+  if (aurora::gx::fifo::in_display_list()) {
+    aurora::gx::fifo::write_data(data, nbytes);
+    return;
+  }
+
+  // The list's address, not its bytes: the FIFO processor reads them when it reaches the call, as
+  // the SDK's GX_CMD_CALL_DL has the GPU do, which saves copying them here.
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(GX_AURORA), static_cast<uint16_t>(GX_AURORA_CALL_DISPLAY_LIST),
+                                  static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)),
+                                  static_cast<uint32_t>(nbytes));
   aurora::gx::fifo::publish();
 }
 

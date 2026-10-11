@@ -8,8 +8,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
+#include <memory>
+#include <new>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace aurora::gfx::detail {
@@ -29,13 +33,27 @@ struct CustomDrawCommand {
   alignas(std::max_align_t) std::array<std::byte, InlineDrawPayloadSize> payload{};
 };
 
-struct RenderPass;
-using DrawEncoder = void (*)(void* payload, const wgpu::RenderPassEncoder& pass, const RenderPass& passInfo);
+// Which renderer a draw's payload is for; the backend draws each kind.
+enum class DrawKind : uint8_t {
+  Gx,    // gx::DrawData
+  Clear, // clear::DrawData
+  RmlUi, // rmlui::DrawData, recorded only with RmlUi on
+};
 
 struct DrawCommand {
-  DrawEncoder encoder = nullptr;
+  DrawKind kind = DrawKind::Gx;
   alignas(std::max_align_t) std::array<std::byte, InlineDrawPayloadSize> payload{};
 };
+
+template <class T>
+concept InlinePayload =
+    std::is_trivially_copyable_v<T> && std::is_aggregate_v<T> && std::is_trivially_destructible_v<T>;
+
+template <InlinePayload T>
+T& inline_payload(void* ptr) noexcept {
+  // C++20 equivalent of C++23's std::start_lifetime_as
+  return *std::launder(static_cast<T*>(std::memmove(ptr, ptr, sizeof(T))));
+}
 
 enum class CommandType {
   SetViewport,
@@ -64,25 +82,22 @@ using CommandList = std::vector<Command>;
 struct RenderPass {
   struct ColorAttachment {
     ColorAttachmentSemantic semantic = ColorAttachmentSemantic::Auxiliary;
-    wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
-    wgpu::Extent3D size;
-    wgpu::TextureView view;
-    wgpu::TextureView resolveView;
+    TextureFormat format = TextureFormat::Undefined;
+    TextureExtent size{};
+    // Null for the EFB's attachment of this semantic, which the backend owns.
+    TextureHandle target;
     Vec4<float> clearValue{0.f, 0.f, 0.f, 0.f};
-    wgpu::LoadOp loadOp = wgpu::LoadOp::Undefined;
-    wgpu::StoreOp storeOp = wgpu::StoreOp::Store;
     bool clear = true;
   };
 
   std::string label;
   std::array<ColorAttachment, MaxColorAttachments> colorAttachments;
   uint32_t colorAttachmentCount = 0;
-  wgpu::TextureView depthStencilView;
-  wgpu::TextureFormat depthStencilFormat = wgpu::TextureFormat::Undefined;
-  wgpu::Texture copySourceTexture;
-  wgpu::TextureView copySourceView;
-  wgpu::TextureView copySourceDepthView;
-  wgpu::Texture copySourceNormalTexture;
+  // Null for the EFB's depth.
+  TextureHandle depthTarget;
+  TextureFormat depthStencilFormat = TextureFormat::Undefined;
+  // Set when a backend's own API opened the pass on its own targets (RmlUi's on Dawn), which replace the ones above.
+  std::shared_ptr<const backend::PassTargets> backendTargets;
   uint32_t msaaSamples = 1;
 
   TextureHandle resolveTarget;
@@ -90,15 +105,11 @@ struct RenderPass {
   GXPixelFmt resolveSourceFormat = GX_PF_RGBA6_Z24;
   ClipRect resolveRect;
   Range resolveUniformRange;
-  wgpu::Texture snapshotColorDst;
-  wgpu::TextureView snapshotDepthDst;
-  wgpu::Texture snapshotNormalDst;
+  // resolve_pass's copies of the pass's colour, depth (R32Float) and normal targets.
+  TextureHandle snapshotColor;
+  TextureHandle snapshotDepth;
+  TextureHandle snapshotNormal;
   float clearDepthValue = 1.f;
-  wgpu::LoadOp depthLoadOp = wgpu::LoadOp::Undefined;
-  wgpu::StoreOp depthStoreOp = wgpu::StoreOp::Store;
-  wgpu::LoadOp stencilLoadOp = wgpu::LoadOp::Undefined;
-  wgpu::StoreOp stencilStoreOp = wgpu::StoreOp::Undefined;
-  uint32_t stencilClearValue = 0;
   CommandList commands;
   bool clearDepth = true;
   bool hasDepth = true;
@@ -110,7 +121,7 @@ struct RenderPass {
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 
   RenderTargetLayout target_layout() const noexcept;
-  bool has_consumer() const { return resolveTarget || snapshotColorDst || snapshotDepthDst || snapshotNormalDst; }
+  bool has_consumer() const { return resolveTarget || snapshotColor || snapshotDepth || snapshotNormal; }
   bool has_content() const {
     if (hasDraws || clearDepth) {
       return true;
@@ -139,7 +150,7 @@ inline void finalize_render_target_layout(RenderTargetLayout& layout) noexcept {
 inline RenderTargetLayout RenderPass::target_layout() const noexcept {
   RenderTargetLayout layout{
       .colorAttachmentCount = colorAttachmentCount,
-      .depthStencilFormat = hasDepth || hasStencil ? depthStencilFormat : wgpu::TextureFormat::Undefined,
+      .depthStencilFormat = hasDepth || hasStencil ? depthStencilFormat : TextureFormat::Undefined,
       .sampleCount = msaaSamples,
   };
   for (uint32_t i = 0; i < colorAttachmentCount; ++i) {
@@ -153,12 +164,6 @@ inline RenderTargetLayout RenderPass::target_layout() const noexcept {
   finalize_render_target_layout(layout);
   return layout;
 }
-
-struct TextureCopy {
-  wgpu::TexelCopyTextureInfo src;
-  wgpu::TexelCopyTextureInfo dst;
-  wgpu::Extent3D size;
-};
 
 struct EncoderTask {
   EncoderTaskId type = InvalidEncoderTask;
@@ -176,7 +181,7 @@ struct FrameOp {
   FrameOpType type = FrameOpType::RenderPass;
   uint32_t index = 0;
   RenderPass* renderPass = nullptr;
-  TextureCopy* textureCopy = nullptr;
+  const backend::TextureCopy* textureCopy = nullptr;
   EncoderTask* encoderTask = nullptr;
   StagingHighWater highWater;
   std::vector<const TextureUpload*> textureUploads;
@@ -186,7 +191,7 @@ using RenderPassList = std::deque<RenderPass>;
 
 struct FramePacket {
   RenderPassList renderPasses;
-  std::deque<TextureCopy> textureCopies;
+  std::deque<std::shared_ptr<const backend::TextureCopy>> textureCopies;
   std::deque<EncoderTask> encoderTasks;
   std::deque<FrameOp> ops;
   std::deque<TextureUpload> textureUploads;
@@ -198,12 +203,12 @@ struct FramePacket {
   ByteBuffer indices;
   ByteBuffer storage;
   ByteBuffer textureUpload;
-  wgpu::CommandEncoder encoder;
-  std::vector<AfterSubmitCallback> afterSubmitCallbacks;
   uint64_t frameId = 0;
   uint32_t frameIndex = 0;
-  size_t stagingBuffer = 0;
-  StagingHighWater copied;
+  // The frame slot, under which a backend keeps its per-frame state.
+  size_t slot = 0;
+  // Where the backend writes the presented frame as an image (aurora_capture_frame); empty for none.
+  std::string capturePath;
   AuroraStats stats{};
 };
 

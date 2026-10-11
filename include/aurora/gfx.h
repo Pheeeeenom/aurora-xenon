@@ -29,9 +29,14 @@ typedef struct {
 } AuroraStats;
 
 const AuroraStats* aurora_get_stats();
+/* AuroraStats' pipeline counters, read atomically: the struct's own fields race the compilation threads. */
+void aurora_get_pipeline_counts(uint32_t* queued, uint32_t* created);
 float aurora_get_fps();
 
 void aurora_enable_vsync(bool enabled);
+/* Whether the present mode in use waits for the vblank. Vsync off still gets Fifo on a surface without Mailbox or
+ * Immediate, which a game pacing itself needs to know. */
+bool aurora_present_waits_for_vblank();
 
 #ifdef __cplusplus
 }

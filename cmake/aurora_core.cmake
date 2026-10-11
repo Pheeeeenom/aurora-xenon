@@ -21,7 +21,8 @@ target_compile_definitions(aurora_core PUBLIC AURORA TARGET_PC)
 target_include_directories(aurora_core PUBLIC include)
 target_link_libraries(aurora_core PUBLIC fmt::fmt ${AURORA_SDL3_TARGET} xxHash::xxhash)
 target_link_libraries(aurora_core PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient)
-if (AURORA_ENABLE_GX AND AURORA_CACHE_USE_ZSTD)
+# Only Dawn's shader cache is compressed.
+if (AURORA_USE_DAWN AND AURORA_CACHE_USE_ZSTD)
     target_compile_definitions(aurora_core PRIVATE AURORA_CACHE_USE_ZSTD)
     target_link_libraries(aurora_core PRIVATE zstd::libzstd)
 endif ()
@@ -70,7 +71,12 @@ if (AURORA_ENABLE_RMLUI)
 endif ()
 
 if (AURORA_ENABLE_GX)
-    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX WEBGPU_DAWN)
+    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX)
+endif ()
+
+# The Dawn backend's device, surface and cache, and <aurora/gfx.hpp>'s WebGPU extension API.
+if (AURORA_USE_DAWN)
+    target_compile_definitions(aurora_core PUBLIC AURORA_GFX_BACKEND_DAWN WEBGPU_DAWN)
     target_sources(aurora_core PRIVATE
             lib/webgpu/gpu.cpp
             lib/webgpu/gpu_cache.cpp

@@ -1,19 +1,11 @@
 add_library(aurora_gx STATIC
-        lib/gfx/clear.cpp
-        lib/gfx/depth_peek.cpp
-        lib/gfx/encoding.cpp
         lib/gfx/frame.cpp
+        lib/gfx/frame_path.cpp
         lib/gfx/pipeline_cache.cpp
         lib/gfx/recording.cpp
         lib/gfx/render_worker.cpp
-        lib/gfx/resource_cache.cpp
-        lib/gfx/dds_io.cpp
-        lib/gfx/tex_copy_conv.cpp
-        lib/gfx/tex_palette_conv.cpp
         lib/gfx/texture.cpp
-        lib/gfx/texture_format.cpp
         lib/gfx/texture_convert.cpp
-        lib/gfx/texture_replacement.cpp
         lib/gx/attr_fmt.cpp
         lib/gx/command_processor.cpp
         lib/gx/regs.cpp
@@ -21,8 +13,6 @@ add_library(aurora_gx STATIC
         lib/gx/fifo.cpp
         lib/gx/gx.cpp
         lib/gx/texture.cpp
-        lib/gx/pipeline.cpp
-        lib/gx/shader.cpp
         lib/gx/shader_info.cpp
         lib/dolphin/gx/GXBump.cpp
         lib/dolphin/gx/GXCull.cpp
@@ -43,15 +33,48 @@ add_library(aurora_gx STATIC
         lib/dolphin/gx/GXTransform.cpp
         lib/dolphin/gx/GXVert.cpp
         lib/dolphin/gx/GXAurora.cpp
-        lib/gfx/png_io.cpp
-        lib/gfx/png_io.hpp
 )
 add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
-target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxHash::xxhash)
-target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient PNG::PNG)
-target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+target_link_libraries(aurora_gx PUBLIC aurora::core xxHash::xxhash)
+target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient)
+# The command processor and the backends read them, all in this library.
+target_compile_definitions(aurora_gx PRIVATE AURORA_INDEX_PATTERN_VERTICES=${AURORA_INDEX_PATTERN_VERTICES}
+                                             AURORA_FIFO_RING_BYTES=${AURORA_FIFO_RING_BYTES})
+# The backend, and texture packs, which only Dawn loads.
+if (AURORA_USE_DAWN)
+    target_sources(aurora_gx PRIVATE
+            lib/gfx/clear.cpp
+            lib/gfx/depth_peek.cpp
+            lib/gfx/encoding.cpp
+            lib/gfx/resource_cache.cpp
+            lib/gfx/dds_io.cpp
+            lib/gfx/tex_copy_conv.cpp
+            lib/gfx/tex_palette_conv.cpp
+            lib/gfx/texture_format.cpp
+            lib/gfx/texture_replacement.cpp
+            lib/gx/pipeline.cpp
+            lib/gx/shader.cpp
+            lib/gfx/png_io.cpp
+            lib/gfx/png_io.hpp
+            lib/webgpu/backend.cpp
+            lib/webgpu/extension.cpp
+            lib/webgpu/present.cpp
+    )
+    target_link_libraries(aurora_gx PUBLIC dawn::webgpu_dawn)
+    target_link_libraries(aurora_gx PRIVATE PNG::PNG)
+    target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
+    # webgpu/backend.cpp starts the Dawn backends aurora_core's aurora.cpp used to.
+    get_target_property(_aurora_dawn_backends aurora_core COMPILE_DEFINITIONS)
+    list(FILTER _aurora_dawn_backends INCLUDE REGEX "^DAWN_ENABLE_BACKEND_")
+    target_compile_definitions(aurora_gx PRIVATE ${_aurora_dawn_backends})
+else ()
+    target_sources(aurora_gx PRIVATE
+            lib/null/backend.cpp
+            lib/null/texture_replacement.cpp
+    )
+endif ()
 
 if (AURORA_ENABLE_RMLUI)
     target_sources(aurora_gx PRIVATE

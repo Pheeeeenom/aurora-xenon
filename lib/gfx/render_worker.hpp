@@ -63,14 +63,21 @@ public:
 
   size_t acquire();
   std::optional<size_t> try_acquire();
+  // Blocks until a slot is free or `timeout` passes.
+  std::optional<size_t> acquire_for(std::chrono::nanoseconds timeout);
   void release(size_t slot);
   void reset();
   [[nodiscard]] size_t free_count() const;
 
 private:
+  size_t take_oldest();
+
   mutable std::mutex m_mutex;
   std::condition_variable m_cv;
-  std::vector<bool> m_freeSlots;
+  // Free slots in the order they were released. A backend whose begin_frame waits for the fence of the slot's last
+  // frame waits least for the slot freed first; the lowest free index can be the last frame's.
+  size_t m_slotCount;
+  std::deque<size_t> m_freeSlots;
 };
 
 void initialize();

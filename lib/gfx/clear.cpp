@@ -1,6 +1,7 @@
 #include "clear.hpp"
 
 #include "encoding.hpp"
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 #include "tracy/Tracy.hpp"
 
@@ -105,7 +106,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderT
   std::array<wgpu::ColorTargetState, MaxColorAttachments> colorTargets{};
   for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
     colorTargets[i] = {
-        .format = layout.colorAttachments[i].format,
+        .format = webgpu::to_wgpu(layout.colorAttachments[i].format),
         .writeMask = config.clearDepth && layout.colorAttachments[i].semantic == ColorAttachmentSemantic::Normal
                          ? wgpu::ColorWriteMask::All
                          : wgpu::ColorWriteMask::None,
@@ -120,7 +121,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderT
       .targets = colorTargets.data(),
   };
   const wgpu::DepthStencilState depthStencil{
-      .format = layout.depthStencilFormat,
+      .format = webgpu::to_wgpu(layout.depthStencilFormat),
       .depthWriteEnabled = config.clearDepth,
       .depthCompare = wgpu::CompareFunction::Always,
   };
@@ -131,19 +132,20 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderT
       .layout = pipelineLayout,
       .vertex = wgpu::VertexState{.module = module, .entryPoint = "vs_main"},
       .primitive = wgpu::PrimitiveState{.topology = wgpu::PrimitiveTopology::TriangleList},
-      .depthStencil = layout.depthStencilFormat != wgpu::TextureFormat::Undefined ? &depthStencil : nullptr,
+      .depthStencil = layout.depthStencilFormat != TextureFormat::Undefined ? &depthStencil : nullptr,
       .multisample = wgpu::MultisampleState{.count = layout.sampleCount},
       .fragment = &fragmentState,
   };
   return g_device.CreateRenderPipeline(&pipelineDescriptor);
 }
 
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize) {
+void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const TextureExtent& targetSize) {
   if (!bind_pipeline(data.pipeline, pass)) {
     return;
   }
 
-  pass.SetBlendConstant(&data.color);
+  const wgpu::Color color{data.color[0], data.color[1], data.color[2], data.color[3]};
+  pass.SetBlendConstant(&color);
   pass.SetViewport(0.f, 0.f, static_cast<float>(targetSize.width), static_cast<float>(targetSize.height), data.depth,
                    data.depth);
   pass.SetScissorRect(data.rect.x, data.rect.y, data.rect.width, data.rect.height);

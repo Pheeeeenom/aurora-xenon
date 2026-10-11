@@ -15,6 +15,33 @@
 // Forward declare dirty state flush
 extern "C" void __GXSetDirtyState();
 
+namespace aurora::gfx {
+// A frame boundary the FIFO processor reached, with what it found there, for the frame tests (gx_test_stubs.cpp).
+struct TestFrameEvent {
+  enum Kind : uint8_t { Begin, End, Close } kind;
+  size_t slot;
+  uint32_t draws;
+  AuroraViewportPolicy viewportPolicy;
+  Vec2<uint32_t> viSize;
+  u32 bpReg41;
+};
+extern std::vector<TestFrameEvent> g_testFrameEvents;
+
+namespace testing {
+// The last resolve_pass_into the FIFO processor made (gx_test_stubs.cpp).
+struct ResolveCall {
+  bool target = false;
+  ClipRect rect{};
+  bool clearColor = false;
+  bool clearAlpha = false;
+  bool clearDepth = false;
+  Vec4<float> clearColorValue{};
+  float clearDepthValue = 0.f;
+};
+extern ResolveCall lastResolve;
+} // namespace testing
+} // namespace aurora::gfx
+
 class GXFifoTest : public ::testing::Test {
 protected:
   void SetUp() override {

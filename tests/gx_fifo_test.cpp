@@ -6,19 +6,43 @@
 
 #include "gx_test_common.hpp"
 #include "__gx.h"
+#include "dolphin/vi/vi_internal.hpp"
+#include "gfx/backend.hpp"
+#include "gx/pipeline.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <thread>
+#include <utility>
 
 using aurora::gx::g_gxState;
 
+namespace aurora::vi {
+extern ConfigureHook g_testConfigureHook;
+} // namespace aurora::vi
+
+namespace aurora::gx {
+extern uint32_t g_testPipelineBuildCount;
+extern u8 g_testPushedPieces;
+} // namespace aurora::gx
+
+namespace aurora::gfx::backend {
+extern Limits g_testLimits;
+} // namespace aurora::gfx::backend
+
 namespace aurora::gfx {
+extern gx::DrawData g_testLastDraw;
 extern uint32_t g_testDrawCount;
 extern std::atomic<uint32_t> g_testProcessedDrawCount;
+extern uint32_t g_testStoragePushes;
+extern bool g_testNormalAttachment;
+extern std::vector<uint8_t> g_testLastVerts;
+extern std::vector<uint8_t> g_testIndices;
+extern bool g_testMergeDraws;
 namespace testing {
 extern std::atomic<uint32_t> beginOffscreenCount;
 extern std::atomic<uint32_t> endOffscreenCount;
@@ -105,6 +129,534 @@ TEST_F(GXFifoTest, FifoPublishesOnlyAtExplicitBoundary) {
   EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41123456u);
 }
 
+// Each of these draws needs 65,538 indices, two more than a u16 count holds.
+TEST_F(GXFifoTest, IndexCountPastU16) {
+  const std::array<std::pair<GXPrimitive, u16>, 3> draws{{
+      {GX_TRIANGLESTRIP, 21848},
+      {GX_TRIANGLEFAN, 21848},
+      {GX_QUADS, 43692},
+  }};
+  for (const auto& [prim, vertices] : draws) {
+    SCOPED_TRACE(static_cast<int>(prim));
+    aurora::gx::fifo::init();
+    aurora::gx::fifo::begin_frame();
+    GXClearVtxDesc();
+    GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+    aurora::gfx::g_testDrawCount = 0;
+
+    GXBegin(prim, GX_VTXFMT0, vertices);
+    for (u32 v = 0; v < vertices; ++v) {
+      GXPosition3u8(0, 0, 0);
+    }
+    GXEnd();
+    aurora::gx::fifo::drain();
+    aurora::gx::fifo::end_frame();
+    aurora::gx::fifo::shutdown();
+
+    EXPECT_EQ(aurora::gfx::g_testDrawCount, 1u);
+    EXPECT_EQ(aurora::gfx::g_testLastDraw.indexCount, 65538u);
+  }
+}
+
+namespace {
+constexpr std::array<GXPrimitive, 6> IndexedPrimitives{GX_QUADS, GX_TRIANGLESTRIP, GX_TRIANGLEFAN,
+                                                       GX_LINES, GX_LINESTRIP,     GX_POINTS};
+
+std::vector<u8> built_indices(GXPrimitive prim, u16 vtxStart, u16 vtxCount) {
+  aurora::ByteBuffer buf;
+  const u32 count = aurora::gx::fifo::prepare_idx_buffer(buf, prim, vtxStart, vtxCount);
+  EXPECT_EQ(buf.size(), count * sizeof(u16));
+  return {buf.data(), buf.data() + buf.size()};
+}
+
+// The pool's indices in range, or none if it isn't in the pool.
+std::vector<u8> pool_indices(aurora::gfx::Range range) {
+  const auto& pool = aurora::gfx::g_testIndices;
+  if (range.offset + range.size > pool.size()) {
+    return {};
+  }
+  return {pool.begin() + range.offset, pool.begin() + range.offset + range.size};
+}
+
+void draw_positions(GXPrimitive prim, u16 vertices) {
+  GXBegin(prim, GX_VTXFMT0, vertices);
+  for (u32 v = 0; v < vertices; ++v) {
+    GXPosition3u8(0, 0, 0);
+  }
+  GXEnd();
+}
+} // namespace
+
+// Every draw the patterns hold finds there the indices it would have built.
+TEST(GXIndexPatterns, EqualTheIndicesADrawBuilds) {
+  constexpr u32 MaxVertices = 300;
+  const auto patterns = aurora::gx::fifo::build_index_patterns(MaxVertices);
+  for (const auto prim : IndexedPrimitives) {
+    SCOPED_TRACE(static_cast<int>(prim));
+    for (u16 vertices = 0; vertices <= MaxVertices; ++vertices) {
+      SCOPED_TRACE(vertices);
+      const auto range = aurora::gx::fifo::index_pattern_range(patterns, prim, vertices);
+      ASSERT_TRUE(range.has_value());
+      EXPECT_EQ(range->offset % 4, 0u);
+      ASSERT_LE(range->offset + range->size, patterns.indices.size());
+      const std::vector<u8> pattern(patterns.indices.data() + range->offset,
+                                    patterns.indices.data() + range->offset + range->size);
+      EXPECT_EQ(pattern, built_indices(prim, 0, vertices));
+    }
+    EXPECT_FALSE(aurora::gx::fifo::index_pattern_range(patterns, prim, MaxVertices + 1).has_value());
+  }
+  EXPECT_FALSE(aurora::gx::fifo::index_pattern_range(patterns, GX_TRIANGLES, 3).has_value());
+
+  const auto none = aurora::gx::fifo::build_index_patterns(0);
+  EXPECT_TRUE(none.indices.empty());
+  EXPECT_FALSE(aurora::gx::fifo::index_pattern_range(none, GX_TRIANGLESTRIP, 4).has_value());
+}
+
+// The tests' patterns hold draws of up to 64 vertices (tests/CMakeLists.txt); longer draws build theirs in the pool.
+TEST_F(GXFifoTest, DrawsTakeIndicesFromThePatterns) {
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+  const auto& patterns = aurora::gx::fifo::index_patterns();
+  ASSERT_EQ(patterns.maxVertices, 64u);
+
+  draw_positions(GX_TRIANGLESTRIP, 64);
+  aurora::gx::fifo::drain();
+  auto draw = aurora::gfx::g_testLastDraw;
+  EXPECT_TRUE(draw.patternIndices);
+  EXPECT_EQ(draw.idxRange, aurora::gx::fifo::index_pattern_range(patterns, GX_TRIANGLESTRIP, 64));
+  EXPECT_EQ(draw.indexCount, 62u * 3);
+
+  aurora::gfx::g_testIndices.clear();
+  draw_positions(GX_TRIANGLESTRIP, 65);
+  aurora::gx::fifo::drain();
+  draw = aurora::gfx::g_testLastDraw;
+  EXPECT_FALSE(draw.patternIndices);
+  EXPECT_EQ(draw.indexCount, 63u * 3);
+  EXPECT_EQ(pool_indices(draw.idxRange), built_indices(GX_TRIANGLESTRIP, 0, 65));
+
+  draw_positions(GX_TRIANGLES, 3);
+  aurora::gx::fifo::drain();
+  EXPECT_FALSE(aurora::gfx::g_testLastDraw.patternIndices);
+  EXPECT_EQ(aurora::gfx::g_testLastDraw.indexCount, 0u);
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+}
+
+// A draw merged into one that took the patterns' indices draws the indices both would have built.
+TEST_F(GXFifoTest, DrawMergedIntoAPatternDrawBuildsBothIndices) {
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+  aurora::gfx::g_testIndices.clear();
+  aurora::gfx::g_testDrawCount = 0;
+
+  draw_positions(GX_TRIANGLESTRIP, 4);
+  aurora::gx::fifo::drain();
+  ASSERT_TRUE(aurora::gfx::g_testLastDraw.patternIndices);
+  aurora::gfx::g_testMergeDraws = true;
+  draw_positions(GX_TRIANGLESTRIP, 4);
+  aurora::gx::fifo::drain();
+  aurora::gfx::g_testMergeDraws = false;
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+
+  const auto& draw = aurora::gfx::g_testLastDraw;
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 1u);
+  EXPECT_FALSE(draw.patternIndices);
+  EXPECT_EQ(draw.vtxCount, 8u);
+  EXPECT_EQ(draw.indexCount, 12u);
+  auto expected = built_indices(GX_TRIANGLESTRIP, 0, 4);
+  const auto second = built_indices(GX_TRIANGLESTRIP, 4, 4);
+  expected.insert(expected.end(), second.begin(), second.end());
+  EXPECT_EQ(pool_indices(draw.idxRange), expected);
+}
+
+// ============================================================================
+// The command stream's chunks, and the frame boundaries in it
+// ============================================================================
+
+namespace {
+std::atomic<uint32_t> sTokensSeen{0};
+std::atomic<uint32_t> sTokensOutOfOrder{0};
+
+// Each token follows a BP write of its own number, which the processor must have applied first.
+void counting_draw_done_callback() {
+  const uint32_t seen = sTokensSeen.load(std::memory_order_relaxed);
+  if ((g_gxState.bpRegCache[0x41] & 0xFFFFFF) != seen) {
+    sTokensOutOfOrder.fetch_add(1, std::memory_order_relaxed);
+  }
+  sTokensSeen.store(seen + 1, std::memory_order_release);
+}
+
+void write_bp41(u32 value) {
+  const std::array<u8, 5> bytes{GX_LOAD_BP_REG, 0x41, static_cast<u8>(value >> 16), static_cast<u8>(value >> 8),
+                                static_cast<u8>(value)};
+  aurora::gx::fifo::write_data(bytes.data(), static_cast<u32>(bytes.size()));
+}
+
+void set_position_format() {
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+}
+} // namespace
+
+// The tests' stream is four 64 KiB chunks (tests/CMakeLists.txt). These commands go round them twice, and those that
+// cross a chunk's end are carried over whole: each is processed once, in order.
+TEST_F(GXFifoTest, CommandsGoRoundTheChunksInOrder) {
+  constexpr u32 Tokens = 60000;
+  sTokensSeen.store(0, std::memory_order_relaxed);
+  sTokensOutOfOrder.store(0, std::memory_order_relaxed);
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXSetDrawDoneCallback(counting_draw_done_callback);
+  for (u32 i = 0; i < Tokens; ++i) {
+    write_bp41(i);
+    GXSetDrawDone();
+  }
+  aurora::gx::fifo::drain();
+  GXSetDrawDoneCallback(nullptr);
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_GT(aurora::gx::fifo::write_position(), 2u * 4 * 64 * 1024);
+  EXPECT_EQ(sTokensSeen.load(std::memory_order_acquire), Tokens);
+  EXPECT_EQ(sTokensOutOfOrder.load(std::memory_order_relaxed), 0u);
+}
+
+// GXBegin(GX_AUTO) leaves the draw's size to patch at GXEnd. Carried over to the next chunk with the draw, it keeps its
+// stream position.
+TEST_F(GXFifoTest, AutoSizedDrawCarriedToTheNextChunkIsPatched) {
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  set_position_format();
+  while (aurora::gx::fifo::get_buffer_size() < 64 * 1024 - 8) {
+    aurora::gx::fifo::write_u8(GX_NOP);
+  }
+  aurora::gx::fifo::publish();
+  const u8* const chunk = aurora::gx::fifo::get_buffer_data();
+  aurora::gfx::g_testDrawCount = 0;
+
+  std::vector<u8> vertices;
+  GXBegin(GX_TRIANGLES, GX_VTXFMT0, GX_AUTO);
+  for (u8 v = 0; v < 6; ++v) {
+    GXPosition3u8(v, static_cast<u8>(v + 10), static_cast<u8>(v + 20));
+    vertices.insert(vertices.end(), {v, static_cast<u8>(v + 10), static_cast<u8>(v + 20)});
+  }
+  GXEnd();
+  EXPECT_NE(aurora::gx::fifo::get_buffer_data(), chunk);
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 1u);
+  EXPECT_EQ(aurora::gfx::g_testLastDraw.vtxCount, 6u);
+  EXPECT_EQ(aurora::gfx::g_testLastVerts, vertices);
+}
+
+// With every chunk holding commands the processor hasn't reached, the game thread waits for one, as a GameCube CPU
+// waited at its FIFO's high-water mark.
+TEST_F(GXFifoTest, WriterWaitsForAChunkTheProcessorHasLeft) {
+  constexpr u32 Writes = 64000; // 320,000 bytes, more than the four chunks hold
+  sBlockingCallbackEntered.store(false, std::memory_order_relaxed);
+  sBlockingCallbackMayReturn.store(false, std::memory_order_relaxed);
+  sBlockingCallbackReturned.store(false, std::memory_order_relaxed);
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXSetDrawDoneCallback(blocking_draw_done_callback);
+  GXSetDrawDone();
+  ASSERT_TRUE(wait_for(sBlockingCallbackEntered, true));
+  GXSetDrawDoneCallback(nullptr);
+
+  std::atomic<bool> written{false};
+  std::thread writer{[&written] {
+    for (u32 i = 0; i < Writes; ++i) {
+      write_bp41(i);
+      aurora::gx::fifo::publish();
+    }
+    written.store(true, std::memory_order_release);
+  }};
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  EXPECT_FALSE(written.load(std::memory_order_acquire));
+  sBlockingCallbackMayReturn.store(true, std::memory_order_release);
+  writer.join();
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_TRUE(sBlockingCallbackReturned.load(std::memory_order_acquire));
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41000000u | (Writes - 1));
+}
+
+// A frame's start goes into the stream ahead of what was written since the last frame ended, which belongs to the
+// frame, and brings the settings the frame records under.
+TEST_F(GXFifoTest, FrameBeginsAheadOfCommandsWrittenBetweenFrames) {
+  using aurora::gfx::TestFrameEvent;
+  auto& events = aurora::gfx::g_testFrameEvents;
+  events.clear();
+
+  aurora::gx::fifo::init();
+  write_bp41(0x123);
+  aurora::gx::fifo::begin_frame({.slot = 1, .viewportPolicy = AURORA_VIEWPORT_NATIVE, .viWidth = 608, .viHeight = 448});
+  aurora::gx::fifo::end_frame({.slot = 1});
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::shutdown();
+
+  ASSERT_EQ(events.size(), 2u);
+  EXPECT_EQ(events[0].kind, TestFrameEvent::Begin);
+  EXPECT_EQ(events[0].slot, 1u);
+  EXPECT_EQ(events[0].viewportPolicy, AURORA_VIEWPORT_NATIVE);
+  EXPECT_EQ(events[0].viSize, (aurora::Vec2<uint32_t>{608, 448}));
+  EXPECT_NE(events[0].bpReg41, 0x41000123u);
+  EXPECT_EQ(events[1].kind, TestFrameEvent::Close);
+  EXPECT_EQ(events[1].slot, 1u);
+  EXPECT_EQ(events[1].bpReg41, 0x41000123u);
+}
+
+// Each frame's start and end reach the processor in order with its draws. The policy and VI size a frame begins with
+// hold until the next frame's start, and VIConfigure during a frame changes the VI size from there in the stream.
+TEST_F(GXFifoTest, FrameBoundariesAndSettingsReachTheProcessorInOrder) {
+  using aurora::gfx::TestFrameEvent;
+  auto& events = aurora::gfx::g_testFrameEvents;
+  events.clear();
+
+  aurora::gx::fifo::init();
+  set_position_format();
+  aurora::gfx::g_testDrawCount = 0;
+  aurora::gx::fifo::begin_frame({.slot = 0, .viewportPolicy = AURORA_VIEWPORT_FIT, .viWidth = 640, .viHeight = 480});
+  draw_positions(GX_TRIANGLES, 3);
+  draw_positions(GX_TRIANGLES, 3);
+  ASSERT_NE(aurora::vi::g_testConfigureHook, nullptr);
+  aurora::vi::g_testConfigureHook({608, 448});
+  draw_positions(GX_TRIANGLES, 3);
+  aurora::gx::fifo::end_frame({.slot = 0});
+  aurora::gx::fifo::begin_frame(
+      {.slot = 1, .viewportPolicy = AURORA_VIEWPORT_STRETCH, .viWidth = 704, .viHeight = 480});
+  draw_positions(GX_TRIANGLES, 3);
+  aurora::gx::fifo::end_frame({.slot = 1, .close = false});
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::shutdown();
+
+  ASSERT_EQ(events.size(), 4u);
+  EXPECT_EQ(events[0].kind, TestFrameEvent::Begin);
+  EXPECT_EQ(events[0].draws, 0u);
+  EXPECT_EQ(events[0].viewportPolicy, AURORA_VIEWPORT_FIT);
+  EXPECT_EQ(events[0].viSize, (aurora::Vec2<uint32_t>{640, 480}));
+  EXPECT_EQ(events[1].kind, TestFrameEvent::Close);
+  EXPECT_EQ(events[1].slot, 0u);
+  EXPECT_EQ(events[1].draws, 3u);
+  EXPECT_EQ(events[1].viewportPolicy, AURORA_VIEWPORT_FIT);
+  EXPECT_EQ(events[1].viSize, (aurora::Vec2<uint32_t>{608, 448}));
+  EXPECT_EQ(events[2].kind, TestFrameEvent::Begin);
+  EXPECT_EQ(events[2].slot, 1u);
+  EXPECT_EQ(events[2].draws, 3u);
+  EXPECT_EQ(events[2].viewportPolicy, AURORA_VIEWPORT_STRETCH);
+  EXPECT_EQ(events[2].viSize, (aurora::Vec2<uint32_t>{704, 480}));
+  EXPECT_EQ(events[3].kind, TestFrameEvent::End);
+  EXPECT_EQ(events[3].slot, 1u);
+  EXPECT_EQ(events[3].draws, 4u);
+}
+
+// The processor wakes a game thread waiting for it when it reaches the position waited for, not at each display list on
+// the way, as each wake costs the waiting game thread a round of yields.
+TEST_F(GXFifoTest, DrainIsWokenOnceNotPerList) {
+  constexpr u32 Lists = 100;
+  alignas(32) std::array<u8, 32> displayList{};
+  displayList[0] = GX_DRAW_TRIANGLES | GX_VTXFMT0;
+  displayList[2] = 3; // vertices
+  sBlockingCallbackEntered.store(false, std::memory_order_relaxed);
+  sBlockingCallbackMayReturn.store(false, std::memory_order_relaxed);
+  sBlockingCallbackReturned.store(false, std::memory_order_relaxed);
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  set_position_format();
+  GXSetDrawDoneCallback(blocking_draw_done_callback);
+  GXSetDrawDone();
+  ASSERT_TRUE(wait_for(sBlockingCallbackEntered, true));
+  GXSetDrawDoneCallback(nullptr);
+  aurora::gfx::g_testDrawCount = 0;
+  for (u32 i = 0; i < Lists; ++i) {
+    GXCallDisplayList(displayList.data(), static_cast<u32>(displayList.size()));
+  }
+
+  const uint64_t wakes = aurora::gx::fifo::waiter_wakes();
+  std::thread releaser{[] {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    sBlockingCallbackMayReturn.store(true, std::memory_order_release);
+  }};
+  aurora::gx::fifo::drain();
+  releaser.join();
+  const uint64_t woken = aurora::gx::fifo::waiter_wakes() - wakes;
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, Lists);
+  EXPECT_EQ(woken, 1u);
+}
+
+namespace {
+std::atomic<bool> sSyncCallbackEntered{false};
+std::atomic<bool> sSyncCallbackMayReturn{false};
+std::atomic<uint32_t> sSyncCallbackToken{0};
+
+void blocking_draw_sync_callback(u16 token) {
+  sSyncCallbackToken.store(token, std::memory_order_release);
+  sSyncCallbackEntered.store(true, std::memory_order_release);
+  while (!sSyncCallbackMayReturn.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+}
+
+void recording_draw_sync_callback(u16 token) { sSyncCallbackToken.store(token, std::memory_order_release); }
+} // namespace
+
+// GXWaitDrawDone waits for the last GXSetDrawDone's token to be processed, not for what was sent after it, as the SDK
+// waits for the token's interrupt.
+TEST_F(GXFifoTest, WaitDrawDoneWaitsForItsTokenNotLaterCommands) {
+  sSyncCallbackEntered.store(false, std::memory_order_relaxed);
+  sSyncCallbackMayReturn.store(false, std::memory_order_relaxed);
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXSetDrawDone();
+  GXSetDrawSyncCallback(blocking_draw_sync_callback);
+  GXSetDrawSync(7);
+  ASSERT_TRUE(wait_for(sSyncCallbackEntered, true));
+  GXSetDrawSyncCallback(nullptr);
+  write_bp41(0x55);
+  aurora::gx::fifo::publish();
+  GXWaitDrawDone();
+  EXPECT_NE(g_gxState.bpRegCache[0x41], 0x41000055u);
+
+  sSyncCallbackMayReturn.store(true, std::memory_order_release);
+  GXDrawDone();
+  EXPECT_EQ(g_gxState.bpRegCache[0x41], 0x41000055u);
+  EXPECT_EQ(GXReadDrawSync(), 7);
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+}
+
+// GXReadDrawSync gives the token the processor passed last, which a game may poll for, between frames too, and the draw
+// sync callback is called with each token.
+TEST_F(GXFifoTest, DrawSyncTokenCanBePolledAndCallsBack) {
+  sSyncCallbackToken.store(0, std::memory_order_relaxed);
+
+  aurora::gx::fifo::init();
+  GXSetDrawSyncCallback(recording_draw_sync_callback);
+  GXSetDrawSync(0x1234);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (GXReadDrawSync() != 0x1234 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  GXSetDrawSyncCallback(nullptr);
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_EQ(GXReadDrawSync(), 0x1234);
+  EXPECT_EQ(sSyncCallbackToken.load(std::memory_order_acquire), 0x1234u);
+}
+
+namespace {
+// Polls for the draw sync token the processor passed last, for up to two seconds.
+bool wait_for_token(u16 token) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (GXReadDrawSync() != token) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::yield();
+  }
+  return true;
+}
+} // namespace
+
+// A publish wakes the processor only while it sleeps (fifo.cpp, worker_main and publish_to). A lost wake leaves a
+// published token unprocessed with the processor asleep, and the poll times out: first with the processor asleep
+// before nearly every publish, then in bursts at random gaps, so that publishes land at every point of its way to
+// sleep.
+TEST_F(GXFifoTest, EveryPublishReachesTheProcessor) {
+  aurora::gx::fifo::init();
+  for (u32 i = 1; i <= 2000; ++i) {
+    GXSetDrawSync(static_cast<u16>(i));
+    ASSERT_TRUE(wait_for_token(static_cast<u16>(i))) << "token " << i;
+  }
+  uint32_t rng = 0x12345678;
+  u16 token = 0;
+  for (u32 round = 0; round < 20000; ++round) {
+    rng ^= rng << 13;
+    rng ^= rng >> 17;
+    rng ^= rng << 5;
+    for (u32 burst = 1 + (rng & 3); burst > 0; --burst) {
+      GXSetDrawSync(++token);
+      for (volatile u32 spin = (rng >> 8) & 1023; spin > 0; spin = spin - 1) {}
+    }
+    ASSERT_TRUE(wait_for_token(token)) << "round " << round;
+  }
+  aurora::gx::fifo::shutdown();
+}
+
+// A frame's end doesn't wait for the processor: the game thread writes the next frame while the processor works on the
+// one before, and waits only for the end of the frame before that, whose stats it publishes. The processor still
+// carries the frames out in order.
+TEST_F(GXFifoTest, FramesEndWithoutWaitingForTheProcessor) {
+  using aurora::gfx::TestFrameEvent;
+  auto& events = aurora::gfx::g_testFrameEvents;
+  events.clear();
+  sBlockingCallbackEntered.store(false, std::memory_order_relaxed);
+  sBlockingCallbackMayReturn.store(false, std::memory_order_relaxed);
+  sBlockingCallbackReturned.store(false, std::memory_order_relaxed);
+
+  aurora::gx::fifo::init();
+  set_position_format();
+  aurora::gfx::g_testDrawCount = 0;
+  aurora::gx::fifo::begin_frame({.slot = 0});
+  draw_positions(GX_TRIANGLES, 3);
+  const uint64_t end0 = aurora::gx::fifo::end_frame({.slot = 0});
+  aurora::gx::fifo::begin_frame({.slot = 1});
+  draw_positions(GX_TRIANGLES, 3);
+  GXSetDrawDoneCallback(blocking_draw_done_callback);
+  GXSetDrawDone();
+  ASSERT_TRUE(wait_for(sBlockingCallbackEntered, true));
+  GXSetDrawDoneCallback(nullptr);
+  draw_positions(GX_TRIANGLES, 3);
+  aurora::gx::fifo::end_frame({.slot = 1});
+  aurora::gx::fifo::wait_processed(end0);
+  aurora::gx::fifo::begin_frame({.slot = 0});
+  draw_positions(GX_TRIANGLES, 3);
+  const uint64_t end2 = aurora::gx::fifo::end_frame({.slot = 0});
+  // The processor is still held in frame 1.
+  const size_t eventsWhileHeld = events.size();
+
+  sBlockingCallbackMayReturn.store(true, std::memory_order_release);
+  aurora::gx::fifo::wait_processed(end2);
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_EQ(eventsWhileHeld, 3u);
+  ASSERT_EQ(events.size(), 6u);
+  const std::array<std::pair<TestFrameEvent::Kind, uint32_t>, 6> expected{{
+      {TestFrameEvent::Begin, 0},
+      {TestFrameEvent::Close, 1},
+      {TestFrameEvent::Begin, 1},
+      {TestFrameEvent::Close, 3},
+      {TestFrameEvent::Begin, 3},
+      {TestFrameEvent::Close, 4},
+  }};
+  for (size_t i = 0; i < expected.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(events[i].kind, expected[i].first);
+    EXPECT_EQ(events[i].draws, expected[i].second);
+    EXPECT_EQ(events[i].slot, i < 2 || i >= 4 ? 0u : 1u);
+  }
+}
+
 TEST_F(GXFifoTest, AutoSizedDrawPublishesAfterLengthPatch) {
   aurora::gx::fifo::init();
   aurora::gx::fifo::begin_frame();
@@ -171,6 +723,43 @@ TEST_F(GXFifoTest, FrameBufferCommandsPublishAfterTheirCompletePayload) {
   ASSERT_TRUE(wait_for(endOffscreenCount, 1));
   aurora::gx::fifo::drain();
   aurora::gx::fifo::end_frame();
+}
+
+// GXClearTexCopySrc clears what GXCopyTex(dest, GX_TRUE) clears, from the same source with the same values, and makes
+// no copy.
+TEST_F(GXFifoTest, ClearTexCopySrc_ClearsAsACopyWithout) {
+  using aurora::gfx::testing::lastResolve;
+  GXSetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+  GXSetCopyClear({64, 128, 192, 32}, 0x800000);
+  GXSetTexCopySrc(0, 0, 640, 448);
+  GXSetTexCopyDst(320, 224, GX_CTF_R8, GX_TRUE);
+  reset_gx_state();
+  decode_fifo(capture_fifo());
+  for (const bool update : {false, true}) {
+    GXSetColorUpdate(update);
+    GXSetAlphaUpdate(update);
+    GXSetZMode(GX_FALSE, GX_LEQUAL, GX_TRUE);
+    GXCopyTex(reinterpret_cast<void*>(0x1234), GX_TRUE);
+    decode_fifo(capture_fifo());
+    const auto copy = lastResolve;
+    const auto copies = g_gxState.copyTextures.size();
+    const auto cached = g_gxState.copyTextureCache.size();
+    GXClearTexCopySrc();
+    decode_fifo(capture_fifo());
+    EXPECT_FALSE(lastResolve.target);
+    EXPECT_EQ(lastResolve.rect, copy.rect);
+    EXPECT_EQ(lastResolve.clearColor, update);
+    EXPECT_EQ(lastResolve.clearAlpha, update);
+    EXPECT_TRUE(lastResolve.clearDepth);
+    EXPECT_EQ(lastResolve.clearColor, copy.clearColor);
+    EXPECT_EQ(lastResolve.clearAlpha, copy.clearAlpha);
+    EXPECT_EQ(lastResolve.clearDepth, copy.clearDepth);
+    EXPECT_EQ(lastResolve.clearColorValue, copy.clearColorValue);
+    EXPECT_EQ(lastResolve.clearDepthValue, copy.clearDepthValue);
+    EXPECT_EQ(g_gxState.copyTextures.size(), copies);
+    EXPECT_EQ(g_gxState.copyTextureCache.size(), cached);
+  }
+  EXPECT_EQ(lastResolve.rect, (aurora::gfx::ClipRect{0, 0, 640, 448}));
 }
 
 TEST_F(GXFifoTest, DrawDoneProcessesPublishedAndUnpublishedTailBeforeCallback) {
@@ -296,6 +885,76 @@ TEST_F(GXFifoTest, AuroraSyncGXProcessesTailWithoutDrawDoneCallback) {
   EXPECT_FALSE(sDrawDoneCallbackCalled.load(std::memory_order_acquire));
   GXSetDrawDoneCallback(nullptr);
   aurora::gx::fifo::end_frame();
+}
+
+TEST_F(GXFifoTest, CallDisplayListWritesTheListsAddressNotItsBytes) {
+  const std::array<u8, 5> displayList{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
+
+  flush_and_capture(); // the dirty state GXInit left, which the call would flush first
+  GXCallDisplayList(displayList.data(), static_cast<u32>(displayList.size()));
+  const auto bytes = capture_fifo();
+
+  const auto address = reinterpret_cast<uintptr_t>(displayList.data());
+  std::vector<u8> expected{GX_AURORA, GX_AURORA_CALL_DISPLAY_LIST >> 8, GX_AURORA_CALL_DISPLAY_LIST & 0xFF};
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    expected.push_back(static_cast<u8>(static_cast<uint64_t>(address) >> shift));
+  }
+  expected.insert(expected.end(), {0, 0, 0, static_cast<u8>(displayList.size())});
+  EXPECT_EQ(bytes, expected);
+}
+
+TEST_F(GXFifoTest, CallDisplayListWhileRecordingCopiesTheList) {
+  const std::array<u8, 5> called{GX_LOAD_BP_REG, 0x41, 0x12, 0x34, 0x56};
+  std::array<u8, 64> recording{};
+
+  GXBeginDisplayList(recording.data(), static_cast<u32>(recording.size()));
+  GXCallDisplayList(called.data(), static_cast<u32>(called.size()));
+  const u32 size = GXEndDisplayList();
+
+  ASSERT_GE(size, called.size());
+  EXPECT_TRUE(std::equal(called.begin(), called.end(), recording.begin()));
+}
+
+// A game may rewrite a list once it knows the list was drawn. Called again, the list is drawn from its new bytes.
+TEST_F(GXFifoTest, DisplayListRewrittenAfterDrawDoneDrawsItsNewBytes) {
+  alignas(32) std::array<u8, 32> displayList{};
+  const auto write_list = [&](u8 first) {
+    displayList = {};
+    displayList[0] = GX_DRAW_TRIANGLES | GX_VTXFMT0;
+    displayList[2] = 3; // vertices
+    for (u8 i = 0; i < 9; ++i) {
+      displayList[3 + i] = static_cast<u8>(first + i);
+    }
+  };
+  const auto vertex_bytes = [](u8 first) {
+    std::vector<u8> bytes(9);
+    for (u8 i = 0; i < 9; ++i) {
+      bytes[i] = static_cast<u8>(first + i);
+    }
+    return bytes;
+  };
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+  aurora::gfx::g_testDrawCount = 0;
+
+  write_list(1);
+  GXCallDisplayList(displayList.data(), static_cast<u32>(displayList.size()));
+  GXDrawDone();
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 1u);
+  EXPECT_EQ(aurora::gfx::g_testLastVerts, vertex_bytes(1));
+
+  write_list(101);
+  GXCallDisplayList(displayList.data(), static_cast<u32>(displayList.size()));
+  aurora::gx::fifo::drain();
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+
+  EXPECT_EQ(aurora::gfx::g_testDrawCount, 2u);
+  EXPECT_EQ(aurora::gfx::g_testLastVerts, vertex_bytes(101));
 }
 
 TEST_F(GXFifoTest, DisplayListCallPublishesAtCompleteBoundary) {
@@ -1577,6 +2236,94 @@ TEST_F(GXFifoTest, SetArray_LittleEndianFlag_UpdatesStateAndClearsCachedRange) {
   EXPECT_EQ(gxState().dirty, aurora::gx::DirtyPipeline | aurora::gx::DirtyImmediates);
 }
 
+// A pipeline config is built again only when what it is built from differs from the last build's.
+TEST_F(GXFifoTest, PipelineConfigBuiltOnlyWhenInputsDiffer) {
+  const auto draw = [] {
+    GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+    GXPosition3u8(0, 1, 2);
+    GXPosition3u8(3, 4, 5);
+    GXPosition3u8(6, 7, 8);
+    GXEnd();
+  };
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+  GXSetChanCtrl(GX_COLOR0, GX_TRUE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT0, GX_DF_CLAMP, GX_AF_NONE);
+  GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+  draw();
+  aurora::gx::fifo::drain();
+  const uint32_t built = aurora::gx::g_testPipelineBuildCount;
+
+  // A stage changed and changed back.
+  GXSetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+  GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+  draw();
+  aurora::gx::fifo::drain();
+  EXPECT_EQ(aurora::gx::g_testPipelineBuildCount, built);
+
+  GXSetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+  draw();
+  // A lit channel's light mask is in its shader config, for the program it generates.
+  GXSetChanCtrl(GX_COLOR0, GX_TRUE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT1, GX_DF_CLAMP, GX_AF_NONE);
+  draw();
+  aurora::gx::fifo::drain();
+  EXPECT_EQ(aurora::gx::g_testPipelineBuildCount, built + 2);
+
+  // The EFB's pixel format is an input: it decides whether alpha is written.
+  GXSetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+  draw();
+  aurora::gx::fifo::drain();
+  EXPECT_EQ(aurora::gx::g_testPipelineBuildCount, built + 3);
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+}
+
+// An array goes into the frame's storage pool once, until the frame ends or vertex data changes.
+TEST_F(GXFifoTest, SetArray_CopiedOncePerFrame) {
+  u8 first[9]{};
+  u8 second[9]{};
+  const auto draw = [](u8* array) {
+    GXSetArray(GX_VA_POS, array, 9, 3, false);
+    GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+    GXPosition1x8(0);
+    GXPosition1x8(1);
+    GXPosition1x8(2);
+    GXEnd();
+  };
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::clear_array_ranges();
+  aurora::gx::fifo::begin_frame();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+  aurora::gfx::g_testStoragePushes = 0;
+
+  draw(first);
+  draw(second);
+  draw(first);
+  aurora::gx::fifo::drain();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 2u);
+  EXPECT_EQ(aurora::gfx::g_testLastDraw.immediateData.arrayStart[0], 0u);
+
+  // Vertex data changed: copied again.
+  GXInvalidateVtxCache();
+  draw(first);
+  aurora::gx::fifo::drain();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 3u);
+
+  // What end_recording calls at the frame's end.
+  aurora::gx::fifo::clear_array_ranges();
+  draw(first);
+  aurora::gx::fifo::drain();
+  EXPECT_EQ(aurora::gfx::g_testStoragePushes, 4u);
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
+}
+
 TEST_F(GXFifoTest, LoadTexObj_EncodesSdkBpBurstAndAuroraMetadata) {
   alignas(32) u8 image[64]{};
   GXTexObj obj{};
@@ -2135,6 +2882,101 @@ TEST_F(GXFifoTest, LoadPosMtxImm_Translation) {
   EXPECT_FLOAT_EQ(decoded.m0[3], 10.0f);
   EXPECT_FLOAT_EQ(decoded.m1[3], 20.0f);
   EXPECT_FLOAT_EQ(decoded.m2[3], 30.0f);
+}
+
+// A write marks only the uniform piece that holds what it changed, and the same values again mark
+// nothing, so a draw pushes only that piece.
+TEST_F(GXFifoTest, Writes_MarkOnlyTheirUniformPiece) {
+  aurora::Mat3x4<float> mtx{};
+  mtx.m0[0] = 2.0f;
+  GXLoadPosMtxImm(&mtx, GX_PNMTX1);
+  const auto pos = capture_fifo();
+  GXLoadNrmMtxImm(&mtx, GX_PNMTX1);
+  const auto nrm = capture_fifo();
+  GXLoadTexMtxImm(&mtx, GX_TEXMTX5, GX_MTX3x4);
+  const auto tex = capture_fifo();
+  GXLightObj lightObj;
+  GXInitLightPos(&lightObj, 100.0f, 200.0f, 300.0f);
+  GXInitLightDir(&lightObj, 0.0f, -1.0f, 0.0f);
+  GXInitLightColor(&lightObj, {255, 128, 64, 255});
+  GXInitLightAttn(&lightObj, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+  GXLoadLightObjImm(&lightObj, GX_LIGHT2);
+  const auto light = capture_fifo();
+  GXSetTevColor(GX_TEVREG1, {200, 100, 50, 255});
+  const auto tev = capture_fifo();
+
+  reset_gx_state();
+  const std::pair<const std::vector<u8>*, u16> writes[] = {
+      {&pos, aurora::gx::DirtyPosMtx},   {&nrm, aurora::gx::DirtyNrmMtx},   {&tex, aurora::gx::DirtyView},
+      {&light, aurora::gx::DirtyLights}, {&tev, aurora::gx::DirtyMaterial},
+  };
+  for (const auto& [bytes, piece] : writes) {
+    g_gxState.dirty = 0;
+    decode_fifo(*bytes);
+    EXPECT_EQ(g_gxState.dirty, piece);
+    g_gxState.dirty = 0;
+    decode_fifo(*bytes);
+    EXPECT_EQ(g_gxState.dirty, 0);
+  }
+}
+
+// A register that holds a piece's state beside other state marks the piece only for that state:
+// channel 0's light mask and its diffuse function, and texture coordinate 0's scale and its line offset, which only
+// line and point draws read.
+TEST_F(GXFifoTest, SharedRegisters_MarkTheirPieceOnlyForItsState) {
+  GXSetChanCtrl(GX_COLOR0, GX_TRUE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT0, GX_DF_CLAMP, GX_AF_NONE);
+  const auto light0 = capture_fifo();
+  GXSetChanCtrl(GX_COLOR0, GX_TRUE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT0, GX_DF_SIGN, GX_AF_NONE);
+  const auto diffuse = capture_fifo();
+  const std::vector<u8> scale{0x61, 0x30, 0x00, 0x00, 0x7F};
+  const std::vector<u8> lineOffset{0x61, 0x30, 0x04, 0x00, 0x7F};
+
+  reset_gx_state();
+  const std::pair<const std::vector<u8>*, u16> writes[] = {
+      {&light0, aurora::gx::DirtyPipeline | aurora::gx::DirtyLights},
+      {&diffuse, aurora::gx::DirtyPipeline},
+      {&scale, aurora::gx::DirtyMaterial},
+      {&lineOffset, aurora::gx::DirtyMaterial},
+  };
+  for (const auto& [bytes, dirty] : writes) {
+    g_gxState.dirty = 0;
+    decode_fifo(*bytes);
+    EXPECT_EQ(g_gxState.dirty, dirty);
+  }
+}
+
+// A shader that writes the normal attachment reads the normal matrices, so an unlit draw with normals pushes them in a
+// pass that has one, and not otherwise.
+TEST_F(GXFifoTest, NormalTarget_PushesNormalMatrices) {
+  const auto draw = [] {
+    GXBegin(GX_TRIANGLES, GX_VTXFMT0, 3);
+    for (s8 i = 0; i < 3; ++i) {
+      GXPosition3u8(i, 1, 2);
+      GXNormal3s8(0, 0, 64);
+    }
+    GXEnd();
+  };
+
+  aurora::gx::fifo::init();
+  aurora::gx::fifo::begin_frame();
+  GXClearVtxDesc();
+  GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+  GXSetVtxDesc(GX_VA_NRM, GX_DIRECT);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_U8, 0);
+  GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_S8, 6);
+  aurora::gx::g_testPushedPieces = 0;
+  aurora::gfx::g_testNormalAttachment = false;
+  draw();
+  aurora::gx::fifo::drain();
+  EXPECT_EQ(aurora::gx::g_testPushedPieces & 1 << aurora::gx::UniformNrmMtx, 0);
+
+  aurora::gfx::g_testNormalAttachment = true;
+  draw();
+  aurora::gx::fifo::drain();
+  EXPECT_NE(aurora::gx::g_testPushedPieces & 1 << aurora::gx::UniformNrmMtx, 0);
+  aurora::gfx::g_testNormalAttachment = false;
+  aurora::gx::fifo::end_frame();
+  aurora::gx::fifo::shutdown();
 }
 
 // --- GXLoadNrmMtxImm (XF 0x400-0x459) ---
@@ -2774,6 +3616,46 @@ TEST_F(GXFifoTest, LoadLightObjImm_SpotLight) {
   EXPECT_FLOAT_EQ(light.distAtt[2], 0.5f * 0.5f / (0.5f * 100.0f * 100.0f));
 }
 
+// For a backend that reads them, a light whose spot or distance coefficients are exactly (1, 0, 0), as
+// GXInitLightAttnA(1, 0, 0) and GX_DA_OFF load them, is marked for the pipeline's key; marks that change dirty the
+// pipeline, and a reload that changes none doesn't.
+TEST_F(GXFifoTest, LoadLightObjImm_UnitTermsMarked) {
+  aurora::gfx::backend::g_testLimits.unitLightTerms = true;
+  GXLightObj directional;
+  GXInitLightPos(&directional, 0.0f, 0.0f, 1048576.0f);
+  GXInitLightColor(&directional, {255, 255, 255, 255});
+  GXInitLightAttnA(&directional, 1.0f, 0.0f, 0.0f);
+  GXInitLightDistAttn(&directional, 1048576.0f, 1.0f, GX_DA_OFF);
+  GXLoadLightObjImm(&directional, GX_LIGHT2);
+  GXLightObj spot;
+  GXInitLightPos(&spot, 10.0f, 20.0f, 30.0f);
+  GXInitLightColor(&spot, {255, 255, 255, 255});
+  GXInitLightSpot(&spot, 45.0f, GX_SP_COS);
+  GXInitLightDistAttn(&spot, 100.0f, 0.5f, GX_DA_MEDIUM);
+  GXLoadLightObjImm(&spot, GX_LIGHT5);
+  auto bytes = capture_fifo();
+
+  reset_gx_state();
+  g_gxState.dirty = 0;
+  decode_fifo(bytes);
+  EXPECT_EQ(g_gxState.unitLightTerms[2], 3);
+  EXPECT_EQ(g_gxState.unitLightTerms[5], 0);
+  EXPECT_NE(g_gxState.dirty & aurora::gx::DirtyPipeline, 0u);
+
+  g_gxState.dirty = 0;
+  decode_fifo(bytes);
+  EXPECT_EQ(g_gxState.dirty & aurora::gx::DirtyPipeline, 0u);
+
+  GXInitLightAttnA(&spot, 1.0f, 0.0f, 0.0f);
+  GXLoadLightObjImm(&spot, GX_LIGHT5);
+  bytes = capture_fifo();
+  g_gxState.dirty = 0;
+  decode_fifo(bytes);
+  EXPECT_EQ(g_gxState.unitLightTerms[5], 1);
+  EXPECT_NE(g_gxState.dirty & aurora::gx::DirtyPipeline, 0u);
+  aurora::gfx::backend::g_testLimits.unitLightTerms = false;
+}
+
 // --- GXSetChanCtrl (XF 0x100E-0x1011) ---
 
 TEST_F(GXFifoTest, ChanCtrl_Color0_LightingEnabled) {
@@ -2789,6 +3671,7 @@ TEST_F(GXFifoTest, ChanCtrl_Color0_LightingEnabled) {
   EXPECT_EQ(cfg.ambSrc, GX_SRC_REG);
   EXPECT_EQ(cfg.diffFn, GX_DF_CLAMP);
   EXPECT_EQ(cfg.attnFn, GX_AF_SPOT);
+  EXPECT_EQ(cfg.lightMask, GX_LIGHT0 | GX_LIGHT1);
 
   // Light mask should be 0x03 (lights 0 and 1)
   auto& state = g_gxState.colorChannelState[GX_COLOR0];
@@ -3255,7 +4138,7 @@ TEST_F(GXFifoTest, FogRangeAdj_DecodesCenterAndCoefficientTable) {
   decode_fifo(bytes);
 
   EXPECT_TRUE(g_gxState.fog.rangeEnabled);
-  EXPECT_EQ(g_gxState.dirty, aurora::gx::DirtyPipeline | aurora::gx::DirtyUniform);
+  EXPECT_EQ(g_gxState.dirty, aurora::gx::DirtyPipeline | aurora::gx::DirtyView);
   EXPECT_EQ(g_gxState.fog.rangeCenter, 320);
   for (u32 i = 0; i < 10; ++i) {
     EXPECT_EQ(g_gxState.fog.rangeK[i], table.r[i]);
@@ -3266,7 +4149,7 @@ TEST_F(GXFifoTest, FogRangeAdj_DecodesCenterAndCoefficientTable) {
   g_gxState.dirty = 0;
   decode_fifo(centerBytes);
   EXPECT_TRUE(g_gxState.fog.rangeEnabled);
-  EXPECT_EQ(g_gxState.dirty, aurora::gx::DirtyUniform);
+  EXPECT_EQ(g_gxState.dirty, aurora::gx::DirtyView);
   EXPECT_EQ(g_gxState.fog.rangeCenter, 321);
 
   GXSetFogRangeAdj(GX_DISABLE, 123, nullptr);
@@ -3274,7 +4157,7 @@ TEST_F(GXFifoTest, FogRangeAdj_DecodesCenterAndCoefficientTable) {
   g_gxState.dirty = 0;
   decode_fifo(disableBytes);
   EXPECT_FALSE(g_gxState.fog.rangeEnabled);
-  EXPECT_EQ(g_gxState.dirty, aurora::gx::DirtyPipeline | aurora::gx::DirtyUniform);
+  EXPECT_EQ(g_gxState.dirty, aurora::gx::DirtyPipeline | aurora::gx::DirtyView);
   EXPECT_EQ(g_gxState.fog.rangeCenter, 123);
 }
 

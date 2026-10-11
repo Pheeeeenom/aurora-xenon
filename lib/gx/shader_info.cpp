@@ -3,6 +3,8 @@
 #include "../gfx/recording.hpp"
 
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 
 #include <tracy/Tracy.hpp>
 
@@ -218,13 +220,9 @@ u32 line_texcoord_mask() noexcept {
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   ZoneScoped;
 
-  ShaderInfo info{
-      // render/logical viewport size, proj
-      .uniformSize = 8 + 8 + 64,
-  };
+  ShaderInfo info{};
 
   if (config.lineMode != 0) {
-    info.uniformSize += 4 + 4 + 4 + 4; // line_width, line_aspect_y, line_tex_offset, line_texcoord_mask
     info.lineMode = config.lineMode;
   }
 
@@ -236,9 +234,6 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       info.indexAttr.set(attr);
     }
   }
-
-  // 10 position matrices, 10 texture matrices, 10 normal matrices.
-  info.uniformSize += sizeof(Mat3x4<float>) * 30;
 
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
@@ -307,7 +302,18 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
-  info.uniformSize += info.loadsTevReg.count() * sizeof(Vec4<float>);
+  // GX_TG_SRTG reads a colour channel's rasterized output, so that channel is computed even when no TEV stage samples
+  // it.
+  for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
+    if (!info.sampledTexCoords.test(i)) {
+      continue;
+    }
+    const auto& tcg = config.tcgs[i];
+    if (tcg.type == GX_TG_SRTG && (tcg.src == GX_TG_COLOR0 || tcg.src == GX_TG_COLOR1)) {
+      info.sampledColorChannels.set(tcg.src == GX_TG_COLOR0 ? 0 : 1);
+    }
+  }
+
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
       const auto& cc = config.colorChannels[i];
@@ -317,29 +323,6 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       }
     }
   }
-  if (info.lightingEnabled) {
-    // Lights + light state for all channels
-    info.uniformSize += 16 + sizeof(Light) * GX::MaxLights;
-  }
-  for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
-    if (info.sampledColorChannels.test(i)) {
-      const auto& cc = config.colorChannels[i];
-      if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
-      }
-      if (cc.matSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
-      }
-      const auto& cca = config.colorChannels[i + GX_ALPHA0];
-      if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
-      }
-      if (cca.matSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
-      }
-    }
-  }
-  info.uniformSize += info.sampledKColors.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
     if (!info.sampledTexCoords.test(i)) {
       continue;
@@ -350,153 +333,161 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       info.usesPTTexMtx.set(postMtxIdx);
     }
   }
-  if (info.usesPTTexMtx.any()) {
-    info.uniformSize += sizeof(Mat3x4<float>) * MaxPTTexMtx;
-  }
   if (config.fogType != GX_FOG_NONE) {
     info.usesFog = true;
-    info.uniformSize += sizeof(Fog);
   }
-  info.uniformSize += MaxTexCoord * sizeof(Vec4<float>);
-  if (info.usedIndTexMtxs.any()) {
-    info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
-  }
-  info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
-  info.uniformSize = gfx::align_uniform(info.uniformSize);
-  if (info.uniformSize > MaxUniformSize) {
-    Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
+  // The uniform pieces the shaders read. Only lighting and emboss read the lights and normals.
+  info.uniformPieces = 1 << UniformView | 1 << UniformPosMtx | 1 << UniformMaterial;
+  if (info.lightingEnabled) {
+    info.uniformPieces |= 1 << UniformNrmMtx | 1 << UniformLights;
   }
   return info;
 }
 
-static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
-  buf.reserve_extra(info.uniformSize);
+// Fill_uniform, a piece at a time, written where the frame's uniform pool keeps it. Each piece holds all its state, as
+// gx.hpp lays it out, and each of its bytes is written once and never read back: the pool can be uncached or
+// write-combined GPU memory, where a piece built on the stack first would cost a write and a read more of each byte.
+template <typename T>
+void put(u8* piece, size_t offset, const T& value) noexcept {
+  std::memcpy(piece + offset, &value, sizeof(T));
+}
 
-  buf.append<f32>(g_gxState.renderViewport.width);
-  buf.append<f32>(g_gxState.renderViewport.height);
-  buf.append<f32>(g_gxState.logicalViewport.width);
-  buf.append<f32>(g_gxState.logicalViewport.height);
-  if (info.lineMode != 0) {
-    if (info.lineMode == 3) { // GX_POINTS
-      buf.append<f32>(static_cast<f32>(g_gxState.pointSize) / 6.f);
-      buf.append<f32>(1.0f);
-      buf.append<f32>(tex_offset(g_gxState.pointTexOffset));
-      buf.append<u32>(point_texcoord_mask());
-    } else { // GX_LINES / GX_LINESTRIP
-      buf.append<f32>(static_cast<f32>(g_gxState.lineWidth) / 6.f);
-      buf.append<f32>(g_gxState.lineHalfAspect ? 0.5f : 1.f);
-      buf.append<f32>(tex_offset(g_gxState.lineTexOffset));
-      buf.append<u32>(line_texcoord_mask());
-    }
+static void write_view_uniform(u8* out, u8 lineMode) noexcept {
+  put(out, offsetof(ViewUniform, renderViewportSize),
+      Vec2<float>{g_gxState.renderViewport.width, g_gxState.renderViewport.height});
+  put(out, offsetof(ViewUniform, logicalViewportSize),
+      Vec2<float>{g_gxState.logicalViewport.width, g_gxState.logicalViewport.height});
+  f32 lineWidth = 0.f;
+  f32 lineAspectY = 0.f;
+  f32 lineTexOffset = 0.f;
+  u32 lineTexCoordMask = 0;
+  if (lineMode == 3) { // GX_POINTS
+    lineWidth = static_cast<f32>(g_gxState.pointSize) / 6.f;
+    lineAspectY = 1.0f;
+    lineTexOffset = tex_offset(g_gxState.pointTexOffset);
+    lineTexCoordMask = point_texcoord_mask();
+  } else if (lineMode != 0) { // GX_LINES / GX_LINESTRIP
+    lineWidth = static_cast<f32>(g_gxState.lineWidth) / 6.f;
+    lineAspectY = g_gxState.lineHalfAspect ? 0.5f : 1.f;
+    lineTexOffset = tex_offset(g_gxState.lineTexOffset);
+    lineTexCoordMask = line_texcoord_mask();
   }
-  auto proj = g_gxState.proj;
+  put(out, offsetof(ViewUniform, lineWidth), lineWidth);
+  put(out, offsetof(ViewUniform, lineAspectY), lineAspectY);
+  put(out, offsetof(ViewUniform, lineTexOffset), lineTexOffset);
+  put(out, offsetof(ViewUniform, lineTexCoordMask), lineTexCoordMask);
+  Mat4x4<float> proj = g_gxState.proj;
   if constexpr (UseReversedZ) {
     proj.m2 = proj.m2 * Vec4{-1.f, -1.f, -1.f, -1.f};
   } else {
     proj.m2 = proj.m2 + proj.m3;
   }
-  buf.append(proj);
-
-  for (int i = 0; i < MaxPnMtx; i++) {
-    buf.append(g_gxState.pnMtx[i].pos);
+  put(out, offsetof(ViewUniform, proj), proj);
+  put(out, offsetof(ViewUniform, texMtxs), g_gxState.texMtxs);
+  std::array<Vec4<float>, 8> channelColors;
+  for (int i = 0; i < 2; ++i) {
+    channelColors[i * 4] = g_gxState.colorChannelState[i].ambColor;
+    channelColors[i * 4 + 1] = g_gxState.colorChannelState[i].matColor;
+    channelColors[i * 4 + 2] = g_gxState.colorChannelState[i + GX_ALPHA0].ambColor;
+    channelColors[i * 4 + 3] = g_gxState.colorChannelState[i + GX_ALPHA0].matColor;
   }
-
-  for (int i = 0; i < MaxTexMtx; i++) {
-    buf.append(g_gxState.texMtxs[i]);
+  put(out, offsetof(ViewUniform, channelColors), channelColors);
+  put(out, offsetof(ViewUniform, postMtxs), g_gxState.ptTexMtxs);
+  const auto& state = g_gxState.fog;
+  const float logicalWidth = std::max(g_gxState.logicalViewport.width, 1.f);
+  const float renderWidth = std::max(g_gxState.renderViewport.width, 1.f);
+  Fog fog{
+      .color = state.color,
+      .a = state.a,
+      .b = state.b,
+      .c = state.c,
+      .rangeCenter = ((static_cast<float>(state.rangeCenter) - g_gxState.logicalViewport.left) / logicalWidth) * 2.f -
+                     1.f + (g_gxState.renderViewport.left / renderWidth) * 2.f,
+  };
+  for (u32 i = 0; i < state.rangeK.size(); ++i) {
+    const u32 source = (i & ~1u) | (1u - (i & 1u));
+    fog.rangeK[i / 4][i % 4] = static_cast<float>(state.rangeK[source]) / 64.f;
   }
-
-  for (int i = 0; i < MaxPnMtx; i++) {
-    buf.append(g_gxState.pnMtx[i].nrm);
+  fog.rangeK[2][2] = fog.rangeK[2][1];
+  fog.rangeK[2][3] = fog.rangeK[2][1];
+  put(out, offsetof(ViewUniform, fog), fog);
+  std::array<Vec4<float>, MaxIndTexMtxs * 2> indTexMtxs;
+  for (u32 i = 0; i < MaxIndTexMtxs; ++i) {
+    const auto& mtx = g_gxState.indTexMtxs[i];
+    indTexMtxs[i * 2] = Vec4{mtx.mtx.m0.x, mtx.mtx.m0.y, mtx.mtx.m1.x, mtx.mtx.m1.y};
+    indTexMtxs[i * 2 + 1] = Vec4{mtx.mtx.m2.x, mtx.mtx.m2.y, std::exp2f(mtx.scaleExp), 0.0f};
   }
-
-  for (int i = 0; i < info.loadsTevReg.size(); ++i) {
-    if (info.loadsTevReg.test(i)) {
-      buf.append(g_gxState.colorRegs[i]);
-    }
-  }
-  if (info.lightingEnabled) {
-    // Lights
-    static_assert(sizeof(g_gxState.lights) == 80 * GX::MaxLights);
-    buf.append(g_gxState.lights);
-    // Light state for all channels
-    for (int i = 0; i < 4; ++i) {
-      buf.append<u32>(g_gxState.colorChannelState[i].lightMask.to_ulong());
-    }
-  }
-  for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
-    if (!info.sampledColorChannels.test(i)) {
-      continue;
-    }
-    const auto& ccc = g_gxState.colorChannelConfig[i];
-    const auto& ccs = g_gxState.colorChannelState[i];
-    if (ccc.lightingEnabled && ccc.ambSrc == GX_SRC_REG) {
-      buf.append(ccs.ambColor);
-    }
-    if (ccc.matSrc == GX_SRC_REG) {
-      buf.append(ccs.matColor);
-    }
-    const auto& ccca = g_gxState.colorChannelConfig[i + GX_ALPHA0];
-    const auto& ccsa = g_gxState.colorChannelState[i + GX_ALPHA0];
-    if (ccca.lightingEnabled && ccca.ambSrc == GX_SRC_REG) {
-      buf.append(ccsa.ambColor);
-    }
-    if (ccca.matSrc == GX_SRC_REG) {
-      buf.append(ccsa.matColor);
-    }
-  }
-  for (int i = 0; i < info.sampledKColors.size(); ++i) {
-    if (info.sampledKColors.test(i)) {
-      buf.append(g_gxState.kcolors[i]);
-    }
-  }
-  if (info.usesPTTexMtx.any()) {
-    for (int i = 0; i < info.usesPTTexMtx.size(); ++i) {
-      buf.append(g_gxState.ptTexMtxs[i]);
-    }
-  }
-  if (info.usesFog) {
-    const auto& state = g_gxState.fog;
-    const float logicalWidth = std::max(g_gxState.logicalViewport.width, 1.f);
-    const float renderWidth = std::max(g_gxState.renderViewport.width, 1.f);
-    Fog fog{
-        .color = state.color,
-        .a = state.a,
-        .b = state.b,
-        .c = state.c,
-        .rangeCenter = ((static_cast<float>(state.rangeCenter) - g_gxState.logicalViewport.left) / logicalWidth) * 2.f -
-                       1.f + (g_gxState.renderViewport.left / renderWidth) * 2.f,
-    };
-    for (u32 i = 0; i < state.rangeK.size(); ++i) {
-      const u32 source = (i & ~1u) | (1u - (i & 1u));
-      fog.rangeK[i / 4][i % 4] = static_cast<float>(state.rangeK[source]) / 64.f;
-    }
-    fog.rangeK[2][2] = fog.rangeK[2][1];
-    fog.rangeK[2][3] = fog.rangeK[2][1];
-    buf.append(fog);
-  }
-  for (const auto& scale : g_gxState.texCoordScales) {
-    buf.append(Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
-  }
-  if (info.usedIndTexMtxs.any()) {
-    for (u32 i = 0; i < MaxIndTexMtxs; ++i) {
-      const auto& mtx = g_gxState.indTexMtxs[i];
-      buf.append(Vec4{mtx.mtx.m0.x, mtx.mtx.m0.y, mtx.mtx.m1.x, mtx.mtx.m1.y});
-      buf.append(Vec4{mtx.mtx.m2.x, mtx.mtx.m2.y, std::exp2f(mtx.scaleExp), 0.0f});
-    }
-  }
-  for (int i = 0; i < info.sampledTextures.size(); ++i) {
-    if (!info.sampledTextures.test(i)) {
-      continue;
-    }
-    buf.append(texture_size_bias(get_texture(static_cast<GXTexMapID>(i))));
-  }
+  put(out, offsetof(ViewUniform, indTexMtxs), indTexMtxs);
 }
 
-gfx::Range build_uniform(const ShaderInfo& info) noexcept {
+static void write_lights_uniform(u8* out) noexcept {
+  put(out, offsetof(LightsUniform, lights), g_gxState.lights);
+  std::array<u32, MaxColorChannels> lightMasks;
+  for (u32 i = 0; i < MaxColorChannels; ++i) {
+    lightMasks[i] = g_gxState.colorChannelState[i].lightMask.to_ulong();
+  }
+  put(out, offsetof(LightsUniform, lightMasks), lightMasks);
+}
+
+static void write_material_uniform(u8* out, const ShaderInfo& info) noexcept {
+  put(out, offsetof(MaterialUniform, tevRegs), g_gxState.colorRegs);
+  put(out, offsetof(MaterialUniform, kcolors), g_gxState.kcolors);
+  std::array<Vec4<float>, MaxTexCoord> texCoordScales;
+  for (u32 i = 0; i < MaxTexCoord; ++i) {
+    const auto& scale = g_gxState.texCoordScales[i];
+    texCoordScales[i] = Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f};
+  }
+  put(out, offsetof(MaterialUniform, texCoordScales), texCoordScales);
+  std::array<Vec4<float>, MaxTextures> textureSizeBias{};
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    if (info.sampledTextures.test(i)) {
+      textureSizeBias[i] = texture_size_bias(get_texture(static_cast<GXTexMapID>(i)));
+    }
+  }
+  put(out, offsetof(MaterialUniform, textureSizeBias), textureSizeBias);
+}
+
+static gfx::Range push_uniform_piece(UniformPiece piece, const ShaderInfo& info) noexcept {
+  if (piece >= UniformPieceCount) {
+    return {};
+  }
+  gfx::Range range;
+  u8* out = gfx::map_uniform(UniformPieceSizes[piece], range);
+  if (out == nullptr) {
+    return {};
+  }
+  switch (piece) {
+  case UniformView:
+    write_view_uniform(out, info.lineMode);
+    break;
+  case UniformPosMtx:
+    for (u32 i = 0; i < MaxPnMtx; ++i) {
+      put(out, i * sizeof(Mat3x4<float>), g_gxState.pnMtx[i].pos);
+    }
+    break;
+  case UniformNrmMtx:
+    for (u32 i = 0; i < MaxPnMtx; ++i) {
+      put(out, i * sizeof(Mat3x4<float>), g_gxState.pnMtx[i].nrm);
+    }
+    break;
+  case UniformLights:
+    write_lights_uniform(out);
+    break;
+  case UniformMaterial:
+    write_material_uniform(out, info);
+    break;
+  default:
+    break;
+  }
+  return range;
+}
+
+void push_uniforms(const ShaderInfo& info, u8 pieces, std::array<u32, UniformPieceCount>& offsets) noexcept {
   ZoneScoped;
-  static ByteBuffer buf;
-  buf.clear();
-  fill_uniform(buf, info);
-  return gfx::push_uniform(buf.data(), buf.size());
+  for (u32 piece = 0; piece < UniformPieceCount; ++piece) {
+    if ((pieces & 1 << piece) != 0) {
+      offsets[piece] = push_uniform_piece(static_cast<UniformPiece>(piece), info).offset;
+    }
+  }
 }
 } // namespace aurora::gx

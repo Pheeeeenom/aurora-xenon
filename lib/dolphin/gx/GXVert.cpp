@@ -5,10 +5,10 @@
 namespace {
 // Track vertex count between GXBegin/GXEnd for mismatch detection
 u16 sBeginNVerts = 0;
-u32 sBeginFifoSize = 0;
+u64 sBeginFifoSize = 0;
 bool sInBegin = false;
-// GX_AUTO: offset of the u32 byte-length placeholder to patch in GXEnd
-u32 sBeginSizeOffset = 0;
+// GX_AUTO: the stream position of the u32 byte-length placeholder to patch in GXEnd
+u64 sBeginSizeOffset = 0;
 bool sBeginAuto = false;
 
 void pre_begin() {
@@ -27,7 +27,7 @@ void pre_begin() {
 
 void post_begin(u16 nVerts) {
   sBeginNVerts = nVerts;
-  sBeginFifoSize = aurora::gx::fifo::get_buffer_size();
+  sBeginFifoSize = aurora::gx::fifo::write_position();
   sInBegin = true;
 }
 } // namespace
@@ -43,11 +43,10 @@ void GXBegin(GXPrimitive primitive, GXVtxFmt vtxFmt, u16 nVerts) {
     AURORA_ASSERT(!aurora::gx::fifo::in_display_list(), "GXBegin: GX_AUTO not supported in display lists");
     GX_WRITE_AURORA(GX_AURORA_DRAW_SIZED);
     GX_WRITE_U8(drawCmd);
-    sBeginSizeOffset = aurora::gx::fifo::get_buffer_size();
+    sBeginSizeOffset = aurora::gx::fifo::write_position();
     GX_WRITE_U32(0);
   } else {
-    GX_WRITE_U8(drawCmd);
-    GX_WRITE_U16(nVerts);
+    aurora::gx::fifo::write_command(static_cast<uint8_t>(drawCmd), static_cast<uint16_t>(nVerts));
   }
 
   post_begin(nVerts);
@@ -75,7 +74,7 @@ void GXBeginIndexed(GXVtxFmt vtxFmt, u16 nVerts, const u16* indices, u32 nIndice
 
 void GXEnd() {
   if (sInBegin) {
-    u32 bytesWritten = aurora::gx::fifo::get_buffer_size() - sBeginFifoSize;
+    const auto bytesWritten = static_cast<u32>(aurora::gx::fifo::write_position() - sBeginFifoSize);
     if (sBeginAuto) {
       aurora::gx::fifo::patch_u32(sBeginSizeOffset, bytesWritten);
       sBeginAuto = false;
@@ -92,152 +91,118 @@ void GXEnd() {
 }
 
 void GXPosition3f32(f32 x, f32 y, f32 z) {
-  GX_WRITE_F32(x);
-  GX_WRITE_F32(y);
-  GX_WRITE_F32(z);
+  aurora::gx::fifo::write_command(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
 }
 
 void GXPosition3u16(u16 x, u16 y, u16 z) {
-  GX_WRITE_U16(x);
-  GX_WRITE_U16(y);
-  GX_WRITE_U16(z);
+  aurora::gx::fifo::write_command(static_cast<uint16_t>(x), static_cast<uint16_t>(y), static_cast<uint16_t>(z));
 }
 
 void GXPosition3s16(s16 x, s16 y, s16 z) {
-  GX_WRITE_U16(static_cast<u16>(x));
-  GX_WRITE_U16(static_cast<u16>(y));
-  GX_WRITE_U16(static_cast<u16>(z));
+  aurora::gx::fifo::write_command(static_cast<uint16_t>(x), static_cast<uint16_t>(y), static_cast<uint16_t>(z));
 }
 
 void GXPosition3u8(u8 x, u8 y, u8 z) {
-  GX_WRITE_U8(x);
-  GX_WRITE_U8(y);
-  GX_WRITE_U8(z);
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(x), static_cast<uint8_t>(y), static_cast<uint8_t>(z));
 }
 
 void GXPosition3s8(s8 x, s8 y, s8 z) {
-  GX_WRITE_U8(static_cast<u8>(x));
-  GX_WRITE_U8(static_cast<u8>(y));
-  GX_WRITE_U8(static_cast<u8>(z));
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(x), static_cast<uint8_t>(y), static_cast<uint8_t>(z));
 }
 
-void GXPosition2f32(f32 x, f32 y) {
-  GX_WRITE_F32(x);
-  GX_WRITE_F32(y);
-}
+void GXPosition2f32(f32 x, f32 y) { aurora::gx::fifo::write_command(static_cast<float>(x), static_cast<float>(y)); }
 
 void GXPosition2u16(u16 x, u16 y) {
-  GX_WRITE_U16(x);
-  GX_WRITE_U16(y);
+  aurora::gx::fifo::write_command(static_cast<uint16_t>(x), static_cast<uint16_t>(y));
 }
 
 void GXPosition2s16(s16 x, s16 y) {
-  GX_WRITE_U16(static_cast<u16>(x));
-  GX_WRITE_U16(static_cast<u16>(y));
+  aurora::gx::fifo::write_command(static_cast<uint16_t>(x), static_cast<uint16_t>(y));
 }
 
-void GXPosition2u8(u8 x, u8 y) {
-  GX_WRITE_U8(x);
-  GX_WRITE_U8(y);
+void GXPosition2u8(u8 x, u8 y) { aurora::gx::fifo::write_command(static_cast<uint8_t>(x), static_cast<uint8_t>(y)); }
+
+void GXPosition2s8(s8 x, s8 y) { aurora::gx::fifo::write_command(static_cast<uint8_t>(x), static_cast<uint8_t>(y)); }
+
+void GXPosition1x16(u16 idx) { aurora::gx::fifo::write_command(static_cast<uint16_t>(idx)); }
+
+u8* GXReserveVertexData(u32 size) {
+  // A list being recorded drops a value that doesn't fit, so the values go through their calls there.
+  if (aurora::gx::fifo::in_display_list()) {
+    return nullptr;
+  }
+  return aurora::gx::fifo::reserve(size);
 }
 
-void GXPosition2s8(s8 x, s8 y) {
-  GX_WRITE_U8(static_cast<u8>(x));
-  GX_WRITE_U8(static_cast<u8>(y));
-}
+void GXCommitVertexData(const u8* end) { aurora::gx::fifo::commit(end); }
 
-void GXPosition1x16(u16 idx) { GX_WRITE_U16(idx); }
-
-void GXPosition1x8(u8 idx) { GX_WRITE_U8(idx); }
+void GXPosition1x8(u8 idx) { aurora::gx::fifo::write_command(static_cast<uint8_t>(idx)); }
 
 void GXNormal3f32(f32 x, f32 y, f32 z) {
-  GX_WRITE_F32(x);
-  GX_WRITE_F32(y);
-  GX_WRITE_F32(z);
+  aurora::gx::fifo::write_command(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
 }
 
 void GXNormal3s16(s16 x, s16 y, s16 z) {
-  GX_WRITE_U16(static_cast<u16>(x));
-  GX_WRITE_U16(static_cast<u16>(y));
-  GX_WRITE_U16(static_cast<u16>(z));
+  aurora::gx::fifo::write_command(static_cast<uint16_t>(x), static_cast<uint16_t>(y), static_cast<uint16_t>(z));
 }
 
 void GXNormal3s8(s8 x, s8 y, s8 z) {
-  GX_WRITE_U8(static_cast<u8>(x));
-  GX_WRITE_U8(static_cast<u8>(y));
-  GX_WRITE_U8(static_cast<u8>(z));
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(x), static_cast<uint8_t>(y), static_cast<uint8_t>(z));
 }
 
-void GXNormal1x16(u16 index) { GX_WRITE_U16(index); }
+void GXNormal1x16(u16 index) { aurora::gx::fifo::write_command(static_cast<uint16_t>(index)); }
 
-void GXNormal1x8(u8 index) { GX_WRITE_U8(index); }
+void GXNormal1x8(u8 index) { aurora::gx::fifo::write_command(static_cast<uint8_t>(index)); }
 
 void GXColor4f32(f32 r, f32 g, f32 b, f32 a) {
-  GX_WRITE_U8(static_cast<u8>(r * 255.0));
-  GX_WRITE_U8(static_cast<u8>(g * 255.0));
-  GX_WRITE_U8(static_cast<u8>(b * 255.0));
-  GX_WRITE_U8(static_cast<u8>(a * 255.0));
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(r * 255.0), static_cast<uint8_t>(g * 255.0),
+                                  static_cast<uint8_t>(b * 255.0), static_cast<uint8_t>(a * 255.0));
 }
 
 void GXColor4u8(u8 r, u8 g, u8 b, u8 a) {
-  GX_WRITE_U8(r);
-  GX_WRITE_U8(g);
-  GX_WRITE_U8(b);
-  GX_WRITE_U8(a);
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b),
+                                  static_cast<uint8_t>(a));
 }
 
 void GXColor3u8(u8 r, u8 g, u8 b) {
-  GX_WRITE_U8(r);
-  GX_WRITE_U8(g);
-  GX_WRITE_U8(b);
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b));
 }
 
-void GXColor1u32(u32 clr) { GX_WRITE_U32(clr); }
+void GXColor1u32(u32 clr) { aurora::gx::fifo::write_command(static_cast<uint32_t>(clr)); }
 
-void GXColor1u16(u16 clr) { GX_WRITE_U16(clr); }
+void GXColor1u16(u16 clr) { aurora::gx::fifo::write_command(static_cast<uint16_t>(clr)); }
 
-void GXColor1x16(u16 index) { GX_WRITE_U16(index); }
+void GXColor1x16(u16 index) { aurora::gx::fifo::write_command(static_cast<uint16_t>(index)); }
 
-void GXColor1x8(u8 index) { GX_WRITE_U8(index); }
+void GXColor1x8(u8 index) { aurora::gx::fifo::write_command(static_cast<uint8_t>(index)); }
 
-void GXTexCoord2f32(f32 s, f32 t) {
-  GX_WRITE_F32(s);
-  GX_WRITE_F32(t);
-}
+void GXTexCoord2f32(f32 s, f32 t) { aurora::gx::fifo::write_command(static_cast<float>(s), static_cast<float>(t)); }
 
 void GXTexCoord2u16(u16 s, u16 t) {
-  GX_WRITE_U16(s);
-  GX_WRITE_U16(t);
+  aurora::gx::fifo::write_command(static_cast<uint16_t>(s), static_cast<uint16_t>(t));
 }
 
 void GXTexCoord2s16(s16 s, s16 t) {
-  GX_WRITE_U16(static_cast<u16>(s));
-  GX_WRITE_U16(static_cast<u16>(t));
+  aurora::gx::fifo::write_command(static_cast<uint16_t>(s), static_cast<uint16_t>(t));
 }
 
-void GXTexCoord2u8(u8 s, u8 t) {
-  GX_WRITE_U8(s);
-  GX_WRITE_U8(t);
-}
+void GXTexCoord2u8(u8 s, u8 t) { aurora::gx::fifo::write_command(static_cast<uint8_t>(s), static_cast<uint8_t>(t)); }
 
-void GXTexCoord2s8(s8 s, s8 t) {
-  GX_WRITE_U8(static_cast<u8>(s));
-  GX_WRITE_U8(static_cast<u8>(t));
-}
+void GXTexCoord2s8(s8 s, s8 t) { aurora::gx::fifo::write_command(static_cast<uint8_t>(s), static_cast<uint8_t>(t)); }
 
-void GXTexCoord1f32(f32 s) { GX_WRITE_F32(s); }
+void GXTexCoord1f32(f32 s) { aurora::gx::fifo::write_command(static_cast<float>(s)); }
 
-void GXTexCoord1u16(u16 s) { GX_WRITE_U16(s); }
+void GXTexCoord1u16(u16 s) { aurora::gx::fifo::write_command(static_cast<uint16_t>(s)); }
 
-void GXTexCoord1s16(s16 s) { GX_WRITE_U16(static_cast<u16>(s)); }
+void GXTexCoord1s16(s16 s) { aurora::gx::fifo::write_command(static_cast<uint16_t>(s)); }
 
-void GXTexCoord1u8(u8 s) { GX_WRITE_U8(s); }
+void GXTexCoord1u8(u8 s) { aurora::gx::fifo::write_command(static_cast<uint8_t>(s)); }
 
-void GXTexCoord1s8(s8 s) { GX_WRITE_U8(static_cast<u8>(s)); }
+void GXTexCoord1s8(s8 s) { aurora::gx::fifo::write_command(static_cast<uint8_t>(s)); }
 
-void GXTexCoord1x16(u16 index) { GX_WRITE_U16(index); }
+void GXTexCoord1x16(u16 index) { aurora::gx::fifo::write_command(static_cast<uint16_t>(index)); }
 
-void GXTexCoord1x8(u8 index) { GX_WRITE_U8(index); }
+void GXTexCoord1x8(u8 index) { aurora::gx::fifo::write_command(static_cast<uint8_t>(index)); }
 
 void GXCmd1u8(const u8 x) { aurora::gx::fifo::write_u8(x); }
 void GXCmd1u16(const u16 x) { aurora::gx::fifo::write_u16(x); }

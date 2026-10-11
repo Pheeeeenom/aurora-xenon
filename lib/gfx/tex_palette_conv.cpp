@@ -1,6 +1,7 @@
 #include "tex_palette_conv.hpp"
 
 #include "../internal.hpp"
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 #include "texture.hpp"
@@ -224,11 +225,11 @@ void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
       },
       wgpu::BindGroupEntry{
           .binding = 1,
-          .textureView = req.src->sampleTextureView,
+          .textureView = req.src->gpu->sampleTextureView,
       },
       wgpu::BindGroupEntry{
           .binding = 2,
-          .textureView = req.tlut->sampleTextureView,
+          .textureView = req.tlut->gpu->sampleTextureView,
       },
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
@@ -240,7 +241,7 @@ void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
 
   const std::array colorAttachments{
       wgpu::RenderPassColorAttachment{
-          .view = req.dst->attachmentTextureView,
+          .view = req.dst->gpu->attachmentTextureView,
           .loadOp = wgpu::LoadOp::Clear,
           .storeOp = wgpu::StoreOp::Store,
           .clearValue = {0.0, 0.0, 0.0, 0.0},
