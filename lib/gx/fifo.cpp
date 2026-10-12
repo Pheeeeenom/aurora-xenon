@@ -401,7 +401,7 @@ void publish_to(uint64_t target) noexcept {
 
 template <size_t N>
 void put_u32(std::array<uint8_t, N>& out, size_t at, uint32_t value) noexcept {
-  const uint32_t big = bswap(value);
+  const uint32_t big = to_big_endian(value);
   std::memcpy(out.data() + at, &big, sizeof(big));
 }
 
@@ -579,7 +579,7 @@ void patch_u32(uint64_t position, uint32_t val) {
                 "fifo::patch_u32: invalid patch position {} (written to {})", position, write_position());
   AURORA_ASSERT(position >= sPublished.load(std::memory_order_relaxed),
                 "fifo::patch_u32: position {} is below the published watermark", position);
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   std::memcpy(detail::sBufferData + (position - sWriteChunk->base), &out, sizeof(out));
 }
 

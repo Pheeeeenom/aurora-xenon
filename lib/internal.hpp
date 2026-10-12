@@ -83,6 +83,16 @@ ALWAYS_INLINE constexpr T bswap(T val) noexcept {
   return std::bit_cast<T>(bits);
 }
 
+// A value in the GameCube's byte order, big-endian, which the command stream keeps; read_bits below reads it back.
+template <typename T>
+ALWAYS_INLINE constexpr T to_big_endian(T val) noexcept {
+  if constexpr (std::endian::native == std::endian::little) {
+    return bswap(val);
+  } else {
+    return val;
+  }
+}
+
 template <typename T>
   requires(std::is_trivially_copyable_v<T>)
 ALWAYS_INLINE T unaligned_load(const void* ptr) noexcept {

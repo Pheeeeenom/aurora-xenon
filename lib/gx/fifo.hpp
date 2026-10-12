@@ -88,22 +88,22 @@ inline void write_u8(const uint8_t val) {
 }
 
 inline void write_u16(const uint16_t val) {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   write_data(&out, sizeof(out));
 }
 
 inline void write_u32(const uint32_t val) {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   write_data(&out, sizeof(out));
 }
 
 inline void write_u64(const uint64_t val) {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   write_data(&out, sizeof(out));
 }
 
 inline void write_f32(const float val) {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   write_data(&out, sizeof(out));
 }
 
@@ -137,25 +137,25 @@ inline uint8_t* put_u8(uint8_t* p, const uint8_t val) noexcept {
 }
 
 inline uint8_t* put_u16(uint8_t* p, const uint16_t val) noexcept {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   std::memcpy(p, &out, sizeof(out));
   return p + sizeof(out);
 }
 
 inline uint8_t* put_u32(uint8_t* p, const uint32_t val) noexcept {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   std::memcpy(p, &out, sizeof(out));
   return p + sizeof(out);
 }
 
 inline uint8_t* put_u64(uint8_t* p, const uint64_t val) noexcept {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   std::memcpy(p, &out, sizeof(out));
   return p + sizeof(out);
 }
 
 inline uint8_t* put_f32(uint8_t* p, const float val) noexcept {
-  const auto out = bswap(val);
+  const auto out = to_big_endian(val);
   std::memcpy(p, &out, sizeof(out));
   return p + sizeof(out);
 }
