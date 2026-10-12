@@ -160,7 +160,17 @@ elseif (_aurora_nod_provider STREQUAL "package")
     message(FATAL_ERROR "Prebuilt nod package did not provide nod::nod target")
   endif ()
 
+elseif (_aurora_nod_provider STREQUAL "iso")
+  # ── ISO: nod's C API over plain disc images, in C, for targets nod's Rust doesn't build for ──
+  if (NOT TARGET nod::nod)
+    message(STATUS "aurora: Using Aurora's ISO reader for nod (provider=iso)")
+    add_library(nod_iso STATIC "${CMAKE_CURRENT_LIST_DIR}/../lib/nod_iso/nod_iso.c")
+    add_library(nod::nod ALIAS nod_iso)
+    target_include_directories(nod_iso PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../lib/nod_iso/include")
+    set_target_properties(nod_iso PROPERTIES FOLDER "aurora")
+  endif ()
+
 else ()
   message(FATAL_ERROR "Invalid AURORA_NOD_PROVIDER: ${AURORA_NOD_PROVIDER} "
-    "(must be auto, vendor, system, or package)")
+    "(must be auto, vendor, system, package, or iso)")
 endif ()

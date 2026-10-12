@@ -91,8 +91,9 @@ set_property(CACHE AURORA_SDL3_LINKAGE PROPERTY STRINGS shared static)
 
 # nod (if AURORA_ENABLE_DVD)
 set(AURORA_NOD_PROVIDER "${_default_provider}" CACHE STRING
-  "How to provide nod: auto, vendor (build from source), system (find_package/imported), package (download prebuilt)")
-set_property(CACHE AURORA_NOD_PROVIDER PROPERTY STRINGS auto vendor system package)
+  "How to provide nod: auto, vendor (build from source), system (find_package/imported), package (download prebuilt), \
+iso (Aurora's reader of plain disc images, in C)")
+set_property(CACHE AURORA_NOD_PROVIDER PROPERTY STRINGS auto vendor system package iso)
 set(AURORA_NOD_LINKAGE "${_default_linkage}" CACHE STRING "nod linkage type preference")
 set_property(CACHE AURORA_NOD_LINKAGE PROPERTY STRINGS shared static)
 
