@@ -9,10 +9,12 @@
 #include "../gx/gx.hpp"
 #include "../imgui.hpp"
 #include "../window.hpp"
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 #include "../rmlui/pipeline.hpp"
 
 #include <aurora/rmlui.hpp>
+#elif defined(AURORA_ENABLE_RMLUI)
+#include "../rmlui.hpp"
 #endif
 
 #include <array>
@@ -139,7 +141,7 @@ void initialize() {
     g_presentTimes.clear();
   }
   render_worker::initialize();
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
   rmlui::initialize_pipeline();
 #endif
   initialize_pipeline_cache();
@@ -158,7 +160,7 @@ void shutdown() {
   shutdown_pipeline_cache();
   texture_replacement::shutdown();
   gx::shutdown();
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
   rmlui::shutdown_pipeline();
 #endif
   for (auto& packet : g_framePackets) {
@@ -224,9 +226,13 @@ FrameEnding end_frame(imgui::DrawData overlay, std::string capturePath) {
     TracyPlot("aurora: cpuFrameTimeMs", cpuFrameTimeMs);
   }
   // RmlUi records its passes into the frame after the GX passes, here on the game thread.
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
   const bool close = !rmlui::is_initialized();
 #else
+#ifdef AURORA_ENABLE_RMLUI
+  // A backend that doesn't draw RmlUi still runs its documents, a frame at a time.
+  rmlui::update();
+#endif
   constexpr bool close = true;
 #endif
   if (close) {

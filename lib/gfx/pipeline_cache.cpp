@@ -7,7 +7,7 @@
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
 #include "../io.hpp"
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 #include "../rmlui/pipeline.hpp"
 // RmlUi draws only with Dawn.
 #include "../webgpu/backend.hpp"
@@ -57,7 +57,7 @@ struct PipelineCacheWrite {
 };
 
 using SavedPipelineConfig = std::variant<gx::PipelineConfig, clear::PipelineConfig
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
                                          ,
                                          rmlui::PipelineConfig
 #endif
@@ -544,7 +544,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig
       priority);
 }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 static PipelineRef resolve_pipeline(ShaderType type, const rmlui::PipelineConfig& config, const RenderTargetLayout&,
                                     PipelinePriority priority) {
   return find_pipeline_impl(
@@ -857,7 +857,7 @@ static void prune_old_pipeline_cache_versions() {
     return;
   }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
   const auto rmlDelete = fmt::format("DELETE FROM pipeline_cache WHERE type = {} AND config_version < {}",
                                      underlying(ShaderType::Rml), rmlui::RmlPipelineConfigVersion);
   ret = sqlite::exec(g_pipelineCacheDb, rmlDelete.c_str());
@@ -1056,7 +1056,7 @@ static size_t load_pipeline_cache() {
   }
 
   size_t acceptedRows = 0;
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
   acceptedRows += load_pipeline_cache_entries<rmlui::PipelineConfig>(ShaderType::Rml, rmlui::RmlPipelineConfigVersion);
 #endif
   acceptedRows +=
@@ -1099,7 +1099,7 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
   return resolve_pipeline(ShaderType::GX, config, layout, PipelinePriority::Normal);
 }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
   remember_pipeline_config(ShaderType::Rml, config, 0, true);
   return resolve_pipeline(ShaderType::Rml, config, {}, PipelinePriority::Blocking);

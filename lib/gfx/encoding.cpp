@@ -9,7 +9,7 @@
 #include "tex_palette_conv.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 #include "../rmlui/pipeline.hpp"
 #endif
 #include "../webgpu/backend.hpp"
@@ -164,7 +164,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
                       passInfo.colorAttachments[SceneColorAttachmentIndex].size);
         break;
       case DrawKind::RmlUi:
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
         rmlui::render(inline_payload<rmlui::DrawData>(draw.payload.data()), pass);
 #endif
         break;

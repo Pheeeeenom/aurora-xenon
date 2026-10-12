@@ -13,7 +13,7 @@
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 #include "../rmlui/pipeline.hpp"
 #endif
 #include "../window.hpp"
@@ -824,7 +824,7 @@ void push_draw_command(gx::DrawData data) {
   push_draw_command(make_draw_command(DrawKind::Gx, data));
 }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 template <>
 void push_draw_command(rmlui::DrawData data) {
   push_draw_command(make_draw_command(DrawKind::RmlUi, data));
@@ -836,7 +836,7 @@ PipelineRef pipeline_ref(const gx::PipelineConfig& config) {
   return find_pipeline(config, get_render_target_layout());
 }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 template <>
 PipelineRef pipeline_ref(const rmlui::PipelineConfig& config) {
   return find_pipeline(config);

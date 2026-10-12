@@ -76,7 +76,7 @@ else ()
     )
 endif ()
 
-if (AURORA_ENABLE_RMLUI)
+if (AURORA_RMLUI_DRAWS)
     target_sources(aurora_gx PRIVATE
         lib/rmlui/pipeline.cpp
         lib/rmlui/pipeline.hpp

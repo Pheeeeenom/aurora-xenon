@@ -59,12 +59,17 @@ if (AURORA_ENABLE_RMLUI)
             lib/rmlui.cpp
             lib/rmlui/RuntimeTextureProvider.cpp
             lib/rmlui/RmlUi_Backend_Aurora.cpp
-            lib/rmlui/WebGPURenderInterface.cpp
             lib/rmlui/SystemInterface_Aurora.cpp
             lib/rmlui/FileInterface_SDL.cpp
-            lib/rmlui/GlassFilter.cpp
-            lib/rmlui/ImageEffects.cpp
     )
+    if (AURORA_RMLUI_DRAWS)
+        target_compile_definitions(aurora_core PUBLIC AURORA_RMLUI_DRAWS)
+        target_sources(aurora_core PRIVATE
+                lib/rmlui/WebGPURenderInterface.cpp
+                lib/rmlui/GlassFilter.cpp
+                lib/rmlui/ImageEffects.cpp
+        )
+    endif ()
     target_link_libraries(aurora_core PUBLIC rmlui)
 
     target_link_libraries(aurora_core PUBLIC rmlui_backends)

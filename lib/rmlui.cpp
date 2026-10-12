@@ -14,11 +14,15 @@
 #include "internal.hpp"
 #include "imgui.hpp"
 #include "rmlui/FileInterface_SDL.h"
+#include "rmlui/SystemInterface_Aurora.h"
+#ifdef AURORA_RMLUI_DRAWS
 #include "rmlui/GlassFilter.hpp"
 #include "rmlui/ImageEffects.hpp"
-#include "rmlui/SystemInterface_Aurora.h"
 #include "rmlui/WebGPURenderInterface.hpp"
 #include "webgpu/gpu.hpp"
+#else
+#include <aurora/gfx.hpp>
+#endif
 
 namespace aurora::rmlui {
 Rml::Context* g_context = nullptr;
@@ -40,12 +44,29 @@ struct TrackedTouch {
 uint32_t s_pressedMouseButtons = 0;
 std::array<TrackedTouch, MaxTrackedTouches> s_trackedTouches{};
 float s_uiScale = 0.0f;
+#ifdef AURORA_RMLUI_DRAWS
 webgpu::TextureWithSampler s_renderTarget;
 wgpu::BindGroup s_renderTargetCopyBindGroup;
 
 WebGPURenderInterface* get_render_interface() noexcept {
   return static_cast<WebGPURenderInterface*>(Backend::GetRenderInterface()); // NOLINT(*-pro-type-static-cast-downcast)
 }
+
+gfx::Viewport present_viewport(uint32_t surfaceWidth, uint32_t surfaceHeight, uint32_t contentWidth,
+                               uint32_t contentHeight) noexcept {
+  return webgpu::calculate_present_viewport(surfaceWidth, surfaceHeight, contentWidth, contentHeight);
+}
+#else
+// Nothing is presented, so the content fills the window.
+gfx::Viewport present_viewport(uint32_t surfaceWidth, uint32_t surfaceHeight, uint32_t, uint32_t) noexcept {
+  return {.left = 0.f,
+          .top = 0.f,
+          .width = static_cast<float>(surfaceWidth),
+          .height = static_cast<float>(surfaceHeight),
+          .znear = 0.f,
+          .zfar = 1.f};
+}
+#endif
 
 Rml::Vector2i dimensions_from_viewport(const gfx::Viewport& viewport) noexcept {
   return {
@@ -55,8 +76,7 @@ Rml::Vector2i dimensions_from_viewport(const gfx::Viewport& viewport) noexcept {
 }
 
 Rml::Vector2i presentation_dimensions_from_window_size(const AuroraWindowSize& size) noexcept {
-  const auto viewport =
-      webgpu::calculate_present_viewport(size.native_fb_width, size.native_fb_height, size.fb_width, size.fb_height);
+  const auto viewport = present_viewport(size.native_fb_width, size.native_fb_height, size.fb_width, size.fb_height);
   return dimensions_from_viewport(viewport);
 }
 
@@ -73,6 +93,7 @@ void sync_context_metrics(Rml::Vector2i dimensions) noexcept {
   }
 }
 
+#ifdef AURORA_RMLUI_DRAWS
 void ensure_render_target(Rml::Vector2i dimensions) noexcept {
   if (dimensions.x <= 0 || dimensions.y <= 0) {
     return;
@@ -111,6 +132,7 @@ bool context_has_visible_backdrop_filter(Rml::Context* context) noexcept {
   }
   return element_has_visible_backdrop_filter(context->GetRootElement());
 }
+#endif
 
 struct MappedPoint {
   Rml::Vector2f position;
@@ -129,8 +151,7 @@ MappedPoint map_native_point_to_content(float nativeX, float nativeY) noexcept {
     return {};
   }
 
-  const auto viewport =
-      webgpu::calculate_present_viewport(size.native_fb_width, size.native_fb_height,
+  const auto viewport = present_viewport(size.native_fb_width, size.native_fb_height,
                                          static_cast<uint32_t>(contentSize.x), static_cast<uint32_t>(contentSize.y));
   const float right = viewport.left + viewport.width;
   const float bottom = viewport.top + viewport.height;
@@ -356,20 +377,24 @@ void initialize(const AuroraWindowSize& size) noexcept {
 
   g_fileInterface = new FileInterface_SDL();
 
-  auto* renderInterface = get_render_interface();
   Rml::SetSystemInterface(Backend::GetSystemInterface());
-  Rml::SetRenderInterface(renderInterface);
+  Rml::SetRenderInterface(Backend::GetRenderInterface());
   Rml::SetFileInterface(g_fileInterface);
 
+#ifdef AURORA_RMLUI_DRAWS
+  auto* renderInterface = get_render_interface();
   renderInterface->SetWindowSize(dim);
   renderInterface->SetRenderTargetFormat(webgpu::g_graphicsConfig.surfaceConfiguration.format);
   renderInterface->CreateDeviceObjects();
+#endif
 
   Rml::Initialise();
+#ifdef AURORA_RMLUI_DRAWS
   register_image_effects();
 
   static GlassFilterInstancer s_glassInstancer;
   Rml::Factory::RegisterFilterInstancer("glass", &s_glassInstancer);
+#endif
 
   g_context = Rml::CreateContext("main", dim);
 
@@ -390,11 +415,16 @@ void set_ui_scale(float scale) noexcept { s_uiScale = scale > 0.0f ? std::clamp(
 
 float get_ui_scale() noexcept { return s_uiScale; }
 
+#ifdef AURORA_RMLUI_DRAWS
 void set_glass_light_dir(float x, float y) noexcept {
   if (const float len = std::hypot(x, y); len > 1e-4f) {
     g_glassLightDir = {x / len, y / len};
   }
 }
+#else
+// Only the glass filter, which draws, reads the light's direction.
+void set_glass_light_dir(float, float) noexcept {}
+#endif
 
 void set_input_type(InputType type) noexcept {
   auto* systemInterface = static_cast<SystemInterface_Aurora*>(Backend::GetSystemInterface());
@@ -449,6 +479,7 @@ void handle_event(SDL_Event& event) noexcept {
   RmlSDL::InputEventHandler(g_context, window::get_sdl_window(), event);
 }
 
+#ifdef AURORA_RMLUI_DRAWS
 RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
   if (g_context == nullptr) {
     return {};
@@ -483,6 +514,15 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
       .overlay = !needsBackdrop,
   };
 }
+#else
+void update() noexcept {
+  if (g_context == nullptr) {
+    return;
+  }
+  sync_context_metrics(presentation_dimensions_from_window_size(window::get_window_size()));
+  g_context->Update();
+}
+#endif
 
 void shutdown() noexcept {
   if (g_context == nullptr) {
@@ -493,7 +533,9 @@ void shutdown() noexcept {
   Rml::Shutdown();
   Backend::Shutdown();
   g_context = nullptr;
+#ifdef AURORA_RMLUI_DRAWS
   s_renderTarget = {};
   s_renderTargetCopyBindGroup = {};
+#endif
 }
 } // namespace aurora::rmlui
