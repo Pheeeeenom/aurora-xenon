@@ -139,7 +139,14 @@ template <typename T>
   requires(std::is_floating_point_v<T> && requires { typename uint_of_size_t<sizeof(T)>; })
 ALWAYS_INLINE T read_bits(const void* ptr, const std::endian e = std::endian::big) noexcept {
   using U = uint_of_size_t<sizeof(T)>;
-  return std::bit_cast<T>(read_bits<U>(ptr, e));
+  U bits = read_bits<U>(ptr, e);
+#ifdef __XSDK__
+  // With no swap between them, GCC merges the integer load and the cast into one float load, and the Xbox 360 raises
+  // an alignment exception on a float load from the command stream, whose floats sit at any byte (an lfsx in
+  // handle_aurora); its integer loads there are fine. Holding the bits in an integer register keeps the load one.
+  asm("" : "+r"(bits));
+#endif
+  return std::bit_cast<T>(bits);
 }
 
 template <typename T>
