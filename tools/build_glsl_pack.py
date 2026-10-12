@@ -7,14 +7,12 @@ each program's SPIR-V by its source's hash, and v4x_shader_bundle, which the lay
     build_glsl_pack.py --vulkan4xenon ../vulkan4xenon --xost ../Xbox-360-SDK/xenos-toolchain \
         --output platforms/xenon/glsl_pack platforms/xenon/shaders
 
-A program glslang or xost refuses, or one xost can't fit in the pixel shader's 16 registers, is left out and listed;
+A program glslang or xost refuses, as xost does one past its kind's share of xsdk's registers, is left out and listed;
 the backend then logs it as missing and skips its draws. Run it from the game's repository root, as build_shaders.py
 wants paths relative.
 """
 
 import argparse
-import contextlib
-import io
 import os
 import re
 import subprocess
@@ -25,8 +23,6 @@ from pathlib import Path
 # A recorded program's name: its hash (glsl::program_hash) in 16 hex digits, and its stage.
 PROGRAM_NAME = re.compile(r"^([0-9a-f]{16})\.(vert|frag)$")
 C_PREFIX = "glsl_"
-# xost's warning for a pixel shader over its register budget (xost:xasm/program.py), which only warns.
-OVER_BUDGET = "will HANG"
 
 
 def compile_spirv(glslang, source, directory):
@@ -40,14 +36,10 @@ def compile_spirv(glslang, source, directory):
 
 def lower(build_shaders, xost, spirv_bytes, source):
     """build_shaders.lower's result, or the reason xost refused the program."""
-    warnings = io.StringIO()
     try:
-        with contextlib.redirect_stderr(warnings):
-            container, literals, resources = build_shaders.lower(xost, spirv_bytes, source)
+        container, literals, resources = build_shaders.lower(xost, spirv_bytes, source)
     except (Exception, SystemExit) as error:  # xost raises its own errors, and build_shaders exits
         return None, f"xost: {type(error).__name__}: {error}"
-    if OVER_BUDGET in warnings.getvalue():
-        return None, "xost: " + warnings.getvalue().strip()
     return (container, literals, resources), None
 
 
