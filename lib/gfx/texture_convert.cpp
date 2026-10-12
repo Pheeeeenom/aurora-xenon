@@ -283,12 +283,15 @@ struct TextureDecoderIA8 {
   static constexpr uint32_t BlockWidth = 4;
   static constexpr uint32_t BlockHeight = 4;
 
+  // Alpha in a texel's first byte and intensity in its second, read as bytes so either host's order does: a
+  // little-endian load put intensity in the high byte, and a big-endian one would swap them.
   static void decode_texel(Target* target, const Source* in, const uint32_t x) {
-    const uint8_t intensity = in[x] >> 8;
+    const auto* texel = reinterpret_cast<const uint8_t*>(in + x);
+    const uint8_t intensity = texel[1];
     target[x].r = intensity;
     target[x].g = intensity;
     target[x].b = intensity;
-    target[x].a = in[x] & 0xff;
+    target[x].a = texel[0];
   }
 };
 
