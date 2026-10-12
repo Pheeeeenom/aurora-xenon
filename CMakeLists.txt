@@ -30,6 +30,12 @@ if (AURORA_ENABLE_GX AND AURORA_GFX_BACKEND STREQUAL "dawn")
 else ()
   set(AURORA_USE_DAWN OFF)
 endif ()
+# On the null backend, a directory to record into the GLSL each pipeline's shader config needs for the vulkan4xenon
+# backend (lib/vulkan4xenon/glsl.hpp), for its offline compile. Empty records nothing.
+set(AURORA_GLSL_RECORD_DIR "" CACHE STRING "Where the null backend records each pipeline's GLSL for vulkan4xenon")
+if (NOT AURORA_GLSL_RECORD_DIR STREQUAL "" AND NOT AURORA_GFX_BACKEND STREQUAL "null")
+  message(FATAL_ERROR "AURORA_GLSL_RECORD_DIR records on the null backend, not ${AURORA_GFX_BACKEND}")
+endif ()
 # RmlUi draws only through Dawn; on the null backend its documents run and nothing is drawn.
 if (AURORA_ENABLE_RMLUI AND AURORA_USE_DAWN)
   set(AURORA_RMLUI_DRAWS ON)

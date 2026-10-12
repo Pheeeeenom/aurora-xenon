@@ -74,6 +74,13 @@ else ()
             lib/null/backend.cpp
             lib/null/texture_replacement.cpp
     )
+    if (NOT AURORA_GLSL_RECORD_DIR STREQUAL "")
+        target_sources(aurora_gx PRIVATE
+                lib/vulkan4xenon/glsl.cpp
+                lib/vulkan4xenon/record.cpp
+        )
+        target_compile_definitions(aurora_gx PRIVATE AURORA_GLSL_RECORD_DIR="${AURORA_GLSL_RECORD_DIR}")
+    endif ()
 endif ()
 
 if (AURORA_RMLUI_DRAWS)

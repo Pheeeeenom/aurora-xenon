@@ -8,6 +8,9 @@
 #include "../imgui.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
+#ifdef AURORA_GLSL_RECORD_DIR
+#include "../vulkan4xenon/glsl.hpp"
+#endif
 
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
@@ -89,8 +92,13 @@ std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPe
 }
 
 CompiledPipeline create_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept {
-  (void)config;
   (void)layout;
+#ifdef AURORA_GLSL_RECORD_DIR
+  // Each config's GLSL for the vulkan4xenon backend, which a run on this backend records for the offline compile.
+  vulkan4xenon::glsl::record(config.shaderConfig, AURORA_GLSL_RECORD_DIR);
+#else
+  (void)config;
+#endif
   return {.main = std::make_shared<Pipeline>()};
 }
 
