@@ -34,8 +34,13 @@ else ()
     set(ABSL_MSVC_STATIC_RUNTIME ON CACHE INTERNAL "Link static runtime libraries")
   endif()
   set(ABSL_PROPAGATE_CXX_STD ON)
+  set(_aurora_abseil_patch)
+  if (XSDK)
+    set(_aurora_abseil_patch PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/PatchAbseil.cmake")
+  endif ()
   FetchContent_Declare(abseil-cpp
     URL https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz
+    ${_aurora_abseil_patch}
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
     EXCLUDE_FROM_ALL
   )
@@ -240,6 +245,10 @@ if (AURORA_ENABLE_GX)
       ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
+    if (XSDK)
+      # ImGui opens links by forking a shell, which xsdk has none of.
+      target_compile_definitions(imgui PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+    endif ()
 
     # Only the Dawn backend draws ImGui, through these.
     if (AURORA_USE_DAWN)
@@ -298,6 +307,11 @@ if (AURORA_ENABLE_GX)
 
     add_library(sqlite3 STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
     target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
+    if (XSDK)
+      # sqlite's Unix VFS needs more POSIX than xsdk has; databases open only through a VFS Aurora registers.
+      target_compile_definitions(sqlite3 PRIVATE SQLITE_OS_OTHER=1)
+      target_sources(sqlite3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../lib/sqlite_os_xsdk.c)
+    endif ()
   endif ()
 
   # Dawn's shader cache compresses with it, and games link it too, whatever the backend.
@@ -373,5 +387,9 @@ if (NOT TARGET Tracy::TracyClient)
 
   if (NOT TARGET TracyClient)
     message(FATAL_ERROR "Failed to make TracyClient available")
+  endif ()
+  if (XSDK)
+    # Tracy's platform layer doesn't build for xsdk, so with profiling off a stand-in defines what's called directly.
+    set_property(TARGET TracyClient PROPERTY SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../lib/tracy_xsdk.cpp")
   endif ()
 endif ()
