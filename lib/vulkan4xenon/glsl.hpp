@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace aurora::gfx::vulkan4xenon::glsl {
@@ -28,14 +29,21 @@ enum class AttrFormat : uint8_t {
   F32x1, // VK_FORMAT_R32_SFLOAT
   F32x2, // VK_FORMAT_R32G32_SFLOAT
   F32x3, // VK_FORMAT_R32G32B32_SFLOAT
-  U8x4,  // VK_FORMAT_R8G8B8A8_UNORM
+  U8x4,  // VK_FORMAT_A8B8G8R8_UNORM_PACK32: one host-order word, red in its low byte
+};
+
+enum class NbtSlice : uint8_t {
+  Normal,
+  Binormal,
+  Tangent,
 };
 
 struct Attribute {
   uint32_t location;
   AttrFormat format;
-  uint32_t offset; // bytes into the vertex
-  GXAttr attr;     // the GX attribute it holds
+  uint32_t offset;                   // bytes into the vertex
+  GXAttr attr;                       // the GX attribute it holds
+  NbtSlice slice = NbtSlice::Normal; // which vector of an NBT normal, for GX_VA_NRM
 };
 
 struct VertexLayout {
@@ -52,10 +60,25 @@ struct Programs {
 // All empty, with the reason logged, for a config these programs don't express yet.
 Programs build_programs(const gx::ShaderConfig& config);
 
+// The backend's own programs. Clears: a full-screen triangle's position at location 0, and the colour in the fragment
+// stage's 16-byte push constant.
+std::string clear_vertex();
+std::string clear_fragment();
+// Copies and the present: the triangle's position at 0 and texture coordinates at 1, offset and scaled by the vertex
+// stage's push constant; set 0's binding 0 the source.
+std::string copy_vertex();
+// A copy to format, as tex_copy_conv.cpp converts it, with alpha read as 1 when opaqueAlpha is set; empty for a format
+// it doesn't convert. GX_TF_RGBA8 copies the texels as they are, as the present does.
+std::string copy_fragment(GXTexFmt format, bool opaqueAlpha);
+bool converts(GXTexFmt format) noexcept;
+// Every one of those programs, and whether it's a fragment program, for the recorder.
+std::vector<std::pair<std::string, bool>> fixed_programs();
+
 // What finds a program's compiled form: its source's XXH3-64, seeded 0 for a vertex program and 1 for a fragment one.
 uint64_t program_hash(std::string_view source, bool fragment) noexcept;
 
 // Any thread: writes config's programs into dir as <hash>.vert and <hash>.frag, the hash in 16 hex digits, each once,
-// for the offline step that compiles them. A config build_programs refuses writes nothing.
+// for the offline step that compiles them. A config build_programs refuses writes nothing. The first call also writes
+// the backend's own programs.
 void record(const gx::ShaderConfig& config, const char* dir);
 } // namespace aurora::gfx::vulkan4xenon::glsl

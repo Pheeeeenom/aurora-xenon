@@ -69,6 +69,20 @@ if (AURORA_USE_DAWN)
     get_target_property(_aurora_dawn_backends aurora_core COMPILE_DEFINITIONS)
     list(FILTER _aurora_dawn_backends INCLUDE REGEX "^DAWN_ENABLE_BACKEND_")
     target_compile_definitions(aurora_gx PRIVATE ${_aurora_dawn_backends})
+elseif (AURORA_GFX_BACKEND STREQUAL "vulkan4xenon")
+    target_sources(aurora_gx PRIVATE
+            lib/vulkan4xenon/backend.cpp
+            lib/vulkan4xenon/decode.cpp
+            lib/vulkan4xenon/device.cpp
+            lib/vulkan4xenon/encoding.cpp
+            lib/vulkan4xenon/glsl.cpp
+            lib/vulkan4xenon/pipeline.cpp
+            lib/null/texture_replacement.cpp
+    )
+    target_compile_definitions(aurora_gx PRIVATE
+            AURORA_VULKAN4XENON_VERTEX_CACHE_BYTES=${AURORA_VULKAN4XENON_VERTEX_CACHE_BYTES})
+    # The layer, and the game's shader pack (aurora/glsl_pack.h) with its bundle, which the game links.
+    target_link_libraries(aurora_gx PUBLIC vulkan4xenon)
 else ()
     target_sources(aurora_gx PRIVATE
             lib/null/backend.cpp

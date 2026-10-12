@@ -3,12 +3,14 @@
 // lighting, fog, indirect texturing, and normal-based texgens (vulkan4xenon's ROADMAP.md, milestone 11).
 #include "glsl.hpp"
 
+#include "../gfx/hash.hpp"
 #include "../gx/shader_info.hpp"
 #include "../internal.hpp"
 
 #include <dolphin/gx/GXEnum.h>
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <string_view>
 
@@ -827,5 +829,111 @@ Programs build_programs(const gx::ShaderConfig& config) {
   programs.layout = make_layout(inputs);
   programs.vertex = vertex_source(plan, programs.layout, body);
   return programs;
+}
+} // namespace aurora::gfx::vulkan4xenon::glsl
+
+namespace aurora::gfx::vulkan4xenon::glsl {
+namespace {
+// What a copy to each format writes, from the sampled colour c and its intensity: tex_copy_conv.cpp's conversions.
+struct CopyConversion {
+  GXTexFmt format;
+  std::string_view result;
+};
+constexpr std::array CopyConversions{
+    CopyConversion{GX_TF_RGBA8, "c"sv},
+    CopyConversion{GX_TF_I4, "vec4(floor(intensity * 16.0) / 15.0)"sv},
+    CopyConversion{GX_TF_I8, "vec4(intensity)"sv},
+    CopyConversion{GX_TF_IA4, "vec4(vec3(floor(intensity * 16.0) / 15.0), floor(c.a * 16.0) / 15.0)"sv},
+    CopyConversion{GX_TF_IA8, "vec4(vec3(intensity), c.a)"sv},
+    CopyConversion{GX_TF_RGB565, "vec4(c.rgb, 1.0)"sv},
+    CopyConversion{GX_CTF_R4, "vec4(floor(c.r * 16.0) / 15.0)"sv},
+    CopyConversion{GX_CTF_RA4, "vec4(vec3(floor(c.r * 16.0) / 15.0), floor(c.a * 16.0) / 15.0)"sv},
+    CopyConversion{GX_CTF_RA8, "c.rrra"sv},
+    CopyConversion{GX_CTF_A8, "c.aaaa"sv},
+    CopyConversion{GX_CTF_R8, "c.rrrr"sv},
+    CopyConversion{GX_CTF_G8, "c.gggg"sv},
+    CopyConversion{GX_CTF_B8, "c.bbbb"sv},
+    CopyConversion{GX_CTF_RG8, "c.rrrg"sv},
+    CopyConversion{GX_CTF_GB8, "c.gggb"sv},
+};
+} // namespace
+
+std::string clear_vertex() {
+  return "#version 450\n"
+         "layout(location = 0) in vec2 in_position;\n"
+         "void main() {\n"
+         "    gl_Position = vec4(in_position, 0.0, 1.0);\n"
+         "}\n";
+}
+
+std::string clear_fragment() {
+  return "#version 450\n"
+         "layout(push_constant, std140) uniform Push {\n"
+         "    vec4 color;\n"
+         "} upush;\n"
+         "layout(location = 0) out vec4 o_color;\n"
+         "void main() {\n"
+         "    o_color = upush.color;\n"
+         "}\n";
+}
+
+// uv_transform is the copy's source rectangle, as offset and scale (recording.cpp, resolve_pass_into).
+std::string copy_vertex() {
+  return "#version 450\n"
+         "layout(push_constant, std140) uniform Push {\n"
+         "    vec4 uv_transform;\n"
+         "} upush;\n"
+         "layout(location = 0) in vec2 in_position;\n"
+         "layout(location = 1) in vec2 in_uv;\n"
+         "layout(location = 0) out vec2 out_uv;\n"
+         "void main() {\n"
+         "    gl_Position = vec4(in_position, 0.0, 1.0);\n"
+         "    out_uv = in_uv * upush.uv_transform.zw + upush.uv_transform.xy;\n"
+         "}\n";
+}
+
+// Sampled alpha is read as 1 in a copy from an EFB without alpha (tex_copy_conv.cpp, sample_efb).
+std::string copy_fragment(GXTexFmt format, bool opaqueAlpha) {
+  const auto conversion = std::ranges::find(CopyConversions, format, &CopyConversion::format);
+  if (conversion == CopyConversions.end()) {
+    return {};
+  }
+  const bool intensity = conversion->result.find("intensity") != std::string_view::npos;
+  return fmt::format(
+      "#version 450\n"
+      "layout(set = 0, binding = 0) uniform sampler2D source;\n"
+      "layout(location = 0) in vec2 in_uv;\n"
+      "layout(location = 0) out vec4 o_color;\n"
+      "void main() {{\n"
+      "    vec4 sampled = texture(source, in_uv);\n"
+      "    vec4 c = {};{}\n"
+      "    o_color = {};\n"
+      "}}\n",
+      opaqueAlpha ? "vec4(sampled.rgb, 1.0)"sv : "sampled"sv,
+      intensity ? "\n    float intensity = dot(c.rgb, vec3(0.257, 0.504, 0.098)) + 16.0 / 255.0;"sv : ""sv,
+      conversion->result);
+}
+
+bool converts(GXTexFmt format) noexcept {
+  return format != GX_TF_RGBA8 &&
+         std::ranges::find(CopyConversions, format, &CopyConversion::format) != CopyConversions.end();
+}
+
+std::vector<std::pair<std::string, bool>> fixed_programs() {
+  std::vector<std::pair<std::string, bool>> programs{
+      {clear_vertex(), false},
+      {clear_fragment(), true},
+      {copy_vertex(), false},
+  };
+  for (const auto& conversion : CopyConversions) {
+    for (const bool opaqueAlpha : {false, true}) {
+      programs.emplace_back(copy_fragment(conversion.format, opaqueAlpha), true);
+    }
+  }
+  return programs;
+}
+
+uint64_t program_hash(std::string_view source, bool fragment) noexcept {
+  return XXH3_64bits_withSeed(source.data(), source.size(), fragment ? 1 : 0);
 }
 } // namespace aurora::gfx::vulkan4xenon::glsl

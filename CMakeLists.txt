@@ -20,11 +20,18 @@ option(AURORA_ENABLE_DIAGNOSTICS "Time Aurora's workers, the GPU and each frame'
 set(AURORA_GX_MAX_PNMTX 10 CACHE STRING
   "Position/normal matrix slots in GX matrix memory: 10 (the SDK's GX_PNMTX0-9) to 21, for a game that loads more")
 set(AURORA_GFX_BACKEND "dawn" CACHE STRING
-  "What draws GX: dawn (WebGPU) or null (nothing: frames are recorded and discarded, with no window or GPU)")
-set_property(CACHE AURORA_GFX_BACKEND PROPERTY STRINGS dawn null)
-if (NOT AURORA_GFX_BACKEND MATCHES "^(dawn|null)$")
-  message(FATAL_ERROR "AURORA_GFX_BACKEND is ${AURORA_GFX_BACKEND}; it must be dawn or null")
+  "What draws GX: dawn (WebGPU), null (nothing: frames are recorded and discarded, with no window or GPU) or \
+vulkan4xenon (the Xbox 360's GPU, through the vulkan4xenon layer)")
+set_property(CACHE AURORA_GFX_BACKEND PROPERTY STRINGS dawn null vulkan4xenon)
+if (NOT AURORA_GFX_BACKEND MATCHES "^(dawn|null|vulkan4xenon)$")
+  message(FATAL_ERROR
+    "AURORA_GFX_BACKEND is ${AURORA_GFX_BACKEND}; it must be dawn, null or vulkan4xenon")
 endif ()
+foreach (_aurora_layer vulkan4xenon)
+  if (AURORA_ENABLE_GX AND AURORA_GFX_BACKEND STREQUAL _aurora_layer AND NOT TARGET ${_aurora_layer})
+    message(FATAL_ERROR "AURORA_GFX_BACKEND is ${_aurora_layer}, but no ${_aurora_layer} target was added before Aurora")
+  endif ()
+endforeach ()
 if (AURORA_ENABLE_GX AND AURORA_GFX_BACKEND STREQUAL "dawn")
   set(AURORA_USE_DAWN ON)
 else ()
@@ -65,6 +72,11 @@ set(AURORA_TEXTURE_CONTENT_CACHE_BYTES 134217728 CACHE STRING "Bytes of converte
 set(AURORA_TEXTURE_PRECONVERT_READY_BYTES 134217728 CACHE STRING
   "Bytes of pre-converted textures waiting for their first draw")
 set(AURORA_TEXTURE_PRECONVERT_QUEUE_BYTES 67108864 CACHE STRING "Bytes of textures queued for pre-conversion")
+# The vulkan4xenon backend's decoded vertices, kept in the console's GPU memory from frame to frame for draws with the
+# same inputs: one block for every frame slot, which must hold every vertex the frames in flight draw; draws past it
+# are skipped. The default is 8 MiB.
+set(AURORA_VULKAN4XENON_VERTEX_CACHE_BYTES 8388608 CACHE STRING
+  "Bytes of GPU memory for the vulkan4xenon backend's decoded vertices, kept across frames")
 
 include(CMakeDependentOption)
 cmake_dependent_option(AURORA_ENABLE_EXAMPLES "Enable examples" ON "CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR" OFF)

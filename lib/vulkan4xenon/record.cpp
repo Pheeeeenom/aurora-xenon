@@ -2,7 +2,6 @@
 // the Xbox 360 (vulkan4xenon's ROADMAP.md, milestone 10). A backend that records needs no compiler of its own.
 #include "glsl.hpp"
 
-#include "../gfx/hash.hpp"
 #include "../internal.hpp"
 
 #include <fmt/format.h>
@@ -36,15 +35,8 @@ void write(const std::filesystem::path& dir, const std::string& source, bool fra
 }
 } // namespace
 
-uint64_t program_hash(std::string_view source, bool fragment) noexcept {
-  return XXH3_64bits_withSeed(source.data(), source.size(), fragment ? 1 : 0);
-}
-
 void record(const gx::ShaderConfig& config, const char* dir) {
   const Programs programs = build_programs(config);
-  if (programs.vertex.empty()) {
-    return;
-  }
   std::lock_guard lock(s_lock);
   const std::filesystem::path path(dir);
   if (!s_madeDir) {
@@ -54,8 +46,13 @@ void record(const gx::ShaderConfig& config, const char* dir) {
       Log.error("couldn't make {}: {}", path.string(), error.message());
     }
     s_madeDir = true;
+    for (const auto& [source, fragment] : fixed_programs()) {
+      write(path, source, fragment);
+    }
   }
-  write(path, programs.vertex, false);
-  write(path, programs.fragment, true);
+  if (!programs.vertex.empty()) {
+    write(path, programs.vertex, false);
+    write(path, programs.fragment, true);
+  }
 }
 } // namespace aurora::gfx::vulkan4xenon::glsl
