@@ -22,6 +22,11 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#ifdef AURORA_GLSL_RECORD_DIR
+#include <set>
+#include <string_view>
+#include <tuple>
+#endif
 
 namespace aurora::gfx::backend {
 struct Pipeline {};
@@ -55,6 +60,25 @@ void take_efb_size() noexcept {
   const auto size = window::get_window_size();
   g_efbSize = {size.fb_width, size.fb_height};
 }
+
+#ifdef AURORA_GLSL_RECORD_DIR
+// Each size and format of target the game draws or copies into, once each: what the vulkan4xenon backend must draw
+// into, beside the programs recorded (vulkan4xenon's ROADMAP.md, milestone 11).
+void log_target(const TextureDesc& desc) noexcept {
+  static constexpr std::array<std::string_view, 5> Usages{"", "Copy target", "Conversion target", "Offscreen target",
+                                                          "Offscreen depth target"};
+  static std::mutex lock;
+  static std::set<std::tuple<TextureUsage, uint32_t, uint32_t, u32>> logged;
+  if (desc.usage == TextureUsage::Sampled) {
+    return;
+  }
+  std::lock_guard guard(lock);
+  if (logged.emplace(desc.usage, desc.width, desc.height, desc.gxFormat).second) {
+    Log.info("{} {}x{}, GX format {}", Usages[static_cast<size_t>(desc.usage)], desc.width, desc.height,
+             desc.gxFormat == InvalidTextureFormat ? "none" : fmt::format("{}", desc.gxFormat));
+  }
+}
+#endif
 } // namespace
 
 bool initialize(AuroraBackend& backend) noexcept {
@@ -80,7 +104,11 @@ void resize(const AuroraWindowSize& size) noexcept { (void)size; }
 void refresh_surface() noexcept {}
 
 std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept {
+#ifdef AURORA_GLSL_RECORD_DIR
+  log_target(desc);
+#else
   (void)desc;
+#endif
   return std::make_shared<Texture>();
 }
 

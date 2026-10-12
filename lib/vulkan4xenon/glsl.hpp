@@ -57,7 +57,7 @@ struct Programs {
   std::string fragment; // GLSL
 };
 
-// All empty, with the reason logged, for a config these programs don't express yet.
+// All empty for a config these programs don't express yet, with all it needs logged once, under the config's hash.
 Programs build_programs(const gx::ShaderConfig& config);
 
 // The backend's own programs. Clears: a full-screen triangle's position at location 0, and the colour in the fragment

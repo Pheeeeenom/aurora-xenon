@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <string_view>
+#include <unordered_set>
 
 namespace aurora::gfx::vulkan4xenon::glsl {
 using namespace std::string_literals;
@@ -33,58 +35,141 @@ struct Plan {
   std::vector<Interpolant> interpolants;
 };
 
+// What a config needs that these programs don't express yet, each with what a generator for it would need to know,
+// in the order make_plan finds them.
+using Needs = std::vector<std::string>;
+
 constexpr bool is_texmtx_attr(u32 attr) noexcept { return attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX; }
 
-bool refuse(std::string_view what) {
-  Log.error("no GLSL yet for {}", what);
-  return false;
-}
-
-bool make_plan(const gx::ShaderConfig& config, Plan& plan) {
-  if (config.lineMode != 0) {
-    return refuse("lines and points"sv);
-  }
-  if (config.tevStageCount == 0 || config.tevStageCount > gx::MaxTevStages) {
-    Log.error("no GLSL for a config with {} TEV stages", config.tevStageCount);
+bool uses_texture_sample(const gx::TevStage& stage) noexcept {
+  if (stage.texMapId == GX_TEXMAP_NULL) {
     return false;
   }
-  if (config.attrs[GX_VA_POS].attrType == GX_NONE) {
-    return refuse("a config without positions"sv);
+  const auto& c = stage.colorPass;
+  const auto& a = stage.alphaPass;
+  return c.a == GX_CC_TEXC || c.a == GX_CC_TEXA || c.b == GX_CC_TEXC || c.b == GX_CC_TEXA || c.c == GX_CC_TEXC ||
+         c.c == GX_CC_TEXA || c.d == GX_CC_TEXC || c.d == GX_CC_TEXA || a.a == GX_CA_TEXA || a.b == GX_CA_TEXA ||
+         a.c == GX_CA_TEXA || a.d == GX_CA_TEXA;
+}
+
+std::string join(const std::vector<std::string>& items, std::string_view separator) {
+  std::string joined;
+  for (const auto& item : items) {
+    if (!joined.empty()) {
+      joined += separator;
+    }
+    joined += item;
   }
+  return joined;
+}
+
+template <size_t N>
+std::string_view name_of(const std::array<std::string_view, N>& names, u32 value) noexcept {
+  return value < N ? names[value] : "?"sv;
+}
+
+// The fog's kind, from the type's low three bits, bit 3 making it orthographic (gx/shader.cpp), and whether it's
+// adjusted by range.
+std::string fog_need(const gx::ShaderConfig& config) {
+  static constexpr std::array Kinds{"?"sv, "?"sv, "LIN"sv, "?"sv, "EXP"sv, "EXP2"sv, "REVEXP"sv, "REVEXP2"sv};
+  return fmt::format("fog ({} {}{})", (config.fogType & 0x08) != 0 ? "orthographic"sv : "perspective"sv,
+                     name_of(Kinds, config.fogType & 0x07), config.fogRangeEnabled ? ", range"sv : ""sv);
+}
+
+// A lit channel as GXSetChanCtrl sets it.
+std::string lit_channel(std::string_view name, const gx::ColorChannelConfig& cc) {
+  static constexpr std::array DiffuseFns{"DF_NONE"sv, "DF_SIGN"sv, "DF_CLAMP"sv};
+  static constexpr std::array AttnFns{"AF_SPEC"sv, "AF_SPOT"sv, "AF_NONE"sv};
+  return fmt::format("{} lights {:#04x} {} {} ambient {}", name, cc.lightMask, name_of(DiffuseFns, cc.diffFn),
+                     name_of(AttnFns, cc.attnFn), cc.ambSrc == GX_SRC_VTX ? "VTX"sv : "REG"sv);
+}
+
+std::mutex s_refusedLock;
+std::unordered_set<uint64_t> s_refused;
+
+// A refused config's needs, once per config under its hash, as the pipeline cache asks for a config once for each
+// pipeline it's in. The hash with every channel's lights cleared groups the configs that differ only in them.
+void refuse(const gx::ShaderConfig& config, const Needs& needs) {
+  const uint64_t hash = XXH3_64bits(&config, sizeof(config));
+  {
+    std::lock_guard lock(s_refusedLock);
+    if (!s_refused.insert(hash).second) {
+      return;
+    }
+  }
+  gx::ShaderConfig unlit = config;
+  for (auto& channel : unlit.colorChannels) {
+    channel.lightMask = 0;
+    channel.unitSpotLights = 0;
+    channel.unitDistanceLights = 0;
+  }
+  Log.error("no GLSL yet for config {:016x} ({:016x} without its lights): {}", hash, XXH3_64bits(&unlit, sizeof(unlit)),
+            join(needs, "; "sv));
+}
+
+// The plan for config's programs, or false with all it needs that they don't express.
+bool make_plan(const gx::ShaderConfig& config, Plan& plan, Needs& needs) {
+  if (config.lineMode != 0) {
+    needs.push_back("lines and points"s);
+  }
+  if (config.tevStageCount == 0 || config.tevStageCount > gx::MaxTevStages) {
+    needs.push_back(fmt::format("{} TEV stages", config.tevStageCount));
+    return false; // the rest reads the stages
+  }
+  if (config.attrs[GX_VA_POS].attrType == GX_NONE) {
+    needs.push_back("no positions"s);
+  }
+  std::vector<std::string> matrixIndices;
+  std::vector<std::string> components;
   for (u32 attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; ++attr) {
     const auto& mapping = config.attrs[attr];
     if (mapping.attrType == GX_NONE) {
       continue;
     }
-    if (attr == GX_VA_PNMTXIDX || is_texmtx_attr(attr)) {
-      return refuse("matrices picked per vertex"sv);
-    }
-    const bool color = attr == GX_VA_CLR0 || attr == GX_VA_CLR1;
-    if (mapping.compType > (color ? GX_RGBA8 : GX_F32)) {
-      Log.error("no GLSL for vertex attribute {} of component type {}", attr, mapping.compType);
-      return false;
+    if (attr == GX_VA_PNMTXIDX) {
+      matrixIndices.push_back("PNMTXIDX"s);
+    } else if (is_texmtx_attr(attr)) {
+      matrixIndices.push_back(fmt::format("TEX{}MTXIDX", attr - GX_VA_TEX0MTXIDX));
+    } else if (mapping.compType > (attr == GX_VA_CLR0 || attr == GX_VA_CLR1 ? GX_RGBA8 : GX_F32)) {
+      components.push_back(fmt::format("vertex attribute {} of component type {}", attr, mapping.compType));
     }
   }
+  if (!matrixIndices.empty()) {
+    needs.push_back(fmt::format("matrices picked per vertex ({})", join(matrixIndices, " "sv)));
+  }
+  needs.insert(needs.end(), components.begin(), components.end());
   plan.info = gx::build_shader_info(config);
   const auto& info = plan.info;
   if (info.usesFog) {
-    return refuse("fog"sv);
+    needs.push_back(fog_need(config));
   }
-  if (info.usedIndStages.any()) {
-    return refuse("indirect texturing"sv);
-  }
+  std::vector<std::string> indStages;
   for (u32 i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
     if (stage.indTexMtxId != GX_ITM_OFF || stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF ||
         stage.indTexAddPrev || stage.channelId == GX_ALPHA_BUMP || stage.channelId == GX_ALPHA_BUMPN) {
-      return refuse("indirect texturing"sv);
+      indStages.push_back(fmt::format("{}", i));
     }
   }
+  if (info.usedIndStages.any() || !indStages.empty()) {
+    needs.push_back(fmt::format("indirect texturing ({} indirect stages, TEV stages {})", info.usedIndStages.count(),
+                                indStages.empty() ? "none"s : join(indStages, " "sv)));
+  }
+  std::vector<std::string> lit;
   for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
-    if (info.sampledColorChannels.test(i) &&
-        (config.colorChannels[i].lightingEnabled || config.colorChannels[i + GX_ALPHA0].lightingEnabled)) {
-      return refuse("lighting"sv);
+    if (!info.sampledColorChannels.test(i)) {
+      continue;
     }
+    if (config.colorChannels[i].lightingEnabled) {
+      lit.push_back(lit_channel(fmt::format("COLOR{}", i), config.colorChannels[i]));
+    }
+    if (config.colorChannels[i + GX_ALPHA0].lightingEnabled) {
+      lit.push_back(lit_channel(fmt::format("ALPHA{}", i), config.colorChannels[i + GX_ALPHA0]));
+    }
+  }
+  if (!lit.empty()) {
+    needs.push_back(fmt::format("lighting ({}{})", join(lit, ", "sv),
+                                config.attrs[GX_VA_NRM].attrType == GX_NONE ? ", no normals"sv : ""sv));
   }
   for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
@@ -97,10 +182,18 @@ bool make_plan(const gx::ShaderConfig& config, Plan& plan) {
     }
     const auto& tcg = config.tcgs[i];
     if (tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7) {
-      return refuse("emboss texgens"sv);
-    }
-    if (tcg.src == GX_TG_BINRM || tcg.src == GX_TG_TANGENT) {
-      return refuse("binormal and tangent texgens"sv);
+      needs.push_back(fmt::format("an emboss texgen (TEXCOORD{})", i));
+    } else {
+      // The types and sources vertex_body writes.
+      if (tcg.type != GX_TG_MTX2x4 && tcg.type != GX_TG_MTX3x4 && tcg.type != GX_TG_SRTG) {
+        needs.push_back(fmt::format("texgen type {} (TEXCOORD{})", underlying(tcg.type), i));
+      }
+      if (tcg.src == GX_TG_BINRM || tcg.src == GX_TG_TANGENT) {
+        needs.push_back(fmt::format("a binormal or tangent texgen (TEXCOORD{})", i));
+      } else if (!(tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) && tcg.src != GX_TG_POS && tcg.src != GX_TG_NRM &&
+                 tcg.src != GX_TG_COLOR0 && tcg.src != GX_TG_COLOR1) {
+        needs.push_back(fmt::format("texgen source {} (TEXCOORD{})", underlying(tcg.src), i));
+      }
     }
     if (tcg.type == GX_TG_MTX3x4) {
       plan.interpolants.push_back({fmt::format("tex{}_uvw", i), "vec3"sv});
@@ -109,10 +202,14 @@ bool make_plan(const gx::ShaderConfig& config, Plan& plan) {
     }
   }
   if (plan.interpolants.size() > MaxInterpolants) {
-    Log.error("no GLSL for a config with {} interpolants", plan.interpolants.size());
-    return false;
+    needs.push_back(fmt::format("{} interpolants", plan.interpolants.size()));
   }
-  return true;
+  for (u32 i = 0; i < config.tevStageCount; ++i) {
+    if (uses_texture_sample(config.tevStages[i]) && config.tevStages[i].texCoordId == GX_TEXCOORD_NULL) {
+      needs.push_back(fmt::format("TEV stage {} sampling a texture with no coordinates", i));
+    }
+  }
+  return needs.empty();
 }
 
 // gx.hpp's uniform pieces as std140 blocks of vec4s, in UniformPiece order: each one's type, variable and members.
@@ -196,7 +293,8 @@ std::string vtx_attr(const gx::ShaderConfig& config, GXAttr attr, std::array<boo
   return input_name(attr);
 }
 
-bool vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bool, gx::MaxVtxAttr>& inputs,
+// The texgens' types and sources are ones make_plan lets through.
+void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bool, gx::MaxVtxAttr>& inputs,
                  std::string& body) {
   const auto& info = plan.info;
   body += fmt::format(
@@ -238,8 +336,7 @@ bool vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
       source = info.sampledColorChannels.test(ch) ? fmt::format("cc{}", ch)
                                                   : vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + ch), inputs);
     } else {
-      Log.error("no GLSL for texgen source {}", underlying(tcg.src));
-      return false;
+      UNLIKELY FATAL("unplanned texgen source {}", underlying(tcg.src));
     }
     body += fmt::format("\n    vec4 tc{} = {};", i, source);
     const auto tc = fmt::format("tc{}", i);
@@ -259,8 +356,7 @@ bool vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
     } else if (tcg.type == GX_TG_SRTG) {
       value = fmt::format("vec3({}.xy, 1.0)", tc);
     } else {
-      Log.error("no GLSL for texgen type {}", underlying(tcg.type));
-      return false;
+      UNLIKELY FATAL("unplanned texgen type {}", underlying(tcg.type));
     }
     body += fmt::format("\n    vec3 tc{}_tmp = {};", i, value);
     std::string tmp = fmt::format("tc{}_tmp", i);
@@ -280,7 +376,6 @@ bool vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
       body += fmt::format("\n    out_tex{}_uv = {}.xy;", i, projected);
     }
   }
-  return true;
 }
 
 // Attribute locations as xost gives them usages: position 0, colour 0 1, texture coordinates from 2 (resolve.py), and
@@ -351,17 +446,6 @@ std::string_view chan_comp(GXTevColorChan chan) noexcept {
   default:
     return "?";
   }
-}
-
-bool uses_texture_sample(const gx::TevStage& stage) noexcept {
-  if (stage.texMapId == GX_TEXMAP_NULL) {
-    return false;
-  }
-  const auto& c = stage.colorPass;
-  const auto& a = stage.alphaPass;
-  return c.a == GX_CC_TEXC || c.a == GX_CC_TEXA || c.b == GX_CC_TEXC || c.b == GX_CC_TEXA || c.c == GX_CC_TEXC ||
-         c.c == GX_CC_TEXA || c.d == GX_CC_TEXC || c.d == GX_CC_TEXA || a.a == GX_CA_TEXA || a.b == GX_CA_TEXA ||
-         a.c == GX_CA_TEXA || a.d == GX_CA_TEXA;
 }
 
 // A TEV register as the program holds it at some stage: the locals with its colour and its alpha, and whether each is
@@ -743,7 +827,7 @@ private:
   }
 
   // GX keeps a fragment when round(alpha * 255) passes; one test of the combined pass factor discards the rest. An
-  // alpha its stage didn't clamp is clamped first.
+  // alpha its stage didn't clamp is clamped first. False for a compare that discards every fragment.
   bool alpha_compare(const std::string& alpha, bool normalized) {
     const auto& ac = m_config.alphaCompare;
     const Pass pass = combine(ac.op, compare(ac.comp0, ac.ref0), compare(ac.comp1, ac.ref1));
@@ -751,8 +835,7 @@ private:
       return true;
     }
     if (pass.constant == 0) {
-      // Nothing is drawn; xost compiles no program that only discards, and the backend skips such a draw.
-      return refuse("an alpha compare that discards every fragment"sv);
+      return false;
     }
     m_body += fmt::format(
         "\n    // Alpha compare"
@@ -768,6 +851,7 @@ private:
   std::string m_body;
 };
 
+// False when the alpha compare discards every fragment.
 bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::string& source) {
   const auto& info = plan.info;
   std::string pre;
@@ -785,10 +869,6 @@ bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::stri
     const auto& stage = config.tevStages[i];
     if (!uses_texture_sample(stage)) {
       continue;
-    }
-    if (stage.texCoordId == GX_TEXCOORD_NULL) {
-      Log.error("no GLSL for TEV stage {}, which samples a texture with no coordinates", i);
-      return false;
     }
     // xost takes only a bias known when it compiles, so the material's LOD bias goes in the sampler.
     pre += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, tex{2}_uv);", i, underlying(stage.texMapId),
@@ -819,11 +899,18 @@ bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::stri
 
 Programs build_programs(const gx::ShaderConfig& config) {
   Plan plan;
+  Needs needs;
+  if (!make_plan(config, plan, needs)) {
+    refuse(config, needs);
+    return {};
+  }
   Programs programs;
   std::array<bool, gx::MaxVtxAttr> inputs{};
   std::string body;
-  if (!make_plan(config, plan) || !vertex_body(config, plan, inputs, body) ||
-      !fragment_source(config, plan, programs.fragment)) {
+  vertex_body(config, plan, inputs, body);
+  if (!fragment_source(config, plan, programs.fragment)) {
+    // Nothing is drawn; xost compiles no program that only discards, and the backend skips such a draw.
+    refuse(config, {"an alpha compare that discards every fragment"s});
     return {};
   }
   programs.layout = make_layout(inputs);
