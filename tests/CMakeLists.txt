@@ -216,6 +216,30 @@ if (TARGET aurora::dvd)
   gtest_discover_tests(dvd_tests)
 endif ()
 
+# The vulkan4xenon backend's GLSL generator, which needs no GPU
+add_executable(vulkan4xenon_glsl_tests
+  vulkan4xenon_glsl_test.cpp
+  ../lib/vulkan4xenon/glsl.cpp
+  ../lib/vulkan4xenon/record.cpp
+  ../lib/gx/attr_fmt.cpp
+  ../lib/gx/shader_info.cpp
+  ../lib/logging.cpp
+)
+target_include_directories(vulkan4xenon_glsl_tests PRIVATE
+  ../include
+  ../lib
+)
+target_compile_definitions(vulkan4xenon_glsl_tests PRIVATE AURORA TARGET_PC)
+target_link_libraries(vulkan4xenon_glsl_tests PRIVATE
+  gtest
+  gtest_main
+  fmt::fmt
+  xxHash::xxhash
+  absl::flat_hash_map
+  Tracy::TracyClient
+)
+gtest_discover_tests(vulkan4xenon_glsl_tests)
+
 add_executable(os_alloc_tests
   os_alloc_test.cpp
   os_test_globals.cpp

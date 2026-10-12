@@ -505,11 +505,19 @@ public:
     for (u32 idx = 0; idx < m_config.tevStageCount; ++idx) {
       const auto& stage = m_config.tevStages[idx];
       const auto& c = stage.colorPass;
-      const std::string color = color_op(idx, stage, color_arg(idx, stage, c.a, 'a'), color_arg(idx, stage, c.b, 'b'),
-                                         color_arg(idx, stage, c.c, 'c'), color_value(idx, stage, c.d));
       const auto& a = stage.alphaPass;
-      const std::string alpha = alpha_op(idx, stage, alpha_arg(idx, stage, a.a, 'a'), alpha_arg(idx, stage, a.b, 'b'),
-                                         alpha_arg(idx, stage, a.c, 'c'), alpha_value(idx, stage, a.d));
+      // The operands in order, as each may add a local of its own.
+      const std::string colorA = color_arg(idx, stage, c.a, 'a');
+      const std::string colorB = color_arg(idx, stage, c.b, 'b');
+      const std::string color =
+          color_op(idx, stage, colorA, colorB, color_arg(idx, stage, c.c, 'c'), color_value(idx, stage, c.d));
+      // A packed compare in the alpha op, R8, GR16 or BGR24, compares the colour operands a and b as the stage reads
+      // them, before it writes its colour (gx/shader.cpp).
+      const bool packed = stage.alphaOp.op >= GX_TEV_COMP_R8_GT && stage.alphaOp.op <= GX_TEV_COMP_BGR24_EQ;
+      const std::string alphaA = packed ? colorA : alpha_arg(idx, stage, a.a, 'a');
+      const std::string alphaB = packed ? colorB : alpha_arg(idx, stage, a.b, 'b');
+      const std::string alpha =
+          alpha_op(idx, stage, alphaA, alphaB, alpha_arg(idx, stage, a.c, 'c'), alpha_value(idx, stage, a.d));
       m_body += fmt::format("\n    // TEV stage {0}\n    vec3 s{0}_color = {1};\n    float s{0}_alpha = {2};", idx,
                             color, alpha);
       Reg& colorReg = m_regs[stage.colorOp.outReg];
@@ -695,23 +703,21 @@ private:
     }
   }
 
-  // The 8-, 16- and 24-bit keys GX compares, rounded as the WGSL rounds them. color selects the per-channel RGB8 key.
-  static std::string compare_key(GXTevOp op, std::string_view v, bool scalar) {
+  // The 8-, 16- and 24-bit keys GX compares, rounded as the WGSL rounds them: from a colour operand's red, green and
+  // red, or blue, green and red, or for RGB8 each channel of a colour operand or an alpha operand alone.
+  static std::string compare_key(GXTevOp op, std::string_view v) {
     switch (op) {
     case GX_TEV_COMP_R8_GT:
     case GX_TEV_COMP_R8_EQ:
-      return scalar ? fmt::format("floor({} * 255.0 + 0.5)", v) : fmt::format("floor({}.r * 255.0 + 0.5)", v);
+      return fmt::format("floor({}.r * 255.0 + 0.5)", v);
     case GX_TEV_COMP_GR16_GT:
     case GX_TEV_COMP_GR16_EQ:
-      // A scalar's .rg reads as the scalar twice: 255 * (1 + 256).
-      return scalar ? fmt::format("floor({} * 65535.0 + 0.5)", v)
-                    : fmt::format("floor(dot({}.rg * 255.0, vec2(1.0, 256.0)) + 0.5)", v);
+      return fmt::format("floor(dot({}.rg * 255.0, vec2(1.0, 256.0)) + 0.5)", v);
     case GX_TEV_COMP_BGR24_GT:
     case GX_TEV_COMP_BGR24_EQ:
-      return scalar ? fmt::format("floor({} * 16777215.0 + 0.5)", v)
-                    : fmt::format("floor(dot({}.rgb * 255.0, vec3(1.0, 256.0, 65536.0)) + 0.5)", v);
+      return fmt::format("floor(dot({}.rgb * 255.0, vec3(1.0, 256.0, 65536.0)) + 0.5)", v);
     default:
-      return scalar ? fmt::format("floor({} * 255.0 + 0.5)", v) : fmt::format("floor({} * 255.0 + 0.5)", v);
+      return fmt::format("floor({} * 255.0 + 0.5)", v);
     }
   }
 
@@ -720,9 +726,9 @@ private:
            op == GX_TEV_COMP_RGB8_GT;
   }
 
-  // The op before its clamp. A compare picks c or 0 by a factor of 1 or 0 (step), which xost compiles where it
-  // doesn't compile the WGSL's select (xost: a branch writes one variable once). The keys are whole numbers, so 0.5
-  // separates them.
+  // The op before its clamp, scalar for an alpha op. A compare picks c or 0 by a factor of 1 or 0 (step), which xost
+  // compiles where it doesn't compile the WGSL's select (xost: a branch writes one variable once). The keys are whole
+  // numbers, so 0.5 separates them.
   static std::string op_expr(const gx::TevOp& tevOp, std::string_view a, std::string_view b, std::string_view c,
                              std::string_view d, bool scalar) {
     switch (tevOp.op) {
@@ -735,8 +741,8 @@ private:
       const bool vector = !scalar && (tevOp.op == GX_TEV_COMP_RGB8_GT || tevOp.op == GX_TEV_COMP_RGB8_EQ);
       const auto half = vector ? "vec3(0.5)"sv : "0.5"sv;
       const auto one = vector ? "vec3(1.0)"sv : "1.0"sv;
-      const auto ka = compare_key(tevOp.op, a, scalar);
-      const auto kb = compare_key(tevOp.op, b, scalar);
+      const auto ka = compare_key(tevOp.op, a);
+      const auto kb = compare_key(tevOp.op, b);
       const auto factor = is_greater(tevOp.op) ? fmt::format("step({}, {} - {})", half, ka, kb)
                                                : fmt::format("({} - step({}, abs({} - {})))", one, half, ka, kb);
       return fmt::format("({} * {} + {})", c, factor, d);
