@@ -3,6 +3,7 @@
 #include "decode.hpp"
 
 #include "../internal.hpp"
+#include "../thread.hpp"
 
 #include <algorithm>
 #include <array>
@@ -700,6 +701,7 @@ public:
 
 private:
   void run() noexcept {
+    aurora::thread::set_current({.name = "Aurora decode helper"});
     while (true) {
       m_start.wait();
       if (m_work.take == nullptr) {

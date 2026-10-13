@@ -25,6 +25,15 @@
 #include <pthread.h>
 #endif
 
+#ifdef __XSDK__
+#include "logging.hpp"
+
+#include <aurora/aurora.h>
+#include <xsdk/thread.h>
+
+#include <string_view>
+#endif
+
 namespace aurora::thread {
 namespace {
 struct Processor {
@@ -279,6 +288,47 @@ void set_thread_name(const std::string& name) noexcept {
   pthread_setname_np(pthread_self(), truncated.c_str());
 #endif
 }
+
+#ifdef __XSDK__
+constexpr Module Log{"aurora::thread"};
+
+// The hardware thread each named thread runs on, as "name=thread,...". A thread not named here stays where the kernel
+// starts it, on its creator's (xsdk:SCOPE.md, milestone 26).
+std::string sHardwareThreads =
+    "Main thread=0,Aurora GPU waiter=1,Aurora render worker=2,Aurora tex preconv=3,Pipeline compilation thread=3,"
+    "Pipeline cache writer thread=3,Aurora FIFO processor=4,Aurora decode helper=5";
+
+std::optional<uint32_t> hardware_thread_for(std::string_view name) noexcept {
+  std::string_view list = sHardwareThreads;
+  while (!list.empty()) {
+    const size_t comma = list.find(',');
+    const std::string_view entry = list.substr(0, comma);
+    list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+    const size_t equals = entry.rfind('=');
+    if (equals == std::string_view::npos || entry.substr(0, equals) != name) {
+      continue;
+    }
+    const std::string_view value = entry.substr(equals + 1);
+    uint32_t thread = 0;
+    if (std::from_chars(value.data(), value.data() + value.size(), thread).ec == std::errc{}) {
+      return thread;
+    }
+  }
+  return std::nullopt;
+}
+
+void place(const std::string& name) noexcept {
+  const auto thread = hardware_thread_for(name);
+  if (!thread) {
+    return;
+  }
+  if (const NTSTATUS status = xsdk_thread_move(*thread); !NT_SUCCESS(status)) {
+    Log.warn("{} not moved to hardware thread {}: {:#010x}", name, *thread, static_cast<uint32_t>(status));
+    return;
+  }
+  Log.info("{} on hardware thread {}", name, xsdk_thread_hardware_thread());
+}
+#endif
 } // namespace
 
 void set_current(const Options& options) noexcept {
@@ -286,6 +336,9 @@ void set_current(const Options& options) noexcept {
     set_thread_name(options.name);
 #ifdef TRACY_ENABLE
     tracy::SetThreadName(options.name.c_str());
+#endif
+#ifdef __XSDK__
+    place(options.name);
 #endif
   }
 
@@ -296,3 +349,11 @@ void set_current(const Options& options) noexcept {
 }
 
 } // namespace aurora::thread
+
+#ifdef __XSDK__
+void aurora_set_hardware_threads(const char* list) {
+  if (list != nullptr) {
+    aurora::thread::sHardwareThreads = list;
+  }
+}
+#endif

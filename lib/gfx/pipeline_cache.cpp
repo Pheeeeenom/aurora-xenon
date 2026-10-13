@@ -13,6 +13,7 @@
 #include "../webgpu/backend.hpp"
 #endif
 #include "../sqlite_utils.hpp"
+#include "../thread.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -918,9 +919,7 @@ static bool write_pipeline_cache_record(const PipelineCacheWrite& write) {
 }
 
 static void pipeline_cache_writer() {
-#ifdef TRACY_ENABLE
-  tracy::SetThreadName("Pipeline cache writer thread");
-#endif
+  aurora::thread::set_current({.name = "Pipeline cache writer thread"});
 
   while (true) {
     std::deque<PipelineCacheWrite> batch;
@@ -962,9 +961,7 @@ static void pipeline_cache_writer() {
 }
 
 static void pipeline_worker() {
-#ifdef TRACY_ENABLE
-  tracy::SetThreadName("Pipeline compilation thread");
-#endif
+  aurora::thread::set_current({.name = "Pipeline compilation thread"});
 
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;

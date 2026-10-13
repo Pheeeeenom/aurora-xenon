@@ -153,6 +153,11 @@ void aurora_set_background_input(bool value);
 void aurora_set_resampler(AuroraSampler sampler);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
+#ifdef __XSDK__
+/* The Xbox 360 hardware thread each of Aurora's named threads runs on, as "name=thread,...", in place of
+ * lib/thread.cpp's list; a thread not named stays on its creator's. Call it before aurora_initialize. */
+void aurora_set_hardware_threads(const char* list);
+#endif
 
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
