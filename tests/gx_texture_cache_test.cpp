@@ -21,6 +21,9 @@ uint64_t copy_allocations();
 gfx::TextureHandle make_texture_handle(uint32_t width, uint32_t height, u32 format = GX_TF_RGBA8_PC);
 void set_replacement(gfx::TextureHandle handle, uint64_t id = 1);
 void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureHandle handle);
+// While held, a conversion waits until released; wait_for_held_conversion is true once one is waiting.
+void hold_conversions(bool hold);
+bool wait_for_held_conversion();
 } // namespace aurora::gx::testing
 
 namespace aurora::gx {
@@ -59,7 +62,11 @@ protected:
     texture::end_frame();
   }
 
-  void TearDown() override { texture::shutdown(); }
+  void TearDown() override {
+    // A held conversion would keep the worker from stopping.
+    testing::hold_conversions(false);
+    texture::shutdown();
+  }
 };
 
 TEST_F(GxTextureCacheTest, CalculatesTiledAndLinearMipSourceSizes) {
@@ -672,6 +679,23 @@ TEST_F(GxTextureCacheTest, UploadedContentIsNotConvertedAgain) {
   ASSERT_TRUE(wait_for_preconversion());
 
   EXPECT_EQ(testing::texture_conversions(), conversions);
+}
+
+// A video frame's planes: the draw comes before the worker has converted them, so it converts inline, and the worker's
+// late result must not be kept, as no draw would take it.
+TEST_F(GxTextureCacheTest, ContentUploadedWhileConvertingIsNotParked) {
+  std::array<uint8_t, 64> pixels{};
+  const auto obj = make_texture(pixels.data(), 1, GX_TF_RGBA8, 4, 4);
+  testing::hold_conversions(true);
+  texture::preconvert_texture(obj);
+  ASSERT_TRUE(testing::wait_for_held_conversion());
+
+  texture::resolve_static_texture(obj);
+  testing::hold_conversions(false);
+  ASSERT_TRUE(wait_for_preconversion());
+
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  EXPECT_EQ(texture::preconversion_parked_bytes_for_testing(), 0);
 }
 
 TEST_F(GxTextureCacheTest, SameObjectIsQueuedOnce) {

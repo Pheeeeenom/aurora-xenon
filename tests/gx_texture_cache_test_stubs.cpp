@@ -8,9 +8,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace {
@@ -24,6 +27,11 @@ std::optional<aurora::texture::TextureSourceKey> s_sourceKey;
 aurora::gfx::TextureHandle s_sourceReplacement;
 uint64_t s_replacementId = 0;
 uint64_t s_sourceReplacementId = 0;
+// While held, convert_texture waits, so a test can act while the pre-conversion worker is converting.
+std::mutex s_holdMutex;
+std::condition_variable s_holdCv;
+bool s_hold = false;
+bool s_holding = false;
 } // namespace
 
 namespace aurora {
@@ -48,6 +56,19 @@ gfx::TextureHandle make_texture_handle(uint32_t width, uint32_t height, u32 form
                                            1, format);
 }
 
+void hold_conversions(bool hold) {
+  {
+    std::lock_guard lock{s_holdMutex};
+    s_hold = hold;
+  }
+  s_holdCv.notify_all();
+}
+
+bool wait_for_held_conversion() {
+  std::unique_lock lock{s_holdMutex};
+  return s_holdCv.wait_for(lock, std::chrono::seconds{5}, [] { return s_holding; });
+}
+
 void reset_texture_stubs() {
   s_textureAllocations = 0;
   s_paletteConversions = 0;
@@ -59,6 +80,7 @@ void reset_texture_stubs() {
   s_sourceReplacement.reset();
   s_replacementId = 0;
   s_sourceReplacementId = 0;
+  hold_conversions(false);
 }
 
 uint64_t texture_allocations() { return s_textureAllocations; }
@@ -105,6 +127,13 @@ TextureHandle new_static_texture_2d_converted(uint32_t width, uint32_t height, u
 }
 
 ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
+  {
+    std::unique_lock lock{s_holdMutex};
+    s_holding = s_hold;
+    s_holdCv.notify_all();
+    s_holdCv.wait(lock, [] { return !s_hold; });
+    s_holding = false;
+  }
   ++s_textureConversions;
   size_t pixels = 0;
   for (uint32_t mip = 0; mip < mips; ++mip) {

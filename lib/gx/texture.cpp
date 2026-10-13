@@ -281,8 +281,8 @@ void cache_content_texture(TextureContentKey key, const gfx::TextureHandle& hand
 namespace pre {
 constexpr uint64_t ReadyBudgetBytes = AURORA_TEXTURE_PRECONVERT_READY_BYTES; // converted results waiting to be drawn
 constexpr uint64_t QueueBudgetBytes = AURORA_TEXTURE_PRECONVERT_QUEUE_BYTES; // source copies queued or being converted
-constexpr auto ReadyLifetime = std::chrono::seconds{120};         // results not drawn by then are dropped
-constexpr size_t KeySetLimit = 16384;                             // bounds seenContent and queuedObjects
+constexpr auto ReadyLifetime = std::chrono::seconds{120};                    // results not drawn by then are dropped
+constexpr size_t KeySetLimit = 16384;                                        // bounds each set of keys
 constexpr uint64_t MaintenanceFrames = 300;
 
 using Clock = std::chrono::steady_clock;
@@ -325,6 +325,10 @@ struct State {
   // Dedupe only: clearing either set at KeySetLimit costs repeat work, never a wrong texture.
   absl::flat_hash_set<TextureContentKey> seenContent;
   absl::flat_hash_set<uint64_t> queuedObjects;
+  // Content the FIFO thread converted inline and uploaded, so a job converting it at the time parks nothing: no draw
+  // would take the result, which would stay until it expired. seenContent can't say so, since the worker adds to it
+  // itself. Clearing it at KeySetLimit lets such a result be parked until it expires, never a wrong texture.
+  absl::flat_hash_set<TextureContentKey> uploadedContent;
 };
 
 // Leaked: destroying a running std::jthread at static destruction terminates the process.
@@ -421,7 +425,8 @@ void worker(std::stop_token) {
 
     std::lock_guard lock{st.mutex};
     st.queueBytes -= job.source.size();
-    if (converted.data.empty() || converted.data.size() > ReadyBudgetBytes || st.parked.contains(key)) {
+    if (converted.data.empty() || converted.data.size() > ReadyBudgetBytes || st.parked.contains(key) ||
+        st.uploadedContent.contains(key)) {
       continue;
     }
     st.parkedLru.push_front(key);
@@ -453,11 +458,13 @@ std::optional<Taken> take(const TextureContentKey& key) noexcept {
   return taken;
 }
 
-// FIFO thread: this content was converted inline and uploaded, so a later job for it has nothing to do.
+// FIFO thread: this content was converted inline and uploaded, so a later job for it has nothing to do, and one
+// converting it now has nothing to park.
 void mark_uploaded(const TextureContentKey& key) noexcept {
   auto& st = state();
   std::lock_guard lock{st.mutex};
   insert_bounded(st.seenContent, key);
+  insert_bounded(st.uploadedContent, key);
 }
 
 // Main thread, from GXInitTexObjLOD.
@@ -527,6 +534,7 @@ void shutdown() noexcept {
   st.parkedBytes = 0;
   st.seenContent.clear();
   st.queuedObjects.clear();
+  st.uploadedContent.clear();
   st.stop = false;
 }
 } // namespace pre
@@ -1051,6 +1059,12 @@ bool preconversion_idle_for_testing() noexcept {
   auto& st = pre::state();
   std::lock_guard lock{st.mutex};
   return st.queueBytes == 0;
+}
+
+uint64_t preconversion_parked_bytes_for_testing() noexcept {
+  auto& st = pre::state();
+  std::lock_guard lock{st.mutex};
+  return st.parkedBytes;
 }
 
 void shutdown() noexcept {

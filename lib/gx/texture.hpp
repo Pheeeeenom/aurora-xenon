@@ -55,6 +55,8 @@ void end_frame() noexcept;
 void preconvert_texture(const GXTexObj_& obj) noexcept;
 // True once every queued pre-conversion has finished. Tests only.
 bool preconversion_idle_for_testing() noexcept;
+// The converted results waiting for a draw. Tests only.
+uint64_t preconversion_parked_bytes_for_testing() noexcept;
 void shutdown() noexcept;
 
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept;
