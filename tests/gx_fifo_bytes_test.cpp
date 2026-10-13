@@ -268,15 +268,16 @@ struct Golden {
 };
 } // namespace
 
-// Before commands were written with one room check each (e3908bb): the stream and a recorded list.
+// Before commands were written with one room check each (e3908bb): the stream and a recorded list. Recorded with
+// encounter's afa388d applied there, which masks a value to its register field (SET_REG_FIELD).
 constexpr Golden kStream[] = {
-    {1, 33339, 0x1B23FA80761264ADull},
-    {0x9E3779B9, 32817, 0x9FC6EDD1533D8A49ull},
-    {0x2545F491, 33681, 0xF5354A51BEF679EEull},
+    {1, 33339, 0x5F1973F3944030FAull},
+    {0x9E3779B9, 32817, 0xE3737D4B1464A3B6ull},
+    {0x2545F491, 33681, 0x1C94F82CB30314E1ull},
 };
 constexpr Golden kList[] = {
-    {1, 17248, 0x83CF5EA687215146ull},
-    {0x9E3779B9, 17152, 0xE2C0A5CDA2029A79ull},
+    {1, 17248, 0x9A1BD2EE88F497D1ull},
+    {0x9E3779B9, 17152, 0x076D6CE0100876A2ull},
 };
 
 TEST_F(GXFifoTest, GXCallsWriteTheStreamsBytesOfBefore) {
