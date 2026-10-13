@@ -21,7 +21,6 @@
 #include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 #include "../gfx/render_worker.hpp"
-#include "../gfx/resource_cache.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu_prof.hpp"
@@ -35,13 +34,6 @@
 #define AURORA_LINUX_EGL_PROC
 #endif
 #endif
-
-namespace aurora::gx {
-void clear_copy_texture_cache() noexcept;
-} // namespace aurora::gx
-namespace aurora::gfx {
-void clear_offscreen_cache();
-} // namespace aurora::gfx
 
 namespace aurora::webgpu {
 static Module Log("aurora::gpu");
@@ -1156,11 +1148,6 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
                            g_frameBuffer.size.width != width || g_frameBuffer.size.height != height;
   if (!force && !sizeChanged) {
     return;
-  }
-  if (sizeChanged) {
-    gx::clear_copy_texture_cache();
-    gfx::clear_caches();
-    gfx::detail::clear_bind_group_cache();
   }
   g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
   g_graphicsConfig.surfaceConfiguration.height = nativeHeight;

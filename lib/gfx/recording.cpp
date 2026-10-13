@@ -2,6 +2,7 @@
 
 #include "backend.hpp"
 #include "frame.hpp"
+#include "lru_cache.hpp"
 
 #include "clear.hpp"
 #include "pipeline_cache.hpp"
@@ -29,7 +30,6 @@
 #include <utility>
 #include <vector>
 
-#include <absl/container/flat_hash_map.h>
 #include <magic_enum.hpp>
 #include <tracy/Tracy.hpp>
 
@@ -118,18 +118,25 @@ void set_single_color_target(RenderPass& pass, TextureFormat format, const Textu
 struct OffscreenCacheKey {
   uint32_t width;
   uint32_t height;
+  TextureFormat colorFormat;
+  TextureFormat depthFormat;
 
-  bool operator==(const OffscreenCacheKey& rhs) const { return width == rhs.width && height == rhs.height; }
+  bool operator==(const OffscreenCacheKey&) const = default;
   template <typename H>
   friend H AbslHashValue(H h, const OffscreenCacheKey& key) {
-    return H::combine(std::move(h), key.width, key.height);
+    return H::combine(std::move(h), key.width, key.height, key.colorFormat, key.depthFormat);
   }
 };
 struct OffscreenCacheEntry {
   TextureHandle color;
   TextureHandle depth;
+
+  uint64_t size_bytes() const {
+    return calc_texture_size(color->format, color->size.width, color->size.height, 1) +
+           calc_texture_size(depth->format, depth->size.width, depth->size.height, 1);
+  }
 };
-absl::flat_hash_map<OffscreenCacheKey, OffscreenCacheEntry> g_offscreenCache;
+LruCache<OffscreenCacheKey, OffscreenCacheEntry> g_offscreenCache{RenderTextureCacheLimits};
 
 RenderPassList& current_render_passes() { return g_recorder.passes(); }
 
@@ -251,19 +258,21 @@ void push_draw_command(DrawCommand data) {
 }
 
 OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
-  OffscreenCacheKey key{width, height};
-  if (const auto it = g_offscreenCache.find(key); it != g_offscreenCache.end()) {
-    return it->second;
-  }
   const auto layout = backend::efb_layout();
+  const auto colorFormat = layout.colorAttachments[SceneColorAttachmentIndex].format;
+  const auto depthFormat = layout.depthStencilFormat;
+  const OffscreenCacheKey key{width, height, colorFormat, depthFormat};
+  if (const auto* entry = g_offscreenCache.find(key)) {
+    return *entry;
+  }
   OffscreenCacheEntry entry{
-      .color = new_texture(width, height, 1, layout.colorAttachments[SceneColorAttachmentIndex].format,
-                           InvalidTextureFormat, backend::TextureUsage::Render, "Offscreen Color"),
-      .depth = new_texture(width, height, 1, layout.depthStencilFormat, InvalidTextureFormat,
-                           backend::TextureUsage::Depth, "Offscreen Depth"),
+      .color = new_texture(width, height, 1, colorFormat, InvalidTextureFormat, backend::TextureUsage::Render,
+                           "Offscreen Color"),
+      .depth = new_texture(width, height, 1, depthFormat, InvalidTextureFormat, backend::TextureUsage::Depth,
+                           "Offscreen Depth"),
   };
-  auto [insertIt, _] = g_offscreenCache.emplace(key, std::move(entry));
-  return insertIt->second;
+  g_offscreenCache.insert(key, entry, entry.size_bytes());
+  return entry;
 }
 
 void enqueue_pass(FramePacket& frame, uint32_t passIndex);
@@ -448,6 +457,9 @@ RecordedFrame end_recording() {
   const RecordedFrame recorded{.packet = g_recorder.packet, .frameSlot = g_recorder.frameSlot};
   g_recorder.packet = nullptr;
   g_recorder.frameSlot = 0;
+  g_offscreenCache.end_frame();
+  TracyPlot("aurora: offscreenCacheBytes", static_cast<int64_t>(g_offscreenCache.cached_bytes()));
+  TracyPlot("aurora: offscreenCacheEntries", static_cast<int64_t>(g_offscreenCache.cached_count()));
   return recorded;
 }
 
@@ -469,12 +481,19 @@ void suppress_render_worker(bool suppress) noexcept { g_recorder.suppressRenderW
 
 void seed_offscreen_cache(uint32_t width, uint32_t height, TextureFormat colorFormat, TextureFormat depthFormat) {
   const TextureExtent size{width, height};
-  g_offscreenCache.insert_or_assign(
-      OffscreenCacheKey{width, height},
-      OffscreenCacheEntry{
-          .color = std::make_shared<TextureRef>(nullptr, size, colorFormat, 1, InvalidTextureFormat),
-          .depth = std::make_shared<TextureRef>(nullptr, size, depthFormat, 1, InvalidTextureFormat),
-      });
+  const OffscreenCacheEntry entry{
+      .color = std::make_shared<TextureRef>(nullptr, size, colorFormat, 1, InvalidTextureFormat),
+      .depth = std::make_shared<TextureRef>(nullptr, size, depthFormat, 1, InvalidTextureFormat),
+  };
+  g_offscreenCache.insert({width, height, colorFormat, depthFormat}, entry, entry.size_bytes());
+}
+
+OffscreenCacheStats offscreen_cache_stats() noexcept {
+  return {.bytes = g_offscreenCache.cached_bytes(), .entries = g_offscreenCache.cached_count()};
+}
+
+bool is_offscreen_cached(uint32_t width, uint32_t height, TextureFormat colorFormat, TextureFormat depthFormat) {
+  return g_offscreenCache.contains({width, height, colorFormat, depthFormat});
 }
 
 } // namespace testing
@@ -774,9 +793,6 @@ RenderTargetLayout get_render_target_layout() noexcept {
   CHECK(g_recorder.currentRenderPass != UINT32_MAX, "get_render_target_layout called outside of a frame");
   return current_render_passes()[g_recorder.currentRenderPass].target_layout();
 }
-
-// The offscreen targets only; Dawn's resize empties its own bind groups.
-void clear_caches() noexcept { g_offscreenCache.clear(); }
 
 void begin_offscreen(uint32_t width, uint32_t height) {
   ZoneScoped;

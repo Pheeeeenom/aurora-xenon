@@ -41,8 +41,14 @@ void begin_backend_pass(RenderPass pass);
 void push_texture_copy(std::shared_ptr<const backend::TextureCopy> copy);
 
 namespace testing {
+struct OffscreenCacheStats {
+  uint64_t bytes;
+  size_t entries;
+};
 void suppress_render_worker(bool suppress) noexcept;
 void seed_offscreen_cache(uint32_t width, uint32_t height, TextureFormat colorFormat, TextureFormat depthFormat);
+OffscreenCacheStats offscreen_cache_stats() noexcept;
+bool is_offscreen_cached(uint32_t width, uint32_t height, TextureFormat colorFormat, TextureFormat depthFormat);
 }
 
 } // namespace aurora::gfx::detail
@@ -56,7 +62,6 @@ bool has_normal_attachment() noexcept;
 RenderTargetLayout get_render_target_layout() noexcept;
 // get_render_target_layout().key, without building the layout: worked out once for each pass.
 uint64_t get_render_target_layout_key() noexcept;
-void clear_caches() noexcept;
 
 namespace tex_palette_conv {
 struct ConvRequest;

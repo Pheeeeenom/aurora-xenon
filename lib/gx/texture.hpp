@@ -16,6 +16,12 @@ struct TextureStats {
   uint64_t evictions = 0;
   uint64_t contentCacheBytes = 0;
   uint64_t contentCacheEntries = 0;
+  uint64_t copyCacheBytes = 0;
+  uint64_t copyCacheEntries = 0;
+  uint64_t copyCacheHits = 0;
+  uint64_t copyCacheMisses = 0;
+  uint64_t copyCacheEvictions = 0;
+  uint64_t currentCopyBytes = 0;
   uint64_t pendingLoads = 0;
   uint64_t publishes = 0;
   uint64_t publishBytes = 0;
@@ -50,10 +56,13 @@ void preconvert_texture(const GXTexObj_& obj) noexcept;
 // True once every queued pre-conversion has finished. Tests only.
 bool preconversion_idle_for_testing() noexcept;
 void shutdown() noexcept;
-void set_content_cache_budget_for_testing(uint64_t bytes) noexcept;
+
+GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept;
 
 // Internal resolvers exposed for cache tests.
 gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj);
 gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GXTlutObj_& tlut);
+void set_content_cache_budget_for_testing(uint64_t bytes) noexcept;
+void set_copy_cache_budget_for_testing(uint64_t bytes) noexcept;
 } // namespace texture
 } // namespace aurora::gx

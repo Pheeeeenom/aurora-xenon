@@ -896,6 +896,8 @@ TextureFormatInfo format_info(TextureFormat format) noexcept {
     return {1, 1, 2, false};
   case TextureFormat::RGBA8Unorm:
   case TextureFormat::BGRA8Unorm:
+  case TextureFormat::RGB10A2Unorm:
+  case TextureFormat::Depth32Float:
     return {1, 1, 4, false};
   case TextureFormat::BC1RGBAUnorm:
     return {4, 4, 8, true};

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "gfx/frame_packet.hpp"
+#include "gfx/lru_cache.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/texture.hpp"
 #include "webgpu/gpu.hpp"
@@ -15,7 +16,8 @@ namespace aurora::gfx {
 namespace {
 
 constexpr auto ColorFormat = wgpu::TextureFormat::RGBA8Unorm;
-constexpr auto DepthFormat = wgpu::TextureFormat::Depth24Plus;
+// The fork's EFB depth (lib/webgpu/gpu.cpp), which the offscreen targets take, and so the seeded ones too.
+constexpr auto DepthFormat = wgpu::TextureFormat::Depth32Float;
 
 class GfxRecordingTest : public ::testing::Test {
 protected:
@@ -44,6 +46,17 @@ protected:
 
   void seed(uint32_t width, uint32_t height) {
     detail::testing::seed_offscreen_cache(width, height, TextureFormat::RGBA8Unorm, TextureFormat::Depth32Float);
+  }
+
+  bool cached(uint32_t width, uint32_t height) {
+    return detail::testing::is_offscreen_cached(width, height, TextureFormat::RGBA8Unorm, TextureFormat::Depth32Float);
+  }
+
+  void next_frame() {
+    finish();
+    detail::end_recording();
+    frame = {};
+    detail::begin_recording(frame, 0);
   }
 
   void copy_current_offscreen() {
@@ -88,15 +101,18 @@ TEST_F(GfxRecordingTest, EfbPassUsesDiscoveredSceneLayout) {
   EXPECT_EQ(targetLayout.colorAttachments[SceneColorAttachmentIndex].semantic, ColorAttachmentSemantic::SceneColor);
 }
 
-// The layout key a draw is keyed by is the current pass's, through offscreen passes and back. The offscreen targets'
-// depth format differs from the EFB's, so a key left over from another pass would show.
+// The layout key a draw is keyed by is the current pass's, through offscreen passes and back. Offscreen targets take
+// the EFB's formats when they're made, and here the EFB's colour format differs only while they are, so the offscreen
+// pass's format differs from the EFB passes' and a key left over from another pass would show.
 TEST_F(GfxRecordingTest, LayoutKeyFollowsTheCurrentPass) {
   const auto key = [this] { return frame.renderPasses.back().target_layout().key; };
   const auto efbKey = get_render_target_layout_key();
   EXPECT_EQ(efbKey, key());
   EXPECT_EQ(has_normal_attachment(), false);
-  seed(320, 180);
+  webgpu::g_frameBuffer.format = wgpu::TextureFormat::BGRA8Unorm;
+  detail::testing::seed_offscreen_cache(320, 180, TextureFormat::BGRA8Unorm, TextureFormat::Depth32Float);
   begin_offscreen(320, 180);
+  webgpu::g_frameBuffer.format = ColorFormat;
   EXPECT_EQ(get_render_target_layout_key(), key());
   EXPECT_NE(get_render_target_layout_key(), efbKey);
   copy_current_offscreen();
@@ -186,6 +202,104 @@ TEST_F(GfxRecordingTest, FinalizedPassesAreSealedOrDeliberatelyDiscarded) {
   }
   detail::end_recording();
   recordingActive = false;
+}
+
+TEST_F(GfxRecordingTest, OffscreenBudgetIncludesColorAndDepth) {
+  seed(2048, 2048); // 16 MiB color + 16 MiB depth
+  seed(4096, 1024); // Another 32 MiB
+  ASSERT_EQ(detail::testing::offscreen_cache_stats().bytes, RenderTextureCacheLimits.bytes);
+  ASSERT_EQ(detail::testing::offscreen_cache_stats().entries, 2);
+
+  begin_offscreen(2048, 2048); // Refresh the older entry within the same frame.
+  end_offscreen();
+  seed(1024, 4096);
+
+  EXPECT_TRUE(cached(2048, 2048));
+  EXPECT_FALSE(cached(4096, 1024));
+  EXPECT_TRUE(cached(1024, 4096));
+  EXPECT_EQ(detail::testing::offscreen_cache_stats().bytes, RenderTextureCacheLimits.bytes);
+}
+
+TEST_F(GfxRecordingTest, OffscreenBudgetBoundsContinuousSizeChanges) {
+  for (uint32_t width = 256; width < 2048; ++width) {
+    seed(width, 1024);
+    begin_offscreen(width, 1024);
+    end_offscreen();
+    EXPECT_LE(detail::testing::offscreen_cache_stats().bytes, RenderTextureCacheLimits.bytes);
+  }
+  EXPECT_FALSE(cached(256, 1024));
+  EXPECT_TRUE(cached(2047, 1024));
+}
+
+TEST_F(GfxRecordingTest, OversizedOffscreenDoesNotDisplaceReusableSizes) {
+  seed(320, 240);
+  seed(4096, 4096); // 128 MiB including depth
+  EXPECT_TRUE(cached(320, 240));
+  EXPECT_FALSE(cached(4096, 4096));
+  EXPECT_EQ(detail::testing::offscreen_cache_stats().entries, 1);
+}
+
+TEST_F(GfxRecordingTest, OffscreenSweepKeepsHotSizesAndExpiresIdleOnes) {
+  seed(320, 240);
+  seed(160, 120);
+  for (uint64_t i = 0; i < RenderTextureCacheLimits.idleFrames.value(); ++i) {
+    begin_offscreen(320, 240);
+    end_offscreen();
+    next_frame();
+  }
+  EXPECT_TRUE(cached(160, 120)); // Exactly 32 frames old is still retained.
+  for (uint64_t i = 0; i < RenderTextureCacheLimits.sweepFrames; ++i) {
+    begin_offscreen(320, 240);
+    end_offscreen();
+    next_frame();
+  }
+  EXPECT_TRUE(cached(320, 240));
+  EXPECT_FALSE(cached(160, 120));
+  EXPECT_EQ(detail::testing::offscreen_cache_stats().entries, 1);
+}
+
+TEST_F(GfxRecordingTest, OffscreenReuseSurvivesEfbResizeCycles) {
+  seed(320, 240);
+  seed(640, 360);
+  for (uint64_t i = 0; i < 4 * RenderTextureCacheLimits.idleFrames.value(); ++i) {
+    const uint32_t width = i % 2 == 0 ? 640 : 1280;
+    const uint32_t height = i % 2 == 0 ? 480 : 720;
+    webgpu::g_frameBuffer.size = {width, height, 1};
+    webgpu::g_depthBuffer.size = {width, height, 1};
+    next_frame();
+    ASSERT_TRUE(cached(width / 2, height / 2));
+    begin_offscreen(width / 2, height / 2);
+    const auto size = get_render_target_size();
+    EXPECT_EQ(size.x, width / 2);
+    EXPECT_EQ(size.y, height / 2);
+    end_offscreen();
+  }
+  EXPECT_EQ(detail::testing::offscreen_cache_stats().entries, 2);
+}
+
+// Upstream's OffscreenKeyIncludesColorAndDepthFormats: the fork's formats name one depth format, so only the colour
+// format varies.
+TEST_F(GfxRecordingTest, OffscreenKeyIncludesColorFormat) {
+  constexpr std::array colors{
+      std::pair{wgpu::TextureFormat::RGBA8Unorm, TextureFormat::RGBA8Unorm},
+      std::pair{wgpu::TextureFormat::BGRA8Unorm, TextureFormat::BGRA8Unorm},
+      std::pair{wgpu::TextureFormat::RGB10A2Unorm, TextureFormat::RGB10A2Unorm},
+  };
+  for (const auto& [_, color] : colors) {
+    detail::testing::seed_offscreen_cache(320, 240, color, TextureFormat::Depth32Float);
+  }
+  ASSERT_EQ(detail::testing::offscreen_cache_stats().entries, 3);
+  EXPECT_EQ(detail::testing::offscreen_cache_stats().bytes, 3 * 320 * 240 * 8);
+
+  for (const auto& [surface, color] : colors) {
+    webgpu::g_frameBuffer.format = surface;
+    begin_offscreen(320, 240);
+    const auto layout = get_render_target_layout();
+    EXPECT_EQ(layout.colorAttachments[SceneColorAttachmentIndex].format, color);
+    EXPECT_EQ(layout.depthStencilFormat, TextureFormat::Depth32Float);
+    end_offscreen();
+  }
+  EXPECT_EQ(detail::testing::offscreen_cache_stats().entries, 3);
 }
 
 // A clear without a copy (GX_AURORA_CLEAR_COPY_SRC) seals the pass with nothing to copy, and the next pass clears as

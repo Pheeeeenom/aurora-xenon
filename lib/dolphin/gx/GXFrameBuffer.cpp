@@ -1,7 +1,6 @@
 #include "gx.hpp"
 #include "__gx.h"
 
-#include "../../gfx/backend.hpp"
 #include "../../gfx/texture.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../window.hpp"
@@ -47,29 +46,14 @@ void resolve_copy_src(gfx::TextureHandle texture, GXBool clear) noexcept {
 void copy_tex(const void* dest, GXBool clear) noexcept {
   const auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight);
   const auto texCopyFmt = g_gxState.texCopyFmt;
-
-  const GXState::CopyTextureKey key{
+  const auto copy = texture::resolve_copy_texture({
       .dest = dest,
       .width = dstWidth,
       .height = dstHeight,
       .format = texCopyFmt,
-  };
-  auto it = g_gxState.copyTextureCache.find(key);
-  if (it == g_gxState.copyTextureCache.end()) {
-    gfx::TextureHandle handle;
-    if (gfx::backend::converts_copy(texCopyFmt)) {
-      handle = gfx::new_conv_texture(dstWidth, dstHeight, texCopyFmt, "Copy Conv Texture");
-    } else {
-      handle = gfx::new_render_texture(dstWidth, dstHeight, GX_TF_RGBA8, "Resolved Texture");
-    }
-    it = g_gxState.copyTextureCache.emplace(key, GXState::CopyTextureRef{.handle = handle, .revision = 0}).first;
-  }
-  auto& handle = it->second;
+  });
 
-  resolve_copy_src(handle.handle, clear);
-  ++handle.revision;
-  g_gxState.copyTextures[dest] = handle;
-  texture::invalidate_bindings();
+  resolve_copy_src(copy.handle, clear);
 }
 
 void clear_copy_src() noexcept { resolve_copy_src({}, GX_TRUE); }

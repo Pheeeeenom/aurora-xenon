@@ -191,12 +191,21 @@ if (AURORA_USE_DAWN)
   target_link_libraries(gfx_recording_tests PRIVATE
     aurora::gx
     aurora::vi
+    absl::flat_hash_map
     gtest
     gtest_main
   )
   aurora_copy_runtime_dlls(gfx_recording_tests)
   gtest_discover_tests(gfx_recording_tests)
 endif () # AURORA_USE_DAWN
+
+# The LRU the texture, copy and offscreen caches share, which needs no GPU
+if (AURORA_ENABLE_GX)
+  add_executable(lru_cache_tests lru_cache_test.cpp)
+  target_include_directories(lru_cache_tests PRIVATE ../lib)
+  target_link_libraries(lru_cache_tests PRIVATE gtest gtest_main absl::flat_hash_map)
+  gtest_discover_tests(lru_cache_tests)
+endif ()
 
 # DVD API tests
 if (TARGET aurora::dvd)

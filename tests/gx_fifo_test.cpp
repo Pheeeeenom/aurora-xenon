@@ -743,7 +743,7 @@ TEST_F(GXFifoTest, ClearTexCopySrc_ClearsAsACopyWithout) {
     decode_fifo(capture_fifo());
     const auto copy = lastResolve;
     const auto copies = g_gxState.copyTextures.size();
-    const auto cached = g_gxState.copyTextureCache.size();
+    const auto revision = g_gxState.copyTextures.at(reinterpret_cast<void*>(0x1234)).revision;
     GXClearTexCopySrc();
     decode_fifo(capture_fifo());
     EXPECT_FALSE(lastResolve.target);
@@ -757,7 +757,7 @@ TEST_F(GXFifoTest, ClearTexCopySrc_ClearsAsACopyWithout) {
     EXPECT_EQ(lastResolve.clearColorValue, copy.clearColorValue);
     EXPECT_EQ(lastResolve.clearDepthValue, copy.clearDepthValue);
     EXPECT_EQ(g_gxState.copyTextures.size(), copies);
-    EXPECT_EQ(g_gxState.copyTextureCache.size(), cached);
+    EXPECT_EQ(g_gxState.copyTextures.at(reinterpret_cast<void*>(0x1234)).revision, revision);
   }
   EXPECT_EQ(lastResolve.rect, (aurora::gfx::ClipRect{0, 0, 640, 448}));
 }
@@ -2594,19 +2594,13 @@ TEST_F(GXFifoTest, DestroyCopyTex_EmitsAuroraDestroyCommand) {
   decode_fifo(bytes);
 }
 
-TEST_F(GXFifoTest, DestroyCopyTex_RemovesActiveCopyTextureAndCacheEntriesForPointer) {
+TEST_F(GXFifoTest, DestroyCopyTex_RetiresOnlyTheRequestedDestination) {
   alignas(32) u8 imageA[32]{};
   alignas(32) u8 imageB[32]{};
 
   const aurora::gx::GXState::CopyTextureRef ref{.revision = 1};
   gxState().copyTextures[imageA] = ref;
   gxState().copyTextures[imageB] = ref;
-  gxState().copyTextureCache.emplace(
-      aurora::gx::GXState::CopyTextureKey{.dest = imageA, .width = 32, .height = 32, .format = GX_TF_I4}, ref);
-  gxState().copyTextureCache.emplace(
-      aurora::gx::GXState::CopyTextureKey{.dest = imageA, .width = 64, .height = 64, .format = GX_TF_I8}, ref);
-  gxState().copyTextureCache.emplace(
-      aurora::gx::GXState::CopyTextureKey{.dest = imageB, .width = 32, .height = 32, .format = GX_TF_I4}, ref);
 
   GXDestroyCopyTex(imageA);
   auto bytes = capture_fifo();
@@ -2615,10 +2609,6 @@ TEST_F(GXFifoTest, DestroyCopyTex_RemovesActiveCopyTextureAndCacheEntriesForPoin
 
   EXPECT_FALSE(gxState().copyTextures.contains(imageA));
   EXPECT_TRUE(gxState().copyTextures.contains(imageB));
-  for (const auto& [key, _] : gxState().copyTextureCache) {
-    EXPECT_NE(key.dest, imageA);
-  }
-  EXPECT_EQ(gxState().copyTextureCache.size(), 1u);
 }
 
 // ============================================================================
