@@ -135,6 +135,9 @@ void set_render_viewport(const gfx::Viewport& viewport) noexcept {
       viewport.height != g_gxState.renderViewport.height) {
     g_gxState.dirty |= DirtyView | DirtyMaterial; // The material's texture LOD bias reads it
   }
+  if (viewport.znear != g_gxState.renderViewport.znear || viewport.zfar != g_gxState.renderViewport.zfar) {
+    g_gxState.dirty |= DirtyView; // The view's depth range
+  }
   g_gxState.renderViewport = viewport;
   gfx::set_viewport(viewport);
 }

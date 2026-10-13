@@ -336,8 +336,11 @@ struct ViewUniform {
   std::array<Mat3x4<float>, MaxPTTexMtx> postMtxs;
   Fog fog;
   std::array<Vec4<float>, MaxIndTexMtxs * 2> indTexMtxs;
+  // The render viewport's znear and zfar, then zeros: what a fragment's depth is mapped to, for a backend whose
+  // programs work out fog's depth themselves.
+  Vec4<float> depthRange;
 };
-static_assert(sizeof(ViewUniform) == 1840);
+static_assert(sizeof(ViewUniform) == 1856);
 using PosMtxUniform = std::array<Mat3x4<float>, MaxPnMtx>;
 using NrmMtxUniform = std::array<Mat3x4<float>, MaxPnMtx>;
 struct LightsUniform {

@@ -418,6 +418,8 @@ static void write_view_uniform(u8* out, u8 lineMode) noexcept {
     indTexMtxs[i * 2 + 1] = Vec4{mtx.mtx.m2.x, mtx.mtx.m2.y, std::exp2f(mtx.scaleExp), 0.0f};
   }
   put(out, offsetof(ViewUniform, indTexMtxs), indTexMtxs);
+  put(out, offsetof(ViewUniform, depthRange),
+      Vec4<float>{g_gxState.renderViewport.znear, g_gxState.renderViewport.zfar, 0.f, 0.f});
 }
 
 static void write_lights_uniform(u8* out) noexcept {

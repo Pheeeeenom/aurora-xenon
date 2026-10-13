@@ -917,6 +917,7 @@ struct View {{
     postmtx: array<mat3x4f, {1}>,
     fog: Fog,
     ind_mtx: array<mat2x4f, {2}>,
+    depth_range: vec4f,
 }};
 struct PosMtx {{
     mtx: array<mat3x4f, {3}>,
