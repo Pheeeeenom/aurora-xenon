@@ -6,7 +6,9 @@
 #include "../gfx/render_worker.hpp"
 #include "../gx/command_processor.hpp"
 #include "../gx/gx.hpp"
+#include "../io.hpp"
 #include "../window.hpp"
+#include "tiled_index.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -138,6 +140,36 @@ uint32_t g_cacheFrames = 0;
 // The render worker's time in vkAcquireNextImageKHR, which waits for the display, since the benchmark last asked.
 std::atomic<uint64_t> g_acquireNs = 0;
 #endif
+
+// A capture (aurora_capture_frame): the frame's EFB as a binary PPM, as the WebGPU backend writes its present source,
+// once the GPU has drawn it. The EFB is a tiled R8G8B8A8 image, its pitch a multiple of 32 texels
+// (xsdk:include/xsdk/texture.h), whose texels' bytes run red to alpha in memory (xsdk:docs/HARDWARE.md, "Byte-order
+// resolves"). Xenia puts a resolve in memory only with --readback_resolve=full.
+void write_capture(const backend::Texture& efb, uint64_t serial, const std::string& path) noexcept {
+  if (!wait_for_frame(serial) || efb.memory.mapped == nullptr) {
+    Log.warn("Frame capture: could not write {}", path);
+    return;
+  }
+  const std::string header = fmt::format("P6\n{} {}\n255\n", efb.width, efb.height);
+  std::vector<uint8_t> ppm(header.begin(), header.end());
+  ppm.reserve(header.size() + size_t{efb.width} * efb.height * 3);
+  // Write-combined memory, so a word at a time: each read goes to memory.
+  const auto* texels = reinterpret_cast<const volatile uint32_t*>(efb.memory.mapped);
+  const uint32_t pitch = (efb.width + 31) & ~31u;
+  for (uint32_t y = 0; y < efb.height; ++y) {
+    for (uint32_t x = 0; x < efb.width; ++x) {
+      const uint32_t texel = texels[tiled_index(x, y, pitch)];
+      uint8_t bytes[4];
+      std::memcpy(bytes, &texel, sizeof(bytes));
+      ppm.insert(ppm.end(), bytes, bytes + 3);
+    }
+  }
+  if (io::write_file(io::fs_path_from_string(path), ppm)) {
+    Log.info("Wrote frame capture to {}", path);
+  } else {
+    Log.warn("Frame capture: could not write {}", path);
+  }
+}
 
 // The EFB follows the window between frames, as under the null backend; a framebuffer is at most the screen.
 bool update_efb() noexcept {
@@ -884,12 +916,11 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay) noexc
                    set, WholeSource);
     }
   }
-  if (!frame.capturePath.empty()) {
-    // The layer's targets are tiled, and nothing reads them back yet.
-    static std::once_flag once;
-    std::call_once(once, [] { Log.error("Frame captures aren't written on the Xbox 360"); });
-  }
+  const uint64_t serial = next_frame_serial();
   submit_frame(frame.slot, image, present, frame.frameId);
+  if (!frame.capturePath.empty()) {
+    write_capture(*state.efbColor, serial, frame.capturePath);
+  }
   state.recording = false;
   reset_bindings();
   g_passDraws.clear();
