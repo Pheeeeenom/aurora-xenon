@@ -918,7 +918,10 @@ std::span<const u8> handle_aurora(ByteReader& reader) noexcept {
     const u32 attrIdx = subCmd - GX_AURORA_LOAD_ARRAYBASE + GX_VA_POS;
     const u64 arrayAddr = reader.read<u64>();
     const u32 arraySize = reader.read<u32>();
-    const bool le = reader.read<u8>() == 1;
+    // Games mark an array le when the host wrote it, in the host's byte order (GXSetArray; J3D's skinned vertices and
+    // matrices): little-endian on the PCs they were ported to, but GX's own, big-endian, on a big-endian host such as
+    // the Xbox 360.
+    const bool le = reader.read<u8>() == 1 && std::endian::native == std::endian::little;
 
     auto& array = g_gxState.arrays[attrIdx];
     const auto newData = reinterpret_cast<void*>(arrayAddr);
