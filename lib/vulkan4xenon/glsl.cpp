@@ -1024,10 +1024,10 @@ private:
   }
 
   // The WGSL's fog, mixed into the stages' colour as fog_color. The fragment's depth comes from clip z and w, as the
-  // GPU's viewport maps it, and range fog's factor is worked out for the fragment's column from the fog's range_k and
-  // centre, as gx/command_processor.cpp's build_fog_range_lut does for each column: the WGSL reads it from that table.
-  // Linear interpolation between neighbouring range_k is a sum of each one by its distance from the index, where 1 or
-  // less; range_k's two after the tenth repeat it (shader_info.cpp), and are past any index.
+  // GPU's viewport maps it, and range fog's factor from the table gx/command_processor.cpp's build_fog_range_lut makes
+  // for each column, as the WGSL reads it: one sample of set 2's copy of it (glsl.hpp). gl_FragCoord.x is the column
+  // plus 0.5, so x / width, wrapped by the sampler, is the middle of the column's texel along u, and the middle of its
+  // row is worked out from the whole part.
   void fog(std::string_view color) {
     m_body += gx::UseReversedZ ? "\n    // Fog"
                                  "\n    float fog_ndc = in_fog_zw.x / in_fog_zw.y;"
@@ -1041,16 +1041,12 @@ private:
                   ? "\n    float fog_base = uview.fog[1].x * fog_depth;"sv
                   : "\n    float fog_base = uview.fog[1].x / (uview.fog[1].y - fog_depth);"sv;
     if (m_config.fogRangeEnabled) {
-      m_body +=
-          "\n    float fog_offset = gl_FragCoord.x / uview.viewport_sizes.x * 2.0 - 1.0 - uview.fog[1].w;"
-          "\n    float fog_index = clamp(9.0 - abs(fog_offset) * 9.0, 0.0, 9.0);"
-          "\n    vec4 fog_k0 = max(vec4(1.0) - abs(vec4(fog_index) - vec4(0.0, 1.0, 2.0, 3.0)), vec4(0.0));"
-          "\n    vec4 fog_k1 = max(vec4(1.0) - abs(vec4(fog_index) - vec4(4.0, 5.0, 6.0, 7.0)), vec4(0.0));"
-          "\n    vec4 fog_k2 = max(vec4(1.0) - abs(vec4(fog_index) - vec4(8.0, 9.0, 10.0, 11.0)), vec4(0.0));"
-          "\n    float fog_k = max(dot(uview.fog[2], fog_k0) + dot(uview.fog[3], fog_k1) + dot(uview.fog[4], fog_k2),"
-          " 0.000001);"
-          "\n    float fog_f = clamp(fog_base * (sqrt(fog_offset * fog_offset + fog_k * fog_k) / fog_k) -"
-          " uview.fog[1].z, 0.0, 1.0);"sv;
+      m_body += fmt::format(
+          "\n    float fog_column = gl_FragCoord.x * (1.0 / {0}.0);"
+          "\n    vec4 fog_range = texture(fog_range_table, vec2(fog_column, floor(fog_column) * (1.0 / {1}.0) +"
+          " (0.5 / {1}.0)));"
+          "\n    float fog_f = clamp(fog_base * fog_range.x - uview.fog[1].z, 0.0, 1.0);",
+          FogRangeTableWidth, FogRangeTableHeight);
     } else {
       m_body += "\n    float fog_f = clamp(fog_base - uview.fog[1].z, 0.0, 1.0);"sv;
     }
@@ -1261,6 +1257,11 @@ std::string indirect_coord(const gx::ShaderConfig& config, const gx::ShaderInfo&
   return fmt::format("ind{}_uv", idx);
 }
 
+// Whether the fragment program has range fog, which reads the range fog table.
+bool reads_fog_range(const gx::ShaderConfig& config, const gx::ShaderInfo& info) noexcept {
+  return info.usesFog && config.fogRangeEnabled;
+}
+
 // False when the alpha compare discards every fragment.
 bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::string& source) {
   const auto& info = plan.info;
@@ -1299,6 +1300,9 @@ bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::stri
       decls += fmt::format("layout(set = 1, binding = {0}) uniform sampler2D tex{0};\n", i);
     }
   }
+  if (reads_fog_range(config, info)) {
+    decls += fmt::format("layout(set = {}, binding = 0) uniform sampler2D fog_range_table;\n", FogRangeSet);
+  }
   for (size_t i = 0; i < plan.interpolants.size(); ++i) {
     decls +=
         fmt::format("layout(location = {}) in {} in_{};\n", i, plan.interpolants[i].type, plan.interpolants[i].name);
@@ -1328,6 +1332,7 @@ Programs build_programs(const gx::ShaderConfig& config) {
   }
   programs.layout = make_layout(inputs);
   programs.vertex = vertex_source(plan, programs.layout, body, programs.normalMatrix);
+  programs.fogRange = reads_fog_range(config, plan.info);
   return programs;
 }
 } // namespace aurora::gfx::vulkan4xenon::glsl

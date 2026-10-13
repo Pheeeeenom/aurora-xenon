@@ -212,6 +212,38 @@ def ref_lighting(mv, n, mask, diff_fn, attn_fn, ambient, material, alpha=False):
     return mul(material, clamp4(lighting))
 
 
+def range_factor(x):
+    """gx/command_processor.cpp's build_fog_range_lut at column x, the render viewport VIEWPORT[0] wide."""
+    k = range_k()
+    offset = ((x + 0.5) / VIEWPORT[0]) * 2.0 - 1.0 - RANGE_CENTER
+    index = clamp(9.0 - abs(offset) * 9.0, 0.0, 9.0)
+    lower = int(index)
+    upper = min(lower + 1, 9)
+    fraction = index - lower
+    kk = max(k[lower] * (1.0 - fraction) + k[upper] * fraction, 0.000001)
+    return math.sqrt(offset * offset + kk * kk) / kk
+
+
+# The backend's range fog table at set 2, binding 0 (lib/vulkan4xenon/glsl.hpp): range_factor's for each column x at
+# texel (x % 64, x / 64) of 64 by 32, sampled nearest with u repeating and v clamped.
+FOG_TABLE = (2, 0)
+FOG_TABLE_SIZE = (64, 32)
+
+
+def fog_table(u, v):
+    width, height = FOG_TABLE_SIZE
+    tx = int(math.floor((u - math.floor(u)) * width))
+    ty = min(max(int(math.floor(v * height)), 0), height - 1)
+    return [range_factor(tx + width * ty), 0.0, 0.0, 1.0]
+
+
+def fog_table_uv():
+    """Where a program should sample the table for PIXEL's column: the middle of its texel."""
+    width, height = FOG_TABLE_SIZE
+    column = PIXEL[0] + 0.5
+    return [column / width, (math.floor(column / width) + 0.5) / height]
+
+
 def ref_fog(color, clip, kind, ortho, ranged):
     """The fog's colour mixed in: its depth as the GPU's viewport maps it, reversed (UseReversedZ), and range's factor
     from gx/command_processor.cpp's build_fog_range_lut at the pixel's column."""
@@ -220,15 +252,7 @@ def ref_fog(color, clip, kind, ortho, ranged):
     depth = 1.0 - (min_depth + ndc * (max_depth - min_depth))
     base = FOG_A * depth if ortho else FOG_A / (FOG_B - depth)
     if ranged:
-        k = range_k()
-        x = PIXEL[0]
-        offset = ((x + 0.5) / VIEWPORT[0]) * 2.0 - 1.0 - RANGE_CENTER
-        index = clamp(9.0 - abs(offset) * 9.0, 0.0, 9.0)
-        lower = int(index)
-        upper = min(lower + 1, 9)
-        fraction = index - lower
-        kk = max(k[lower] * (1.0 - fraction) + k[upper] * fraction, 0.000001)
-        base *= math.sqrt(offset * offset + kk * kk) / kk
+        base *= range_factor(PIXEL[0])
     if not 0.0 < base - FOG_C < 1.0:
         SATURATED.append(base - FOG_C)
     f = clamp(base - FOG_C)
@@ -362,12 +386,12 @@ class Programs:
             registers[r] = list(outputs["out_" + var.name[len("in_"):]])
         if interface.frag_coord is not None:
             registers[max(registers, default=-1) + 1] = PIXEL + [0.0, 0.0]
-        slots = {slot: var.binding for var, slot in interface.samplers}
+        slots = {slot: (var.descriptor_set, var.binding) for var, slot in interface.samplers}
 
         def fetch(slot, coordinates):
-            binding = slots[slot]
-            sampled.setdefault(binding, []).append(coordinates[:2])
-            return textures[binding](coordinates[0], coordinates[1])
+            key = slots[slot]
+            sampled.setdefault(key, []).append(coordinates[:2])
+            return textures[key](coordinates[0], coordinates[1])
 
         result = simulate.run(blob, registers=registers, constants=self.constants("frag", values), texture_fetch=fetch)
         return result.exports.get(0), result.killed
@@ -446,7 +470,10 @@ def check_fog(programs, name, failures):
     check_position(position, clip, failures, name)
     rasterized = CHANNEL_COLORS[1][:3] + [CHANNEL_COLORS[3][3]]
     want = ref_fog(clamp4(rasterized)[:3], clip, kind, ortho, ranged) + [clamp(rasterized[3])]
-    color, _ = programs.fragment(uniforms(), outputs, {}, {})
+    sampled = {}
+    color, _ = programs.fragment(uniforms(), outputs, {FOG_TABLE: fog_table}, sampled)
+    if ranged and not close(sampled.get(FOG_TABLE, [None])[0], fog_table_uv(), 1e-6):
+        failures.append(f"{name}: range fog table sampled at {sampled.get(FOG_TABLE)}, want {fog_table_uv()}")
     if not close(color, want):
         failures.append(f"{name}: colour {color}, want {want}")
 
@@ -463,7 +490,7 @@ def check_texmtx(programs, name, failures):
             failures.append(f"{name} {byte}: tex1_uvw {outputs.get('out_tex1_uvw')}, want {uvw}")
         uv = [uvw[0] / uvw[2], uvw[1] / uvw[2]]
         want = mul(image(*uv)[:3], rasterized[:3]) + [rasterized[3]]
-        color, _ = programs.fragment(uniforms(), outputs, {0: image}, {})
+        color, _ = programs.fragment(uniforms(), outputs, {(1, 0): image}, {})
         if not close(color, clamp4(want)):
             failures.append(f"{name} {byte}: colour {color}, want {clamp4(want)}")
 
@@ -472,12 +499,12 @@ def check_indirect(programs, name, failures):
     outputs, _ = programs.vertex(uniforms(), {"in_pos": POSITION, "in_tex0_uv": TEX0, "in_tex1_uv": TEX0})
     uv, ind_uv, bump = ref_indirect(name)
     sampled = {}
-    color, _ = programs.fragment(uniforms(), outputs, {0: image, 1: lambda u, v: INDIRECT}, sampled)
+    color, _ = programs.fragment(uniforms(), outputs, {(1, 0): image, (1, 1): lambda u, v: INDIRECT}, sampled)
     # Coordinates are checked closer than colours: an offset's small terms move them by less than a colour shows.
-    if not close(sampled.get(1, [None])[0], ind_uv, 1e-5):
-        failures.append(f"{name}: indirect texture sampled at {sampled.get(1)}, want {ind_uv}")
-    if not close(sampled.get(0, [None])[0], uv, 1e-5):
-        failures.append(f"{name}: texture sampled at {sampled.get(0)}, want {uv}")
+    if not close(sampled.get((1, 1), [None])[0], ind_uv, 1e-5):
+        failures.append(f"{name}: indirect texture sampled at {sampled.get((1, 1))}, want {ind_uv}")
+    if not close(sampled.get((1, 0), [None])[0], uv, 1e-5):
+        failures.append(f"{name}: texture sampled at {sampled.get((1, 0))}, want {uv}")
     rasterized = CHANNEL_COLORS[1][:3] + [CHANNEL_COLORS[3][3]]
     if bump is None:
         want = mul(image(*uv)[:3], rasterized[:3]) + [rasterized[3]]
@@ -500,7 +527,7 @@ def check_scene(programs, name, failures):
         failures.append(f"{name}: cc0 {outputs.get('out_cc0')}, want {cc0}")
     tc = rows3x4(tex_matrix((byte - TEXMTX0) // 3), TEX0 + [1.0, 1.0])
     uv = tc[:2]                                  # a 2x4 texgen
-    color, _ = programs.fragment(uniforms(), outputs, {0: image}, {})
+    color, _ = programs.fragment(uniforms(), outputs, {(1, 0): image, FOG_TABLE: fog_table}, {})
     textured = clamp4(mul(image(*uv)[:3], clamp4(cc0)[:3]))
     want = ref_fog(textured, clip, "lin", False, True) + [clamp(cc0[3])]
     if not close(color, want):

@@ -263,6 +263,9 @@ TEST_P(Fog, IsWritten) {
     EXPECT_TRUE(has(programs.fragment, ortho ? "fog_base = uview.fog[1].x * fog_depth;"
                                              : "fog_base = uview.fog[1].x / (uview.fog[1].y - fog_depth);"));
     EXPECT_EQ(has(programs.fragment, "gl_FragCoord.x"), GetParam().range);
+    EXPECT_EQ(has(programs.fragment, "layout(set = 2, binding = 0) uniform sampler2D fog_range_table;"),
+              GetParam().range);
+    EXPECT_EQ(programs.fogRange, GetParam().range);
     EXPECT_TRUE(has(programs.fragment, GetParam().z)) << programs.fragment;
     EXPECT_TRUE(has(programs.fragment, "o_color = vec4(fog_color, "));
   }

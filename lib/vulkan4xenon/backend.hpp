@@ -127,7 +127,7 @@ void shutdown_pipelines() noexcept;
 // Set 0 of the GX layout: the frame's uniform buffer, dynamic, once per uniform piece. Set 1: the 8 GX texture maps.
 VkDescriptorSetLayout uniform_set_layout() noexcept;
 VkDescriptorSetLayout texture_set_layout() noexcept;
-// The one texture a copy or the present samples.
+// The one texture a copy or the present samples, and set 2 of the GX layout, the range fog table (glsl.hpp).
 VkDescriptorSetLayout source_set_layout() noexcept;
 VkPipelineLayout copy_layout() noexcept;
 // Three vertices covering any framebuffer: positions and texture coordinates.
@@ -149,7 +149,7 @@ VkPipeline present_pipeline() noexcept;
 
 // backend.cpp: textures and descriptor sets.
 bool initialize_textures() noexcept;
-// Tiled, as every image the layer makes is.
+// Tiled, as every image the layer makes is. R32Float only sampled, as the range fog table.
 std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc) noexcept;
 void shutdown_textures() noexcept;
 VkDescriptorSet allocate_set(VkDescriptorSetLayout layout) noexcept;
@@ -197,6 +197,8 @@ struct Pipeline {
   uint64_t decodeFormat = 0;
   // The vertex program reads the current normal matrix, pushed after the position matrix (glsl.hpp).
   bool normalMatrix = false;
+  // The fragment program samples the range fog table (glsl.hpp).
+  bool fogRange = false;
 
   Pipeline() noexcept = default;
   Pipeline(const Pipeline&) = delete;

@@ -238,7 +238,8 @@ bool create_layouts() noexcept {
       !create_set_layout(std::span{textureBindings}.first(1), g_sourceSetLayout)) {
     return false;
   }
-  const std::array gxSets{g_uniformSetLayout, g_textureSetLayout};
+  // Set 2 is the range fog table, one texture as a copy's source is (glsl.hpp).
+  const std::array gxSets{g_uniformSetLayout, g_textureSetLayout, g_sourceSetLayout};
   // The GX programs' current position and normal matrices, the clear's colour, and a copy's source rectangle.
   return create_layout(gxSets, VK_SHADER_STAGE_VERTEX_BIT, 2 * sizeof(Mat3x4<float>), g_gxLayout) &&
          create_layout({}, VK_SHADER_STAGE_FRAGMENT_BIT, 16, g_clearLayout) &&
@@ -492,6 +493,7 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& confi
   pipeline->vertexLayout = std::move(programs.layout);
   pipeline->decodeFormat = decode::decode_format(pipeline->shaderConfig, pipeline->vertexLayout);
   pipeline->normalMatrix = programs.normalMatrix;
+  pipeline->fogRange = programs.fogRange;
   std::vector<VkVertexInputAttributeDescription> attributes;
   for (const auto& attribute : pipeline->vertexLayout.attributes) {
     attributes.push_back({

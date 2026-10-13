@@ -8,10 +8,14 @@
 #include "../gx/gx.hpp"
 #include "../io.hpp"
 #include "../window.hpp"
+#include "glsl.hpp"
 #include "tiled_index.hpp"
+
+#include <xxhash.h>
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #ifdef AURORA_DIAGNOSTICS
 #include <chrono>
@@ -112,6 +116,23 @@ const uint8_t* g_pushedNormalMatrix = nullptr;
 // lookup. A ref's set stays the same while a pass is recorded; expire_texture_sets runs after the frame's last.
 std::optional<BindGroupRef> g_lookedUpRef;
 VkDescriptorSet g_lookedUpSet = VK_NULL_HANDLE;
+VkDescriptorSet g_boundFogRange = VK_NULL_HANDLE;
+
+// Render worker: the range fog tables (glsl.hpp), the most recently used last. The FIFO worker pushes Aurora's table
+// into the frame's storage pool when a draw's fog changes it (gx/command_processor.cpp, push_gx_draw), so a frame has
+// one per fog setting it draws with and the next frame pushes the same again; a table is found by its factors.
+struct FogRangeTable {
+  uint64_t hash = 0;
+  std::vector<float> factors;
+  std::shared_ptr<backend::Texture> texture;
+  VkDescriptorSet set = VK_NULL_HANDLE;
+};
+// 8 KiB each.
+constexpr size_t MaxFogRangeTables = 8;
+constexpr uint32_t FogRangeColumns = glsl::FogRangeTableWidth * glsl::FogRangeTableHeight;
+std::vector<FogRangeTable> g_fogRangeTables;
+// The pass's tables, by where the FIFO worker pushed them, in words into the storage pool.
+std::vector<std::pair<uint32_t, VkDescriptorSet>> g_passFogRanges;
 constexpr VkDeviceSize NoIndices = UINT64_MAX;
 // Render worker: the pass being recorded's GX draws, in order, as lay_out_pass placed them.
 struct PassDraw {
@@ -119,6 +140,7 @@ struct PassDraw {
   VkDeviceSize offset = 0;                     // its vertices, in the vertex cache
   VkDeviceSize indices = NoIndices;            // a listed draw's index list, in the vertex cache
   bool decoded = false;                        // false when the cache had no room: its pipeline is bound, no more
+  VkDescriptorSet fogRange = VK_NULL_HANDLE;   // a range-fog program's table
 };
 std::vector<PassDraw> g_passDraws;
 // The pass's draws with a pipeline, their place in g_passDraws, keys and arrays' ends; and those to decode.
@@ -397,6 +419,7 @@ void use_pipeline(PipelineRef ref, std::shared_ptr<backend::Pipeline> pipeline, 
   if (pipeline->layout != g_currentLayout) {
     g_currentLayout = pipeline->layout;
     g_boundTextures = VK_NULL_HANDLE;
+    g_boundFogRange = VK_NULL_HANDLE;
     g_pushedMatrix = nullptr;
     g_pushedNormalMatrix = nullptr;
   }
@@ -421,9 +444,96 @@ void reset_bindings() noexcept {
   g_currentPipelineObject.reset();
   g_currentLayout = VK_NULL_HANDLE;
   g_boundTextures = VK_NULL_HANDLE;
+  g_boundFogRange = VK_NULL_HANDLE;
   g_pushedMatrix = nullptr;
   g_pushedNormalMatrix = nullptr;
   g_lookedUpRef.reset();
+}
+
+// The set of a range fog table holding factors, one a column: one made before, or a new one, written by the CPU
+// before any frame draws with it. Null when it can't be made.
+VkDescriptorSet fog_range_set(std::span<const float> factors) noexcept {
+  const uint64_t hash = XXH3_64bits(factors.data(), factors.size_bytes());
+  for (auto it = g_fogRangeTables.begin(); it != g_fogRangeTables.end(); ++it) {
+    if (it->hash == hash && it->factors.size() == factors.size() &&
+        std::memcmp(it->factors.data(), factors.data(), factors.size_bytes()) == 0) {
+      std::rotate(it, it + 1, g_fogRangeTables.end());
+      return g_fogRangeTables.back().set;
+    }
+  }
+  auto texture = make_texture({
+      .width = glsl::FogRangeTableWidth,
+      .height = glsl::FogRangeTableHeight,
+      .mips = 1,
+      .format = TextureFormat::R32Float,
+      .gxFormat = InvalidTextureFormat,
+      .usage = backend::TextureUsage::Sampled,
+      .label = "Range fog table",
+  });
+  if (!texture) {
+    return VK_NULL_HANDLE;
+  }
+  // Column x at texel (x % width, x / width), tiled as the layer tiles its images, each float a word in the CPU's
+  // order, as the layer's copies take R32_SFLOAT's texels; columns past the target's repeat its last, unread. Mapped
+  // memory is write-combined, so a word at a time (xsdk's CLAUDE.md), and vkQueueSubmit drains it for the GPU.
+  auto* const texels = reinterpret_cast<volatile uint32_t*>(texture->memory.mapped);
+  for (uint32_t x = 0; x < FogRangeColumns; ++x) {
+    texels[tiled_index(x % glsl::FogRangeTableWidth, x / glsl::FogRangeTableWidth, glsl::FogRangeTableWidth)] =
+        std::bit_cast<uint32_t>(factors[std::min<size_t>(x, factors.size() - 1)]);
+  }
+  const VkDescriptorSet set = allocate_set(source_set_layout());
+  if (set == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
+  const VkDescriptorImageInfo image{
+      .sampler = sampler({.wrapS = GX_REPEAT}),
+      .imageView = texture->view,
+      .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+  };
+  const VkWriteDescriptorSet write{
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = set,
+      .descriptorCount = 1,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .pImageInfo = &image,
+  };
+  vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
+  // A dropped table's texture and set go once the frames that may draw with it are done.
+  if (g_fogRangeTables.size() == MaxFogRangeTables) {
+    retire([set = g_fogRangeTables.front().set] { free_set(set); });
+    g_fogRangeTables.erase(g_fogRangeTables.begin());
+  }
+  g_fogRangeTables.push_back({hash, {factors.begin(), factors.end()}, std::move(texture), set});
+  return set;
+}
+
+// The set of the table the FIFO worker pushed at base, in words into the storage pool, for a target width columns
+// wide; null, logged, when it can't be had.
+VkDescriptorSet pass_fog_range(std::span<const uint8_t> storage, uint32_t base, uint32_t width) noexcept {
+  for (const auto& [at, set] : g_passFogRanges) {
+    if (at == base) {
+      return set;
+    }
+  }
+  VkDescriptorSet set = VK_NULL_HANDLE;
+  const size_t offset = size_t{base} * sizeof(float);
+  if (width == 0 || offset > storage.size() || storage.size() - offset < size_t{width} * sizeof(float)) {
+    static std::once_flag once;
+    std::call_once(once,
+                   [&] { Log.error("No range fog table at word {} of the storage pool for {} columns", base, width); });
+  } else {
+    if (width > FogRangeColumns) {
+      static std::once_flag once;
+      std::call_once(once, [&] {
+        Log.error("Range fog over {} columns: the table holds {}, and those past it read its last row", width,
+                  FogRangeColumns);
+      });
+    }
+    // The pool's arrays are 16-byte aligned (backend::Limits::storageAlignment).
+    set = fog_range_set({reinterpret_cast<const float*>(storage.data() + offset), width});
+  }
+  g_passFogRanges.emplace_back(base, set);
+  return set;
 }
 
 // Whether a draw's entry can hold an index list and its first vertices: a draw with no indices of its own, whose places
@@ -494,8 +604,11 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
   g_keyedPlaces.clear();
   g_decodeJobs.clear();
   g_decodeDraws.clear();
+  g_passFogRanges.clear();
   const std::span<const uint8_t> verts{frame.verts.data(), op.highWater.verts};
   const std::span<const uint8_t> storage{frame.storage.data(), op.highWater.storage};
+  // Aurora's range fog table has a factor for each column of the pass's target (gx/command_processor.cpp).
+  const uint32_t targetWidth = pass.colorAttachments[SceneColorAttachmentIndex].size.width;
   PipelineRef ref = UINTPTR_MAX;
   std::shared_ptr<backend::Pipeline> pipeline;
   for (auto& command : pass.commands) {
@@ -513,6 +626,12 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
     }
     if (!pipeline) {
       continue;
+    }
+    if (pipeline->fogRange) {
+      draw.fogRange = pass_fog_range(storage, data.immediateData.fogRangeBase, targetWidth);
+      if (draw.fogRange == VK_NULL_HANDLE) {
+        continue;
+      }
     }
     draw.pipeline = pipeline;
     g_keyedDraws.push_back(
@@ -583,6 +702,11 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
   if (textures != g_boundTextures) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 1, 1, &textures, 0, nullptr);
     g_boundTextures = textures;
+  }
+  if (pipeline.fogRange && draw.fogRange != g_boundFogRange) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, glsl::FogRangeSet, 1, &draw.fogRange,
+                            0, nullptr);
+    g_boundFogRange = draw.fogRange;
   }
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0, 1, &state.uniformSet,
                           data.uniformOffsets.size(), data.uniformOffsets.data());
@@ -820,6 +944,11 @@ void shutdown_frames() noexcept {
   g_lists = decode::IndexLists{IndexListBytes};
   g_efbColor.reset();
   g_efbDepth.reset();
+  for (const auto& table : g_fogRangeTables) {
+    free_set(table.set);
+  }
+  g_fogRangeTables.clear();
+  g_passFogRanges.clear();
   reset_bindings();
   g_passDraws.clear();
 }

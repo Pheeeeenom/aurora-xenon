@@ -7,6 +7,10 @@
 //   DrawData::uniformOffsets[i]. A program declares only the pieces it reads, each as std140 vec4s: a matrix is its
 //   rows, as Mat3x4 and Mat4x4 hold them.
 // - Set 1 is the 8 GX texture maps, binding i GX_TEXMAPi, sampled by the fragment program alone.
+// - Set 2, binding 0, for a fragment program with range fog, where Programs' fogRange says: the factor for each column
+//   of the target, as gx/command_processor.cpp's build_fog_range_lut works it out, column x at texel
+//   (x % FogRangeTableWidth, x / FogRangeTableWidth) of an R32_SFLOAT table, sampled nearest with u repeating and v
+//   clamped (encoding.cpp).
 // - The vertex stage's push constant is the current position matrix's three rows, 48 bytes, then, where Programs'
 //   normalMatrix says, the current normal matrix's, 48 more: the matrices the draw selects. A matrix picked per vertex
 //   is read from its piece at its first row, a vertex attribute (decode.cpp), as xost reads a block's array at an
@@ -26,6 +30,12 @@
 #include <vector>
 
 namespace aurora::gfx::vulkan4xenon::glsl {
+// The range fog table's size: a 2048-column target's factors in two of Xenos's 32 by 32 tiles, 8 KiB, where one row
+// would take 32 rows of tiles all the same.
+inline constexpr uint32_t FogRangeSet = 2;
+inline constexpr uint32_t FogRangeTableWidth = 64;
+inline constexpr uint32_t FogRangeTableHeight = 32;
+
 // vulkan4xenon's vertex formats, named here so the generator builds without Vulkan headers.
 enum class AttrFormat : uint8_t {
   F32x1, // VK_FORMAT_R32_SFLOAT
@@ -59,6 +69,8 @@ struct Programs {
   std::string fragment; // GLSL
   // The vertex program reads the current normal matrix, pushed after the position matrix.
   bool normalMatrix = false;
+  // The fragment program samples the range fog table at set 2.
+  bool fogRange = false;
 };
 
 // All empty for a config these programs don't express yet, with all it needs logged once, under the config's hash.

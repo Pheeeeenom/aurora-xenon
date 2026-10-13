@@ -49,7 +49,7 @@ backend::Limits g_limits{
     // as it copied the arrays and vertex bytes, while warm, where the render worker would read them cold.
     .arraySizes = true,
     .contentHashes = true,
-    // glsl.hpp's programs have no fog yet (vulkan4xenon's ROADMAP.md, milestone 11), so no range fog table.
+    // Aurora's own range fog table, which the backend copies into a texture for glsl.hpp's programs (encoding.cpp).
     .fogRangeTable = nullptr,
     // Off as on the null backend, so a pipeline's shader config is the one a run there recorded: the field changes
     // ColorChannelConfig (gx.cpp), and glsl.hpp's programs have no lighting yet.
@@ -258,10 +258,12 @@ VkSampler sampler(const SamplerConfig& config) noexcept {
 std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc) noexcept {
   using backend::TextureUsage;
   const bool depth = desc.format == TextureFormat::Depth32Float;
-  // BC1 only as sampled images, where the layer has it (samples_bc1).
+  // BC1 only as sampled images, where the layer has it (samples_bc1); 32-bit floats only sampled, as the layer has them
+  // (vulkan4xenon's docs/SUPPORT.md, Formats).
   const bool bc1 = desc.format == TextureFormat::BC1RGBAUnorm && desc.usage == TextureUsage::Sampled;
-  if (!depth && !bc1 && desc.format != TextureFormat::RGBA8Unorm) {
-    Log.error("No texture for {}: format {} isn't RGBA8 or swizzled BC1", desc.label,
+  const bool floats = desc.format == TextureFormat::R32Float && desc.usage == TextureUsage::Sampled;
+  if (!depth && !bc1 && !floats && desc.format != TextureFormat::RGBA8Unorm) {
+    Log.error("No texture for {}: format {} isn't RGBA8, swizzled BC1 or sampled R32Float", desc.label,
               static_cast<uint32_t>(desc.format));
     return {};
   }
@@ -272,9 +274,10 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
   VkImageCreateInfo info{
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = VK_IMAGE_TYPE_2D,
-      .format = depth ? VK_FORMAT_D24_UNORM_S8_UINT
-                : bc1 ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
-                      : VK_FORMAT_R8G8B8A8_UNORM,
+      .format = depth    ? VK_FORMAT_D24_UNORM_S8_UINT
+                : bc1    ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+                : floats ? VK_FORMAT_R32_SFLOAT
+                         : VK_FORMAT_R8G8B8A8_UNORM,
       .extent = {desc.width, desc.height, 1},
       .mipLevels = 1,
       .arrayLayers = 1,
