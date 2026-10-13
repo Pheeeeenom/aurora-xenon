@@ -592,7 +592,7 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
       for (size_t i = 0; i + sizeof(uint16_t) <= baseBytes; i += sizeof(uint16_t)) {
         uint16_t value = 0;
         std::memcpy(&value, textureData + i, sizeof(value));
-        const uint32_t index = bswap(value) & 0x3fff;
+        const uint32_t index = from_big_endian(value) & 0x3fff;
         minTlutIndex = std::min(minTlutIndex, index);
         maxTlutIndex = std::max(maxTlutIndex, index);
       }

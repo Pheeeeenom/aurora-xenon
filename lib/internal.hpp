@@ -93,6 +93,13 @@ ALWAYS_INLINE constexpr T to_big_endian(T val) noexcept {
   }
 }
 
+// A big-endian value, as the GameCube's textures and palettes hold them, in the host's byte order: swapped on a
+// little-endian host, and kept as it is on a big-endian one such as the Xbox 360.
+template <typename T>
+ALWAYS_INLINE constexpr T from_big_endian(T val) noexcept {
+  return to_big_endian(val);
+}
+
 template <typename T>
   requires(std::is_trivially_copyable_v<T>)
 ALWAYS_INLINE T unaligned_load(const void* ptr) noexcept {

@@ -327,7 +327,9 @@ struct TextureDecoderC14X2 {
   static constexpr uint32_t BlockWidth = 4;
   static constexpr uint32_t BlockHeight = 4;
 
-  static void decode_texel(Target* target, const Source* in, const uint32_t x) { target[x] = bswap(in[x]) & 0x3fff; }
+  static void decode_texel(Target* target, const Source* in, const uint32_t x) {
+    target[x] = from_big_endian(in[x]) & 0x3fff;
+  }
 };
 
 struct TextureDecoderRGB565 {
@@ -339,7 +341,7 @@ struct TextureDecoderRGB565 {
   static constexpr uint32_t BlockHeight = 4;
 
   static void decode_texel(Target* target, const Source* in, const uint32_t x) {
-    const auto texel = bswap(in[x]);
+    const auto texel = from_big_endian(in[x]);
     target[x].r = ExpandTo8<5>(texel >> 11 & 0x1f);
     target[x].g = ExpandTo8<6>(texel >> 5 & 0x3f);
     target[x].b = ExpandTo8<5>(texel & 0x1f);
@@ -356,7 +358,7 @@ struct TextureDecoderRGB5A3 {
   static constexpr uint32_t BlockHeight = 4;
 
   static void decode_texel(Target* target, const Source* in, const uint32_t x) {
-    const auto texel = bswap(in[x]);
+    const auto texel = from_big_endian(in[x]);
     if ((texel & 0x8000) != 0) {
       target[x].r = ExpandTo8<5>(texel >> 10 & 0x1f);
       target[x].g = ExpandTo8<5>(texel >> 5 & 0x1f);
@@ -433,8 +435,8 @@ static ByteBuffer BuildRGBA8FromCMPR(uint32_t width, uint32_t height, uint32_t m
         for (uint32_t yb = 0; yb < 8; yb += 4) {
           for (uint32_t xb = 0; xb < 8; xb += 4) {
             // CMPR difference: Big-endian color1/2
-            const uint16_t color1 = bswap(*reinterpret_cast<const uint16_t*>(src));
-            const uint16_t color2 = bswap(*reinterpret_cast<const uint16_t*>(src + 2));
+            const uint16_t color1 = from_big_endian(*reinterpret_cast<const uint16_t*>(src));
+            const uint16_t color2 = from_big_endian(*reinterpret_cast<const uint16_t*>(src + 2));
             src += 4;
 
             // Fill in first two colors in color table.
