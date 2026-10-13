@@ -1,6 +1,7 @@
 // GLSL programs for a GX shader config, after gx/shader.cpp's WGSL in the form xost compiles; glsl.hpp has the
-// bindings they read. Configs needing what xost doesn't compile yet are refused: matrices picked per vertex,
-// lighting, fog, indirect texturing, and normal-based texgens (vulkan4xenon's ROADMAP.md, milestone 11).
+// bindings they read. Configs needing what these programs don't express yet are refused: lines and points, emboss,
+// binormal and tangent texgens, and more interpolants than xost gives a program (vulkan4xenon's ROADMAP.md, milestone
+// 11).
 #include "glsl.hpp"
 
 #include "../gfx/hash.hpp"
@@ -39,8 +40,6 @@ struct Plan {
 // in the order make_plan finds them.
 using Needs = std::vector<std::string>;
 
-constexpr bool is_texmtx_attr(u32 attr) noexcept { return attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX; }
-
 bool uses_texture_sample(const gx::TevStage& stage) noexcept {
   if (stage.texMapId == GX_TEXMAP_NULL) {
     return false;
@@ -61,27 +60,6 @@ std::string join(const std::vector<std::string>& items, std::string_view separat
     joined += item;
   }
   return joined;
-}
-
-template <size_t N>
-std::string_view name_of(const std::array<std::string_view, N>& names, u32 value) noexcept {
-  return value < N ? names[value] : "?"sv;
-}
-
-// The fog's kind, from the type's low three bits, bit 3 making it orthographic (gx/shader.cpp), and whether it's
-// adjusted by range.
-std::string fog_need(const gx::ShaderConfig& config) {
-  static constexpr std::array Kinds{"?"sv, "?"sv, "LIN"sv, "?"sv, "EXP"sv, "EXP2"sv, "REVEXP"sv, "REVEXP2"sv};
-  return fmt::format("fog ({} {}{})", (config.fogType & 0x08) != 0 ? "orthographic"sv : "perspective"sv,
-                     name_of(Kinds, config.fogType & 0x07), config.fogRangeEnabled ? ", range"sv : ""sv);
-}
-
-// A lit channel as GXSetChanCtrl sets it.
-std::string lit_channel(std::string_view name, const gx::ColorChannelConfig& cc) {
-  static constexpr std::array DiffuseFns{"DF_NONE"sv, "DF_SIGN"sv, "DF_CLAMP"sv};
-  static constexpr std::array AttnFns{"AF_SPEC"sv, "AF_SPOT"sv, "AF_NONE"sv};
-  return fmt::format("{} lights {:#04x} {} {} ambient {}", name, cc.lightMask, name_of(DiffuseFns, cc.diffFn),
-                     name_of(AttnFns, cc.attnFn), cc.ambSrc == GX_SRC_VTX ? "VTX"sv : "REG"sv);
 }
 
 std::mutex s_refusedLock;
@@ -119,58 +97,15 @@ bool make_plan(const gx::ShaderConfig& config, Plan& plan, Needs& needs) {
   if (config.attrs[GX_VA_POS].attrType == GX_NONE) {
     needs.push_back("no positions"s);
   }
-  std::vector<std::string> matrixIndices;
-  std::vector<std::string> components;
-  for (u32 attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7; ++attr) {
+  for (u32 attr = GX_VA_POS; attr <= GX_VA_TEX7; ++attr) {
     const auto& mapping = config.attrs[attr];
-    if (mapping.attrType == GX_NONE) {
-      continue;
-    }
-    if (attr == GX_VA_PNMTXIDX) {
-      matrixIndices.push_back("PNMTXIDX"s);
-    } else if (is_texmtx_attr(attr)) {
-      matrixIndices.push_back(fmt::format("TEX{}MTXIDX", attr - GX_VA_TEX0MTXIDX));
-    } else if (mapping.compType > (attr == GX_VA_CLR0 || attr == GX_VA_CLR1 ? GX_RGBA8 : GX_F32)) {
-      components.push_back(fmt::format("vertex attribute {} of component type {}", attr, mapping.compType));
+    if (mapping.attrType != GX_NONE &&
+        mapping.compType > (attr == GX_VA_CLR0 || attr == GX_VA_CLR1 ? GX_RGBA8 : GX_F32)) {
+      needs.push_back(fmt::format("vertex attribute {} of component type {}", attr, mapping.compType));
     }
   }
-  if (!matrixIndices.empty()) {
-    needs.push_back(fmt::format("matrices picked per vertex ({})", join(matrixIndices, " "sv)));
-  }
-  needs.insert(needs.end(), components.begin(), components.end());
   plan.info = gx::build_shader_info(config);
   const auto& info = plan.info;
-  if (info.usesFog) {
-    needs.push_back(fog_need(config));
-  }
-  std::vector<std::string> indStages;
-  for (u32 i = 0; i < config.tevStageCount; ++i) {
-    const auto& stage = config.tevStages[i];
-    if (stage.indTexMtxId != GX_ITM_OFF || stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF ||
-        stage.indTexAddPrev || stage.channelId == GX_ALPHA_BUMP || stage.channelId == GX_ALPHA_BUMPN) {
-      indStages.push_back(fmt::format("{}", i));
-    }
-  }
-  if (info.usedIndStages.any() || !indStages.empty()) {
-    needs.push_back(fmt::format("indirect texturing ({} indirect stages, TEV stages {})", info.usedIndStages.count(),
-                                indStages.empty() ? "none"s : join(indStages, " "sv)));
-  }
-  std::vector<std::string> lit;
-  for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
-    if (!info.sampledColorChannels.test(i)) {
-      continue;
-    }
-    if (config.colorChannels[i].lightingEnabled) {
-      lit.push_back(lit_channel(fmt::format("COLOR{}", i), config.colorChannels[i]));
-    }
-    if (config.colorChannels[i + GX_ALPHA0].lightingEnabled) {
-      lit.push_back(lit_channel(fmt::format("ALPHA{}", i), config.colorChannels[i + GX_ALPHA0]));
-    }
-  }
-  if (!lit.empty()) {
-    needs.push_back(fmt::format("lighting ({}{})", join(lit, ", "sv),
-                                config.attrs[GX_VA_NRM].attrType == GX_NONE ? ", no normals"sv : ""sv));
-  }
   for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
       plan.interpolants.push_back({fmt::format("cc{}", i), "vec4"sv});
@@ -200,6 +135,10 @@ bool make_plan(const gx::ShaderConfig& config, Plan& plan, Needs& needs) {
     } else {
       plan.interpolants.push_back({fmt::format("tex{}_uv", i), "vec2"sv});
     }
+  }
+  if (info.usesFog) {
+    // Clip z and w, for the fragment's depth: xost gives a fragment program no gl_FragCoord.z.
+    plan.interpolants.push_back({"fog_zw"s, "vec2"sv});
   }
   if (plan.interpolants.size() > MaxInterpolants) {
     needs.push_back(fmt::format("{} interpolants", plan.interpolants.size()));
@@ -249,8 +188,13 @@ std::string uniform_blocks(std::string_view program) {
   const auto all = pieces();
   for (u32 i = 0; i < gx::UniformPieceCount; ++i) {
     if (program.find(fmt::format("{}.", all[i].var)) != std::string_view::npos) {
-      blocks += fmt::format("layout(set = 0, binding = {}, std140) uniform {} {{{}\n}} {};\n", i, all[i].type,
-                            all[i].members, all[i].var);
+      std::string members = all[i].members;
+      // View's last member, declared only where it's read, so the programs that don't read it keep their text.
+      if (i == gx::UniformView && program.find("uview.depth_range") != std::string_view::npos) {
+        members += "\n    vec4 depth_range; // the render viewport's znear and zfar";
+      }
+      blocks += fmt::format("layout(set = 0, binding = {}, std140) uniform {} {{{}\n}} {};\n", i, all[i].type, members,
+                            all[i].var);
     }
   }
   return blocks;
@@ -260,6 +204,11 @@ std::string uniform_blocks(std::string_view program) {
 std::string mul3x4(std::string_view rows, u32 first, std::string_view v) {
   return fmt::format("vec3(dot({0}[{1}], {3}), dot({0}[{2}], {3}), dot({0}[{4}], {3}))", rows, first, first + 1, v,
                      first + 2);
+}
+
+// The same with its first row at an index the program works out, an int.
+std::string mul3x4_at(std::string_view rows, std::string_view first, std::string_view v) {
+  return fmt::format("vec3(dot({0}[{1}], {2}), dot({0}[{1} + 1], {2}), dot({0}[{1} + 2], {2}))", rows, first, v);
 }
 
 std::string input_name(GXAttr attr) {
@@ -274,6 +223,12 @@ std::string input_name(GXAttr attr) {
   }
   if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
     return fmt::format("in_tex{}_uv", attr - GX_VA_TEX0);
+  }
+  if (attr == GX_VA_PNMTXIDX) {
+    return "in_pnmtxidx"s;
+  }
+  if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
+    return fmt::format("in_tex{}mtxidx", attr - GX_VA_TEX0MTXIDX);
   }
   UNLIKELY FATAL("unhandled vtx attr {}", underlying(attr));
 }
@@ -293,29 +248,167 @@ std::string vtx_attr(const gx::ShaderConfig& config, GXAttr attr, std::array<boo
   return input_name(attr);
 }
 
-// The texgens' types and sources are ones make_plan lets through.
+// A light's vec4s in the lights piece: position, direction, colour, angle and distance coefficients.
+constexpr u32 LightVec4s = 5;
+
+// The sampled channels' lit halves, the colour or the alpha of a channel: each one's channel and whether it's the
+// alpha.
+std::vector<std::pair<u32, bool>> lit_channels(const gx::ShaderConfig& config, const gx::ShaderInfo& info) {
+  std::vector<std::pair<u32, bool>> lit;
+  for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
+    if (!info.sampledColorChannels.test(i)) {
+      continue;
+    }
+    for (const bool alpha : {false, true}) {
+      if (config.colorChannels[i + (alpha ? GX_ALPHA0 : 0)].lightingEnabled) {
+        lit.emplace_back(i, alpha);
+      }
+    }
+  }
+  return lit;
+}
+
+// A lit channel half as gx/shader.cpp's lighting_func lights it per vertex: its ambient colour plus each light the
+// config's mask names, unrolled, clamped and times its material colour, in the local cc<channel>[a]_lit, the colour's
+// vec4 or the alpha.
+struct LitHalf {
+  const gx::ColorChannelConfig* cc;
+  std::string name; // cc0, or cc0a for the alpha
+  bool alpha;
+  std::string sum;      // the running sum: the ambient colour, then each light's sum
+  std::string material; // the material colour's vec4 or alpha
+};
+
+// Light j's term of a lit half, added to its sum. light<j>_vec, _dist2, _dist and _dir and mv_nrm are the vertex
+// program's.
+void light_term(LitHalf& half, u32 j, std::string& body) {
+  const auto& cc = *half.cc;
+  const auto& name = half.name;
+  const u32 light = j * LightVec4s;
+  std::vector<std::string> factors;
+  if (cc.attnFn == GX_AF_SPOT) {
+    // The cosine as the WGSL clamps it, NaN-safe there by a select and here by the clamp's saturate, for a point
+    // light's unset direction.
+    body += fmt::format(
+        "\n    float {0}_cos{1} = clamp(dot(light{1}_dir, ulights.lights[{2}].xyz), 0.0, 1.0);"
+        "\n    float {0}_attn{1} = max(0.0, dot(ulights.lights[{3}].xyz, vec3(1.0, {0}_cos{1}, {0}_cos{1} * "
+        "{0}_cos{1}))"
+        " / dot(ulights.lights[{4}].xyz, vec3(1.0, light{1}_dist, light{1}_dist2)));",
+        name, j, light + 1, light + 3, light + 4);
+    factors.push_back(fmt::format("{}_attn{}", name, j));
+  } else if (cc.attnFn == GX_AF_SPEC) {
+    body += fmt::format(
+        "\n    float {0}_spec{1} = clamp(dot(mv_nrm, ulights.lights[{2}].xyz), 0.0, 1.0) * step(0.0, dot(mv_nrm,"
+        " light{1}_dir));"
+        "\n    vec3 {0}_terms{1} = vec3(1.0, {0}_spec{1}, {0}_spec{1} * {0}_spec{1});"
+        "\n    float {0}_attn{1} = max(0.0, dot(ulights.lights[{3}].xyz, {0}_terms{1}) / max(0.0, dot({4},"
+        " {0}_terms{1})));",
+        name, j, light + 1, light + 3,
+        cc.diffFn != GX_DF_NONE ? fmt::format("normalize(ulights.lights[{}].xyz)", light + 4)
+                                : fmt::format("ulights.lights[{}].xyz", light + 4));
+    factors.push_back(fmt::format("{}_attn{}", name, j));
+  }
+  if (cc.diffFn == GX_DF_SIGN) {
+    body += fmt::format("\n    float {0}_diff{1} = dot(light{1}_dir, mv_nrm);", name, j);
+    factors.push_back(fmt::format("{}_diff{}", name, j));
+  } else if (cc.diffFn == GX_DF_CLAMP) {
+    body += fmt::format("\n    float {0}_diff{1} = max(0.0, dot(light{1}_dir, mv_nrm));", name, j);
+    factors.push_back(fmt::format("{}_diff{}", name, j));
+  }
+  factors.push_back(fmt::format("ulights.lights[{}]{}", light + 2, half.alpha ? ".a"sv : ""sv));
+  body += fmt::format("\n    {} {}_sum{} = {} + {};", half.alpha ? "float"sv : "vec4"sv, name, j, half.sum,
+                      join(factors, " * "sv));
+  half.sum = fmt::format("{}_sum{}", name, j);
+}
+
+// The texgens' types and sources are ones make_plan lets through. Sets normalMatrix when the program reads the
+// current normal matrix from its push constant.
 void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bool, gx::MaxVtxAttr>& inputs,
-                 std::string& body) {
+                 std::string& body, bool& normalMatrix) {
   const auto& info = plan.info;
+  // A position matrix picked per vertex is read at its first row (decode.cpp's pnmtx_row); without one, the backend
+  // pushes the current one.
+  const bool perVertex = config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE;
+  if (perVertex) {
+    body += fmt::format("\n    int pnmtx = int({});", vtx_attr(config, GX_VA_PNMTXIDX, inputs));
+  }
   body += fmt::format(
       "\n    vec4 pos4 = vec4({}, 1.0);"
       "\n    vec4 mv_pos4 = vec4({}, 1.0);"
       "\n    vec4 clip_pos = vec4(dot(uview.proj[0], mv_pos4), dot(uview.proj[1], mv_pos4),"
       " dot(uview.proj[2], mv_pos4), dot(uview.proj[3], mv_pos4));"
       "\n    gl_Position = clip_pos * vec4(1.0, -1.0, 1.0, 1.0);",
-      vtx_attr(config, GX_VA_POS, inputs), mul3x4("upush.pos_mtx"sv, 0, "pos4"sv));
+      vtx_attr(config, GX_VA_POS, inputs),
+      perVertex ? mul3x4_at("upos.mtx"sv, "pnmtx"sv, "pos4"sv) : mul3x4("upush.pos_mtx"sv, 0, "pos4"sv));
 
-  // Unlit channels: the colour from one material source, the alpha from the alpha channel's.
+  // A channel's colour or alpha from its material source, or its ambient and material sources when it's lit.
+  const auto source = [&](u32 channel, GXColorSrc src, u32 slot) {
+    return src == GX_SRC_VTX ? vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + channel), inputs)
+                             : fmt::format("uview.channel_colors[{}]", channel * 4 + slot);
+  };
+  std::vector<LitHalf> halves;
+  bool normal = false;
+  u32 lights = 0;
+  for (const auto& [channel, alpha] : lit_channels(config, info)) {
+    const auto& cc = config.colorChannels[channel + (alpha ? GX_ALPHA0 : 0)];
+    const u32 slot = alpha ? 2 : 0;
+    const auto part = alpha ? ".a"sv : ""sv;
+    halves.push_back({&cc, fmt::format("cc{}{}", channel, alpha ? "a"sv : ""sv), alpha,
+                      fmt::format("{}{}", source(channel, cc.ambSrc, slot), part),
+                      fmt::format("{}{}", source(channel, cc.matSrc, slot + 1), part)});
+    normal = normal || (cc.lightMask != 0 && (cc.diffFn != GX_DF_NONE || cc.attnFn == GX_AF_SPEC));
+    lights |= cc.lightMask;
+  }
+  // The normal in view space, normalized unless it's nearly zero, as the WGSL keeps it: picked by a factor of 1 or 0,
+  // as glslang makes a branch of a ?: of calls, which xost doesn't lower in a vertex program.
+  if (normal) {
+    normalMatrix = !perVertex;
+    body += fmt::format(
+        "\n    vec4 nrm4 = vec4({}, 0.0);"
+        "\n    vec3 nrm_tmp = {};"
+        "\n    float nrm_len2 = dot(nrm_tmp, nrm_tmp);"
+        "\n    vec3 mv_nrm = nrm_tmp * mix(1.0, inversesqrt(max(nrm_len2, 1e-10)), step(1e-10, nrm_len2));",
+        vtx_attr(config, GX_VA_NRM, inputs),
+        perVertex ? mul3x4_at("unrm.mtx"sv, "pnmtx"sv, "nrm4"sv) : mul3x4("upush.nrm_mtx"sv, 0, "nrm4"sv));
+  }
+  // The lights in turn, each one's vectors then its term in each half that sums it, so a light's vectors are dead
+  // before the next light's: xost gives each value a register till it's dead.
+  for (u32 j = 0; j < GX::MaxLights; ++j) {
+    if ((lights & 1u << j) == 0) {
+      continue;
+    }
+    body += fmt::format(
+        "\n    vec3 light{0}_vec = ulights.lights[{1}].xyz - mv_pos4.xyz;"
+        "\n    float light{0}_dist2 = dot(light{0}_vec, light{0}_vec);"
+        "\n    float light{0}_dist = sqrt(light{0}_dist2);"
+        "\n    vec3 light{0}_dir = light{0}_vec / light{0}_dist;",
+        j, j * LightVec4s);
+    for (auto& half : halves) {
+      if ((half.cc->lightMask & 1u << j) != 0) {
+        light_term(half, j, body);
+      }
+    }
+  }
+  for (const auto& half : halves) {
+    body += fmt::format("\n    {0} {1}_lit = {2} * clamp({3}, 0.0, 1.0);", half.alpha ? "float"sv : "vec4"sv, half.name,
+                        half.material, half.sum);
+  }
+
+  // Each channel's colour, then its alpha from the alpha channel: a material source, or lit.
   for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (!info.sampledColorChannels.test(i)) {
       continue;
     }
-    const auto material = [&](const gx::ColorChannelConfig& cc, u32 slot) {
-      return cc.matSrc == GX_SRC_VTX ? vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + i), inputs)
-                                     : fmt::format("uview.channel_colors[{}]", i * 4 + slot);
+    const auto half = [&](bool alpha) {
+      const auto& cc = config.colorChannels[i + (alpha ? GX_ALPHA0 : 0)];
+      if (!cc.lightingEnabled) {
+        return fmt::format("{}{}", source(i, cc.matSrc, alpha ? 3 : 1), alpha ? ".a"sv : ".rgb"sv);
+      }
+      return alpha ? fmt::format("cc{}a_lit", i) : fmt::format("cc{}_lit.rgb", i);
     };
-    body += fmt::format("\n    vec4 cc{0} = vec4({1}.rgb, {2}.a);\n    out_cc{0} = cc{0};", i,
-                        material(config.colorChannels[i], 1), material(config.colorChannels[i + GX_ALPHA0], 3));
+    const auto color = half(false);
+    const auto alpha = half(true);
+    body += fmt::format("\n    vec4 cc{0} = vec4({1}, {2});\n    out_cc{0} = cc{0};", i, color, alpha);
   }
 
   for (u32 i = 0; i < info.sampledTexCoords.size(); ++i) {
@@ -342,7 +435,20 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
     const auto tc = fmt::format("tc{}", i);
     std::string value;
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
-      if (tcg.mtx == GX_IDENTITY) {
+      if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+        // A matrix picked per vertex: a position matrix below the slots past MaxPnMtx, a texture matrix from them, as
+        // the WGSL picks it; each index held in its array, as both are read. The attribute is the slot's first row
+        // (decode.cpp), and the pick's factors are 1 and 0, so the sum is the matrix picked.
+        const auto row = vtx_attr(config, static_cast<GXAttr>(GX_VA_TEX0MTXIDX + i), inputs);
+        body += fmt::format(
+            "\n    int tc{0}_pos_row = int(min({1}, {2}.0));"
+            "\n    int tc{0}_tex_row = int(clamp({1} - {3}.0, 0.0, {4}.0));"
+            "\n    float tc{0}_is_tex = step({3}.0, {1});",
+            i, row, (gx::MaxPnMtx - 1) * 3, gx::MaxPnMtx * 3, (gx::MaxTexMtx - 1) * 3);
+        value = fmt::format("{} * (1.0 - tc{}_is_tex) + {} * tc{}_is_tex",
+                            mul3x4_at("upos.mtx"sv, fmt::format("tc{}_pos_row", i), tc), i,
+                            mul3x4_at("uview.tex_mtx"sv, fmt::format("tc{}_tex_row", i), tc), i);
+      } else if (tcg.mtx == GX_IDENTITY) {
         value = fmt::format("{}.xyz", tc);
       } else if (tcg.mtx >= GX_TEXMTX0) {
         value = mul3x4("uview.tex_mtx"sv, (tcg.mtx - GX_TEXMTX0) / 3 * 3, tc);
@@ -376,6 +482,9 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
       body += fmt::format("\n    out_tex{}_uv = {}.xy;", i, projected);
     }
   }
+  if (info.usesFog) {
+    body += "\n    out_fog_zw = clip_pos.zw;";
+  }
 }
 
 // Attribute locations as xost gives them usages: position 0, colour 0 1, texture coordinates from 2 (resolve.py), and
@@ -402,6 +511,11 @@ VertexLayout make_layout(const std::array<bool, gx::MaxVtxAttr>& inputs) {
   if (inputs[GX_VA_CLR1]) {
     add(GX_VA_CLR1, location++, AttrFormat::U8x4, 4);
   }
+  for (u32 attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7MTXIDX; ++attr) {
+    if (inputs[attr]) {
+      add(static_cast<GXAttr>(attr), location++, AttrFormat::F32x1, 4);
+    }
+  }
   return layout;
 }
 
@@ -419,8 +533,11 @@ std::string_view input_type(AttrFormat format) {
   return {};
 }
 
-std::string vertex_source(const Plan& plan, const VertexLayout& layout, const std::string& body) {
-  std::string decls = "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n} upush;\n";
+std::string vertex_source(const Plan& plan, const VertexLayout& layout, const std::string& body, bool normalMatrix) {
+  std::string decls =
+      normalMatrix
+          ? "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n    vec4 nrm_mtx[3];\n} upush;\n"
+          : "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n} upush;\n";
   for (const auto& attribute : layout.attributes) {
     decls += fmt::format("layout(location = {}) in {} {};\n", attribute.location, input_type(attribute.format),
                          input_name(attribute.attr));
@@ -489,7 +606,7 @@ std::string konst_alpha(GXTevKAlphaSel sel) {
 // The program's fragment body for its TEV stages, and the final colour's locals.
 class Fragment {
 public:
-  Fragment(const gx::ShaderConfig& config, const gx::ShaderInfo& info) : m_config(config) {
+  Fragment(const gx::ShaderConfig& config, const gx::ShaderInfo& info) : m_config(config), m_fog(info.usesFog) {
     static constexpr std::array zero{"vec3(0.0)"sv, "0.0"sv};
     for (u32 i = 0; i < gx::MaxTevRegs; ++i) {
       if (info.loadsTevReg.test(i)) {
@@ -536,6 +653,10 @@ public:
     const Reg& alphaReg = m_regs[last.alphaOp.outReg];
     std::string color = colorReg.color;
     std::string alpha = alphaReg.alpha;
+    if (m_fog) {
+      fog(color);
+      color = "fog_color"s;
+    }
     if (!colorReg.colorNormalized) {
       m_body += fmt::format("\n    vec3 out_color = {};", overflow(color));
       color = "out_color"s;
@@ -563,6 +684,47 @@ private:
     CHECK(stage.texMapId >= GX_TEXMAP0 && stage.texMapId <= GX_TEXMAP7, "invalid texture {} for stage {}",
           underlying(stage.texMapId), idx);
     return fmt::format("sampled{}", idx);
+  }
+
+  static bool is_alpha_bump(GXChannelID id) noexcept { return id == GX_ALPHA_BUMP || id == GX_ALPHA_BUMPN; }
+
+  // The WGSL's alpha_bump_sel: the bits of one of the stage's indirect texture components its format keeps, as
+  // tev_mask_expr masks them, u32(v) & mask. v is 0 to 255 and the masks keep the bits from the format's lowest, so
+  // the masked value is v's whole part less its remainder by that bit. GX_ALPHA_BUMPN scales it to 1.
+  std::string alpha_bump(const gx::TevStage& stage) const {
+    if (stage.indTexStage >= m_config.numIndStages || stage.indTexAlphaSel == GX_ITBA_OFF) {
+      return "0.0"s;
+    }
+    std::string_view comp;
+    switch (stage.indTexAlphaSel) {
+      DEFAULT_FATAL("invalid indTexAlphaSel {}", underlying(stage.indTexAlphaSel));
+    case GX_ITBA_S:
+      comp = "x"sv;
+      break;
+    case GX_ITBA_T:
+      comp = "y"sv;
+      break;
+    case GX_ITBA_U:
+      comp = "z"sv;
+      break;
+    }
+    u32 lowest = 8;
+    switch (stage.indTexFormat) {
+      DEFAULT_FATAL("invalid indirect format {}", underlying(stage.indTexFormat));
+    case GX_ITF_8:
+    case GX_ITF_3:
+      lowest = 8; // 0xF8
+      break;
+    case GX_ITF_5:
+      lowest = 32; // 0xE0
+      break;
+    case GX_ITF_4:
+      lowest = 16; // 0xF0
+      break;
+    }
+    const auto value = fmt::format("floor(ind_tex{}.{})", underlying(stage.indTexStage), comp);
+    const auto masked = fmt::format("(({0} - mod({0}, {1}.0)) / 255.0)", value, lowest);
+    return stage.channelId == GX_ALPHA_BUMPN ? fmt::format("({} * (255.0 / 248.0))", masked) : masked;
   }
 
   std::string color_value(u32 idx, const gx::TevStage& stage, GXTevColorArg arg) const {
@@ -597,6 +759,9 @@ private:
       if (stage.channelId == GX_COLOR_ZERO || stage.channelId == GX_COLOR_NULL) {
         return "vec3(0.0)"s;
       }
+      if (is_alpha_bump(stage.channelId)) {
+        return fmt::format("vec3({})", alpha_bump(stage));
+      }
       const auto& swap = m_config.tevSwapTable[stage.tevSwapRas];
       return fmt::format("in_cc{}.{}{}{}", gx::color_channel(stage.channelId), chan_comp(swap.red),
                          chan_comp(swap.green), chan_comp(swap.blue));
@@ -604,6 +769,9 @@ private:
     case GX_CC_RASA: {
       if (stage.channelId == GX_COLOR_ZERO || stage.channelId == GX_COLOR_NULL) {
         return "vec3(0.0)"s;
+      }
+      if (is_alpha_bump(stage.channelId)) {
+        return fmt::format("vec3({})", alpha_bump(stage));
       }
       const auto& swap = m_config.tevSwapTable[stage.tevSwapRas];
       return fmt::format("vec3(in_cc{}.{})", gx::color_channel(stage.channelId), chan_comp(swap.alpha));
@@ -637,6 +805,9 @@ private:
     case GX_CA_RASA: {
       if (stage.channelId == GX_COLOR_ZERO || stage.channelId == GX_COLOR_NULL) {
         return "0.0"s;
+      }
+      if (is_alpha_bump(stage.channelId)) {
+        return alpha_bump(stage);
       }
       const auto& swap = m_config.tevSwapTable[stage.tevSwapRas];
       return fmt::format("in_cc{}.{}", gx::color_channel(stage.channelId), chan_comp(swap.alpha));
@@ -852,10 +1023,243 @@ private:
     return true;
   }
 
+  // The WGSL's fog, mixed into the stages' colour as fog_color. The fragment's depth comes from clip z and w, as the
+  // GPU's viewport maps it, and range fog's factor is worked out for the fragment's column from the fog's range_k and
+  // centre, as gx/command_processor.cpp's build_fog_range_lut does for each column: the WGSL reads it from that table.
+  // Linear interpolation between neighbouring range_k is a sum of each one by its distance from the index, where 1 or
+  // less; range_k's two after the tenth repeat it (shader_info.cpp), and are past any index.
+  void fog(std::string_view color) {
+    m_body += gx::UseReversedZ ? "\n    // Fog"
+                                 "\n    float fog_ndc = in_fog_zw.x / in_fog_zw.y;"
+                                 "\n    float fog_depth = uview.depth_range.y - fog_ndc * (uview.depth_range.y -"
+                                 " uview.depth_range.x);"sv
+                               : "\n    // Fog"
+                                 "\n    float fog_ndc = in_fog_zw.x / in_fog_zw.y;"
+                                 "\n    float fog_depth = uview.depth_range.x + fog_ndc * (uview.depth_range.y -"
+                                 " uview.depth_range.x);"sv;
+    m_body += (m_config.fogType & 0x08) != 0
+                  ? "\n    float fog_base = uview.fog[1].x * fog_depth;"sv
+                  : "\n    float fog_base = uview.fog[1].x / (uview.fog[1].y - fog_depth);"sv;
+    if (m_config.fogRangeEnabled) {
+      m_body +=
+          "\n    float fog_offset = gl_FragCoord.x / uview.viewport_sizes.x * 2.0 - 1.0 - uview.fog[1].w;"
+          "\n    float fog_index = clamp(9.0 - abs(fog_offset) * 9.0, 0.0, 9.0);"
+          "\n    vec4 fog_k0 = max(vec4(1.0) - abs(vec4(fog_index) - vec4(0.0, 1.0, 2.0, 3.0)), vec4(0.0));"
+          "\n    vec4 fog_k1 = max(vec4(1.0) - abs(vec4(fog_index) - vec4(4.0, 5.0, 6.0, 7.0)), vec4(0.0));"
+          "\n    vec4 fog_k2 = max(vec4(1.0) - abs(vec4(fog_index) - vec4(8.0, 9.0, 10.0, 11.0)), vec4(0.0));"
+          "\n    float fog_k = max(dot(uview.fog[2], fog_k0) + dot(uview.fog[3], fog_k1) + dot(uview.fog[4], fog_k2),"
+          " 0.000001);"
+          "\n    float fog_f = clamp(fog_base * (sqrt(fog_offset * fog_offset + fog_k * fog_k) / fog_k) -"
+          " uview.fog[1].z, 0.0, 1.0);"sv;
+    } else {
+      m_body += "\n    float fog_f = clamp(fog_base - uview.fog[1].z, 0.0, 1.0);"sv;
+    }
+    switch (m_config.fogType & 0x07) {
+      DEFAULT_FATAL("invalid fog type {}", m_config.fogType);
+    case GX_FOG_PERSP_LIN:
+      m_body += "\n    float fog_z = fog_f;"sv;
+      break;
+    case GX_FOG_PERSP_EXP:
+      m_body += "\n    float fog_z = 1.0 - exp2(-8.0 * fog_f);"sv;
+      break;
+    case GX_FOG_PERSP_EXP2:
+      m_body += "\n    float fog_z = 1.0 - exp2(-8.0 * fog_f * fog_f);"sv;
+      break;
+    case GX_FOG_PERSP_REVEXP:
+      m_body += "\n    float fog_z = exp2(-8.0 * (1.0 - fog_f));"sv;
+      break;
+    case GX_FOG_PERSP_REVEXP2:
+      m_body += "\n    float fog_g = 1.0 - fog_f;\n    float fog_z = exp2(-8.0 * fog_g * fog_g);"sv;
+      break;
+    }
+    m_body += fmt::format("\n    vec3 fog_color = mix({}, uview.fog[0].rgb, clamp(fog_z, 0.0, 1.0));", color);
+  }
+
   const gx::ShaderConfig& m_config;
+  bool m_fog;
   std::array<Reg, gx::MaxTevRegs> m_regs;
   std::string m_body;
 };
+
+std::string_view ind_scale(GXIndTexScale scale) {
+  switch (scale) {
+    DEFAULT_FATAL("unhandled indirect scale {}", underlying(scale));
+  case GX_ITS_1:
+    return "1.0"sv;
+  case GX_ITS_2:
+    return "(1.0 / 2.0)"sv;
+  case GX_ITS_4:
+    return "(1.0 / 4.0)"sv;
+  case GX_ITS_8:
+    return "(1.0 / 8.0)"sv;
+  case GX_ITS_16:
+    return "(1.0 / 16.0)"sv;
+  case GX_ITS_32:
+    return "(1.0 / 32.0)"sv;
+  case GX_ITS_64:
+    return "(1.0 / 64.0)"sv;
+  case GX_ITS_128:
+    return "(1.0 / 128.0)"sv;
+  case GX_ITS_256:
+    return "(1.0 / 256.0)"sv;
+  }
+}
+
+// Each indirect stage the TEV stages use, its texture sampled once, as the WGSL samples it: at its coordinates scaled
+// first by the texture coordinate scale, then by the stage's, back to the texture's own; its components 0 to 255, in
+// the order alpha, blue, green.
+void indirect_textures(const gx::ShaderConfig& config, const gx::ShaderInfo& info, std::string& pre) {
+  for (u32 n = 0; n < info.usedIndStages.size(); ++n) {
+    if (!info.usedIndStages.test(n)) {
+      continue;
+    }
+    const auto& indStage = config.indStages[n];
+    const u32 coord = underlying(indStage.texCoordId);
+    const u32 map = underlying(indStage.texMapId);
+    pre += fmt::format(
+        "\n    // Indirect stage {0}"
+        "\n    vec3 ind_tex{0} = 255.0 * texture(tex{1}, tex{2}_uv * umat.texcoord_scale[{2}].xy * vec2({3}, {4}) /"
+        " umat.tex_size_bias[{1}].xy).abg;",
+        n, map, coord, ind_scale(indStage.scaleS), ind_scale(indStage.scaleT));
+  }
+}
+
+// The WGSL's % on f32, which truncates: a wrap of a coordinate, in texels.
+std::string ind_wrap(GXIndTexWrap wrap, const std::string& coord) {
+  switch (wrap) {
+    DEFAULT_FATAL("unhandled indirect wrap {}", underlying(wrap));
+  case GX_ITW_OFF:
+    return coord;
+  case GX_ITW_256:
+  case GX_ITW_128:
+  case GX_ITW_64:
+  case GX_ITW_32:
+  case GX_ITW_16: {
+    static constexpr std::array Sizes{0, 256, 128, 64, 32, 16};
+    const int size = Sizes[wrap];
+    return fmt::format("({0} - {1}.0 * trunc({0} / {1}.0))", coord, size);
+  }
+  case GX_ITW_0:
+    return "0.0"s;
+  }
+}
+
+// TEV stage idx's texture coordinate from indirect texturing, as the WGSL works it out: the stage's indirect
+// coordinate through its format, bias and matrix, added to its own coordinate, wrapped, and to the running coordinate
+// texCoord before it (the WGSL's t_TexCoord) where the stage adds to it. The uv the stage samples its texture at, or
+// empty where it samples at its own coordinate.
+std::string indirect_coord(const gx::ShaderConfig& config, const gx::ShaderInfo& info, u32 idx, std::string& texCoord,
+                           std::string& pre) {
+  const auto& stage = config.tevStages[idx];
+  const bool needsIndirectCoord = stage.indTexMtxId != GX_ITM_OFF;
+  const bool hasIndirectStage = stage.indTexStage < config.numIndStages;
+  const bool needsTevTexCoord =
+      needsIndirectCoord || stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF || stage.indTexAddPrev;
+  if (!needsTevTexCoord) {
+    return {};
+  }
+  const bool hasBaseTexture = stage.texMapId != GX_TEXMAP_NULL;
+  const bool hasBaseCoord = stage.texCoordId != GX_TEXCOORD_NULL && hasBaseTexture;
+  const u32 coord = underlying(stage.texCoordId);
+  pre += fmt::format("\n    // TEV stage {} indirect", idx);
+
+  // The indirect matrix's offset, in texels.
+  std::string offset;
+  if (needsIndirectCoord && hasIndirectStage) {
+    std::string_view shift;
+    switch (stage.indTexFormat) {
+      DEFAULT_FATAL("unhandled indirect format {}", underlying(stage.indTexFormat));
+    case GX_ITF_8:
+      break;
+    case GX_ITF_5:
+      shift = " / 8.0"sv;
+      break;
+    case GX_ITF_4:
+      shift = " / 16.0"sv;
+      break;
+    case GX_ITF_3:
+      shift = " / 32.0"sv;
+      break;
+    }
+    const u32 indStage = underlying(stage.indTexStage);
+    if (shift.empty()) {
+      pre += fmt::format("\n    vec3 ind{0}_coord = ind_tex{1};", idx, indStage);
+    } else {
+      pre += fmt::format("\n    vec3 ind{0}_coord = floor(ind_tex{1}{2});", idx, indStage, shift);
+    }
+    std::string indCoord = fmt::format("ind{}_coord", idx);
+    if (stage.indTexBiasSel != GX_ITB_NONE) {
+      const auto sel = stage.indTexBiasSel;
+      const bool s = sel == GX_ITB_S || sel == GX_ITB_ST || sel == GX_ITB_SU || sel == GX_ITB_STU;
+      const bool t = sel == GX_ITB_T || sel == GX_ITB_ST || sel == GX_ITB_TU || sel == GX_ITB_STU;
+      const bool u = sel == GX_ITB_U || sel == GX_ITB_SU || sel == GX_ITB_TU || sel == GX_ITB_STU;
+      pre += fmt::format("\n    vec3 ind{0}_biased = ind{0}_coord + vec3({1}, {2}, {3}) * {4};", idx,
+                         s ? "1.0"sv : "0.0"sv, t ? "1.0"sv : "0.0"sv, u ? "1.0"sv : "0.0"sv,
+                         stage.indTexFormat == GX_ITF_8 ? "-128.0"sv : "1.0"sv);
+      indCoord = fmt::format("ind{}_biased", idx);
+    }
+    if (stage.indTexMtxId >= GX_ITM_0 && stage.indTexMtxId <= GX_ITM_2) {
+      // Static 2x3 matrix: dot(mat_row, vec3(S, T, U)) times its scale.
+      const u32 mtx = stage.indTexMtxId - GX_ITM_0;
+      pre += fmt::format("\n    vec4 ind{0}_c0 = uview.ind_mtx[{1}];\n    vec4 ind{0}_c1 = uview.ind_mtx[{2}];", idx,
+                         mtx * 2, mtx * 2 + 1);
+      offset = fmt::format(
+          "vec2(dot(vec3(ind{0}_c0.xz, ind{0}_c1.x), {1}), dot(vec3(ind{0}_c0.yw, ind{0}_c1.y), {1})) * ind{0}_c1.z",
+          idx, indCoord);
+    } else if (stage.indTexMtxId >= GX_ITM_S0 && stage.indTexMtxId <= GX_ITM_S2 && hasBaseCoord) {
+      // Dynamic S: the scaled texture coordinate times the indirect S, by the matrix's scale over 256.
+      offset = fmt::format("tex{0}_uv * umat.texcoord_scale[{0}].xy * {1}.x * uview.ind_mtx[{2}].z / 256.0", coord,
+                           indCoord, (stage.indTexMtxId - GX_ITM_S0) * 2 + 1);
+    } else if (stage.indTexMtxId >= GX_ITM_T0 && stage.indTexMtxId <= GX_ITM_T2 && hasBaseCoord) {
+      offset = fmt::format("tex{0}_uv * umat.texcoord_scale[{0}].xy * {1}.y * uview.ind_mtx[{2}].z / 256.0", coord,
+                           indCoord, (stage.indTexMtxId - GX_ITM_T0) * 2 + 1);
+    }
+  }
+
+  // The stage's own coordinate, in texels unless nothing moves it, wrapped, then the offset added.
+  const bool useSimpleCoords = stage.indTexMtxId == GX_ITM_OFF && !stage.indTexAddPrev;
+  std::string base;
+  if (hasBaseCoord) {
+    if (useSimpleCoords) {
+      base = fmt::format("tex{}_uv", coord);
+    } else {
+      pre += fmt::format("\n    vec2 ind{0}_texel = tex{1}_uv * umat.texcoord_scale[{1}].xy;", idx, coord);
+      base = fmt::format("ind{}_texel", idx);
+    }
+  }
+  std::string wrapped = base;
+  if (!base.empty() && (stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF)) {
+    wrapped =
+        fmt::format("vec2({}, {})", ind_wrap(stage.indTexWrapS, base + ".x"), ind_wrap(stage.indTexWrapT, base + ".y"));
+  }
+  std::string coordExpr;
+  if (!wrapped.empty() && !offset.empty()) {
+    coordExpr = fmt::format("{} + ({})", wrapped, offset);
+  } else if (!wrapped.empty()) {
+    coordExpr = wrapped;
+  } else {
+    coordExpr = offset;
+  }
+  if (!info.usedIndStages.any() || coordExpr.empty()) {
+    return {};
+  }
+  if (stage.indTexAddPrev) {
+    pre += fmt::format("\n    vec2 tev_coord{} = {} + ({});", idx, texCoord, coordExpr);
+  } else {
+    pre += fmt::format("\n    vec2 tev_coord{} = {};", idx, coordExpr);
+  }
+  texCoord = fmt::format("tev_coord{}", idx);
+  if (!uses_texture_sample(stage) || !hasBaseTexture) {
+    return {};
+  }
+  if (useSimpleCoords) {
+    pre += fmt::format("\n    vec2 ind{}_uv = {};", idx, texCoord);
+  } else {
+    pre +=
+        fmt::format("\n    vec2 ind{}_uv = {} / umat.tex_size_bias[{}].xy;", idx, texCoord, underlying(stage.texMapId));
+  }
+  return fmt::format("ind{}_uv", idx);
+}
 
 // False when the alpha compare discards every fragment.
 bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::string& source) {
@@ -871,14 +1275,17 @@ bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::stri
       pre += fmt::format("\n    vec2 tex{0}_uv = in_tex{0}_uv;", i);
     }
   }
+  indirect_textures(config, info, pre);
+  std::string texCoord = "vec2(0.0)"s;
   for (u32 i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
+    const auto uv = indirect_coord(config, info, i, texCoord, pre);
     if (!uses_texture_sample(stage)) {
       continue;
     }
     // xost takes only a bias known when it compiles, so the material's LOD bias goes in the sampler.
-    pre += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, tex{2}_uv);", i, underlying(stage.texMapId),
-                       underlying(stage.texCoordId));
+    pre += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, {2});", i, underlying(stage.texMapId),
+                       uv.empty() ? fmt::format("tex{}_uv", underlying(stage.texCoordId)) : uv);
   }
   Fragment fragment(config, info);
   fragment.stages();
@@ -913,14 +1320,14 @@ Programs build_programs(const gx::ShaderConfig& config) {
   Programs programs;
   std::array<bool, gx::MaxVtxAttr> inputs{};
   std::string body;
-  vertex_body(config, plan, inputs, body);
+  vertex_body(config, plan, inputs, body, programs.normalMatrix);
   if (!fragment_source(config, plan, programs.fragment)) {
     // Nothing is drawn; xost compiles no program that only discards, and the backend skips such a draw.
     refuse(config, {"an alpha compare that discards every fragment"s});
     return {};
   }
   programs.layout = make_layout(inputs);
-  programs.vertex = vertex_source(plan, programs.layout, body);
+  programs.vertex = vertex_source(plan, programs.layout, body, programs.normalMatrix);
   return programs;
 }
 } // namespace aurora::gfx::vulkan4xenon::glsl

@@ -239,8 +239,8 @@ bool create_layouts() noexcept {
     return false;
   }
   const std::array gxSets{g_uniformSetLayout, g_textureSetLayout};
-  // The GX programs' current position matrix, the clear's colour, and a copy's source rectangle.
-  return create_layout(gxSets, VK_SHADER_STAGE_VERTEX_BIT, sizeof(Mat3x4<float>), g_gxLayout) &&
+  // The GX programs' current position and normal matrices, the clear's colour, and a copy's source rectangle.
+  return create_layout(gxSets, VK_SHADER_STAGE_VERTEX_BIT, 2 * sizeof(Mat3x4<float>), g_gxLayout) &&
          create_layout({}, VK_SHADER_STAGE_FRAGMENT_BIT, 16, g_clearLayout) &&
          create_layout(std::span{&g_sourceSetLayout, 1}, VK_SHADER_STAGE_VERTEX_BIT, 16, g_copyLayout);
 }
@@ -491,6 +491,7 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& confi
   }
   pipeline->vertexLayout = std::move(programs.layout);
   pipeline->decodeFormat = decode::decode_format(pipeline->shaderConfig, pipeline->vertexLayout);
+  pipeline->normalMatrix = programs.normalMatrix;
   std::vector<VkVertexInputAttributeDescription> attributes;
   for (const auto& attribute : pipeline->vertexLayout.attributes) {
     attributes.push_back({

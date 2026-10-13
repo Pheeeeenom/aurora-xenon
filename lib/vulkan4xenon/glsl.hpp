@@ -7,14 +7,16 @@
 //   DrawData::uniformOffsets[i]. A program declares only the pieces it reads, each as std140 vec4s: a matrix is its
 //   rows, as Mat3x4 and Mat4x4 hold them.
 // - Set 1 is the 8 GX texture maps, binding i GX_TEXMAPi, sampled by the fragment program alone.
-// - The vertex stage's push constant is the current position matrix's three rows, 48 bytes: xost reads no uniform
-//   array at an index known only at run time (its docs/xsc.md), so the backend pushes the matrix the draw selects.
+// - The vertex stage's push constant is the current position matrix's three rows, 48 bytes, then, where Programs'
+//   normalMatrix says, the current normal matrix's, 48 more: the matrices the draw selects. A matrix picked per vertex
+//   is read from its piece at its first row, a vertex attribute (decode.cpp), as xost reads a block's array at an
+//   index known only at run time (its docs/xsc.md).
 // - One vertex stream, binding 0, in the layout below. Locations follow xost's usages: position at 0, colour 0 at 1,
 //   texture coordinates from 2 (xost:xsc/resolve.py).
 // - The vertex program writes the WGSL's position with y negated, Vulkan's clip space.
 //
 // The programs are written in the GLSL xost compiles (its docs/xsc.md): each local assigned once, no function calls,
-// no unary minus, and at most one discard, on one comparison.
+// no unary minus but on a literal, and at most one discard, on one comparison.
 #include "../gx/pipeline.hpp"
 
 #include <cstdint>
@@ -55,6 +57,8 @@ struct Programs {
   VertexLayout layout;  // exactly the attributes the vertex program reads
   std::string vertex;   // GLSL
   std::string fragment; // GLSL
+  // The vertex program reads the current normal matrix, pushed after the position matrix.
+  bool normalMatrix = false;
 };
 
 // All empty for a config these programs don't express yet, with all it needs logged once, under the config's hash.

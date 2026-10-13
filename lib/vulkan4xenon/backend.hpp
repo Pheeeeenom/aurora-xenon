@@ -195,6 +195,8 @@ struct Pipeline {
   gx::ShaderConfig shaderConfig{};
   vulkan4xenon::decode::VertexLayout vertexLayout;
   uint64_t decodeFormat = 0;
+  // The vertex program reads the current normal matrix, pushed after the position matrix (glsl.hpp).
+  bool normalMatrix = false;
 
   Pipeline() noexcept = default;
   Pipeline(const Pipeline&) = delete;

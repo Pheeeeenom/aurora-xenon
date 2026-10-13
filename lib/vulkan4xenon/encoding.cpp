@@ -103,8 +103,9 @@ PipelineRef g_currentPipeline = UINTPTR_MAX;
 std::shared_ptr<backend::Pipeline> g_currentPipelineObject;
 VkPipelineLayout g_currentLayout = VK_NULL_HANDLE;
 VkDescriptorSet g_boundTextures = VK_NULL_HANDLE;
-// The position matrix last pushed, by its place in the frame's uniform data.
+// The position and normal matrices last pushed, by their places in the frame's uniform data.
 const uint8_t* g_pushedMatrix = nullptr;
+const uint8_t* g_pushedNormalMatrix = nullptr;
 // The texture set last looked up, by its ref: consecutive draws often share one, and texture_set takes a lock and a
 // lookup. A ref's set stays the same while a pass is recorded; expire_texture_sets runs after the frame's last.
 std::optional<BindGroupRef> g_lookedUpRef;
@@ -365,6 +366,7 @@ void use_pipeline(PipelineRef ref, std::shared_ptr<backend::Pipeline> pipeline, 
     g_currentLayout = pipeline->layout;
     g_boundTextures = VK_NULL_HANDLE;
     g_pushedMatrix = nullptr;
+    g_pushedNormalMatrix = nullptr;
   }
   g_currentPipeline = ref;
   g_currentPipelineObject = std::move(pipeline);
@@ -388,6 +390,7 @@ void reset_bindings() noexcept {
   g_currentLayout = VK_NULL_HANDLE;
   g_boundTextures = VK_NULL_HANDLE;
   g_pushedMatrix = nullptr;
+  g_pushedNormalMatrix = nullptr;
   g_lookedUpRef.reset();
 }
 
@@ -557,6 +560,16 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
   if (g_pushedMatrix != matrix) {
     vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Mat3x4<float>), matrix);
     g_pushedMatrix = matrix;
+  }
+  // A lit program's current normal matrix, after it: the normal matrices piece is there for every lit draw.
+  if (pipeline.normalMatrix) {
+    const uint8_t* normal = state.uniformData.get() + data.uniformOffsets[gx::UniformNrmMtx] +
+                            size_t{data.immediateData.currentPnMtx} * sizeof(Mat3x4<float>);
+    if (g_pushedNormalMatrix != normal) {
+      vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, sizeof(Mat3x4<float>), sizeof(Mat3x4<float>),
+                         normal);
+      g_pushedNormalMatrix = normal;
+    }
   }
   vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexCache.buffer, &offset);
   if (draw.indices != NoIndices) {

@@ -34,6 +34,10 @@ struct Address {
 // Zero past the end of the pool, as the WGSL's load_word returns past its buffer.
 u32 load_u8(Pool pool, size_t offset) noexcept { return offset < pool.size() ? pool[offset] : 0; }
 
+// A position matrix index's first row, the program's index into its rows (glsl.hpp): the WGSL's index, the byte over
+// 3, held to the last matrix as Dawn holds an index past an array's end.
+float pnmtx_row(u32 byte) noexcept { return static_cast<float>(std::min<u32>(byte / 3, gx::MaxPnMtx - 1) * 3); }
+
 u32 load_u16(Pool pool, size_t offset, bool le) noexcept {
   const u32 b0 = load_u8(pool, offset);
   const u32 b1 = load_u8(pool, offset + 1);
@@ -195,14 +199,16 @@ void decode_attribute(const gx::ShaderConfig& config, const Attribute& attribute
   const auto& mapping = config.attrs[attribute.attr];
   if (attribute.attr == GX_VA_PNMTXIDX) {
     const auto address = attr_address(mapping, attribute.attr, vertex, 0, 0, verts, storage, immediates);
-    const float index = static_cast<float>(load_u8(address.pool, address.offset) / 3);
-    write_floats(value, &index, 1);
+    const float row = pnmtx_row(load_u8(address.pool, address.offset));
+    write_floats(value, &row, 1);
   } else if (attribute.attr >= GX_VA_TEX0MTXIDX && attribute.attr <= GX_VA_TEX7MTXIDX) {
-    // The matrix's slot: a position matrix's index, or MaxPnMtx plus a texture matrix's, as the WGSL works them out.
+    // The matrix's slot, a position matrix's index or MaxPnMtx plus a texture matrix's, as the WGSL works them out;
+    // as its first row, the slot times 3.
     const auto address = attr_address(mapping, attribute.attr, vertex, 0, 0, verts, storage, immediates);
     const u32 row = load_u8(address.pool, address.offset);
     const float slot = static_cast<float>(row >= GX_TEXMTX0 ? gx::MaxPnMtx + (row - GX_TEXMTX0) / 3 : row / 3);
-    write_floats(value, &slot, 1);
+    const float first = slot * 3.f;
+    write_floats(value, &first, 1);
   } else if (attribute.attr == GX_VA_CLR0 || attribute.attr == GX_VA_CLR1) {
     const auto address = attr_address(mapping, attribute.attr, vertex, 0, 0, verts, storage, immediates);
     note_reach(reach, mapping, attribute.attr, address, color_size(mapping.compType));
@@ -399,7 +405,7 @@ ALWAYS_INLINE void run_step(const Step& step, const gx::ShaderConfig& config, co
   uint8_t* value = out + step.outOffset;
   float f[3];
   if (step.op == Op::PnmtxDirect) {
-    f[0] = static_cast<float>(in[step.inOffset] / 3u);
+    f[0] = pnmtx_row(in[step.inOffset]);
     write_floats(value, f, 1);
     return;
   }
