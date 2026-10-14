@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -14,6 +15,8 @@ namespace aurora::io {
 namespace {
 
 std::atomic<uint64_t> s_temporaryFileCounter = 0;
+// ".tmp-", 16 hex digits and the terminator.
+constexpr size_t TemporaryNameBytes = 22;
 
 void restore_error(const std::string& error) noexcept {
   if (!error.empty()) {
@@ -249,7 +252,10 @@ AtomicFileWriter open_atomic_file(const std::filesystem::path& path, AtomicFileM
     for (uint32_t attempt = 0; attempt < 32 && !stream; ++attempt) {
       const uint64_t suffix = (static_cast<uint64_t>(SDL_rand_bits()) << 32) ^
                               s_temporaryFileCounter.fetch_add(1, std::memory_order_relaxed);
-      temporaryPath = targetPath + ".tmp-" + std::to_string(suffix);
+      // A name that doesn't grow with the target's: FATX, the Xbox 360's file system, holds 42 characters a name.
+      std::array<char, TemporaryNameBytes> name{};
+      std::snprintf(name.data(), name.size(), ".tmp-%016llx", static_cast<unsigned long long>(suffix));
+      temporaryPath = fs_path_to_string(path.parent_path() / name.data());
       stream.reset(SDL_IOFromFile(temporaryPath.c_str(), "wb+x"));
     }
     if (!stream) {

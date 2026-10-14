@@ -112,9 +112,28 @@ TEST_F(IoTest, AbandonedAtomicWriteKeepsOriginalAndRemovesTemporaryFile) {
   EXPECT_EQ(*aurora::io::read_file(path), std::vector<uint8_t>(original.begin(), original.end()));
   const auto temporaryCount =
       std::ranges::count_if(std::filesystem::directory_iterator{m_directory}, [](const auto& entry) {
-        return entry.path().filename().string().starts_with("abandoned.bin.tmp-");
+        return entry.path().filename() != "abandoned.bin";
       });
   EXPECT_EQ(temporaryCount, 0);
+}
+
+// FATX, the Xbox 360's file system, holds 42 characters a name, and the temporary file is made there too.
+TEST_F(IoTest, AtomicWriteTemporaryNameFitsFatx) {
+  constexpr size_t FatxNameCharacters = 42;
+  constexpr std::array<uint8_t, 2> contents{8, 9};
+  const auto path = m_directory / "Xbox 360 Controller_045E_028E.controller";
+
+  auto writer = aurora::io::open_atomic_file(path);
+  ASSERT_TRUE(writer) << SDL_GetError();
+  std::vector<std::string> names;
+  for (const auto& entry : std::filesystem::directory_iterator{m_directory}) {
+    names.push_back(entry.path().filename().string());
+  }
+  ASSERT_EQ(names.size(), 1u);
+  EXPECT_LE(names[0].size(), FatxNameCharacters) << names[0];
+  ASSERT_TRUE(aurora::io::write_exact(writer.get(), contents.data(), contents.size())) << SDL_GetError();
+  ASSERT_TRUE(writer.commit()) << SDL_GetError();
+  EXPECT_EQ(*aurora::io::read_file(path), std::vector<uint8_t>(contents.begin(), contents.end()));
 }
 
 TEST_F(IoTest, CardFileIoDelegatesExactOffsetOperations) {
