@@ -393,7 +393,7 @@ void upload_textures(FrameState& state, const detail::FrameOp& op, VkCommandBuff
     }
     const VkBufferImageCopy region{
         .bufferOffset = offset,
-        .bufferRowLength = texture->bc1 ? pitch / 8 * 4 : pitch / 4,
+        .bufferRowLength = texture->bc1 ? pitch / 8 * 4 : pitch / texture->texelBytes,
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, upload.mipLevel, 0, 1},
         .imageExtent = {std::min(upload.width, std::max(texture->width >> upload.mipLevel, 1u)),
                         std::min(upload.height, std::max(texture->height >> upload.mipLevel, 1u)), 1},

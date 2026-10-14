@@ -43,7 +43,9 @@ backend::Limits g_limits{
     .cmprAsBc1 = false,
     // BC1 would need power-of-two sides; vulkan4xenon has no BC1 yet.
     .bcPowerOfTwo = true,
-    .componentSwizzle = false,
+    // R8 and RG8 textures sample as intensity, and as intensity and alpha, through their views' component mappings
+    // (vulkan4xenon's docs/SUPPORT.md, Images), so they're uploaded at 1 and 2 bytes a texel, not 4.
+    .componentSwizzle = true,
     .pipelineThreads = true,
     // The vertex cache hashes each array a draw reads, whole (encoding.cpp), and takes the hashes the FIFO worker made
     // as it copied the arrays and vertex bytes, while warm, where the render worker would read them cold.
@@ -262,8 +264,10 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
   // (vulkan4xenon's docs/SUPPORT.md, Formats).
   const bool bc1 = desc.format == TextureFormat::BC1RGBAUnorm && desc.usage == TextureUsage::Sampled;
   const bool floats = desc.format == TextureFormat::R32Float && desc.usage == TextureUsage::Sampled;
-  if (!depth && !bc1 && !floats && desc.format != TextureFormat::RGBA8Unorm) {
-    Log.error("No texture for {}: format {} isn't RGBA8, swizzled BC1 or sampled R32Float", desc.label,
+  const bool red = desc.format == TextureFormat::R8Unorm && desc.usage == TextureUsage::Sampled;
+  const bool redGreen = desc.format == TextureFormat::RG8Unorm && desc.usage == TextureUsage::Sampled;
+  if (!depth && !bc1 && !floats && !red && !redGreen && desc.format != TextureFormat::RGBA8Unorm) {
+    Log.error("No texture for {}: format {} isn't RGBA8, swizzled BC1, or sampled R32Float, R8 or RG8", desc.label,
               static_cast<uint32_t>(desc.format));
     return {};
   }
@@ -271,13 +275,16 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
   texture->width = desc.width;
   texture->height = desc.height;
   texture->bc1 = bc1;
+  texture->texelBytes = red ? 1 : redGreen ? 2 : 4;
   VkImageCreateInfo info{
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = VK_IMAGE_TYPE_2D,
-      .format = depth    ? VK_FORMAT_D24_UNORM_S8_UINT
-                : bc1    ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
-                : floats ? VK_FORMAT_R32_SFLOAT
-                         : VK_FORMAT_R8G8B8A8_UNORM,
+      .format = depth      ? VK_FORMAT_D24_UNORM_S8_UINT
+                : bc1      ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+                : floats   ? VK_FORMAT_R32_SFLOAT
+                : red      ? VK_FORMAT_R8_UNORM
+                : redGreen ? VK_FORMAT_R8G8_UNORM
+                           : VK_FORMAT_R8G8B8A8_UNORM,
       .extent = {desc.width, desc.height, 1},
       .mipLevels = 1,
       .arrayLayers = 1,
@@ -312,11 +319,18 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
     Log.error("No memory for {} ({}x{})", desc.label, desc.width, desc.height);
     return {};
   }
+  // R8 is intensity, read into every channel, as the WebGPU backend's swizzle reads R8_PC and I8; RG8 is intensity
+  // and alpha, as it reads RG8_PC.
+  const VkComponentSwizzle r = VK_COMPONENT_SWIZZLE_R;
+  const VkComponentMapping components = red        ? VkComponentMapping{r, r, r, r}
+                                        : redGreen ? VkComponentMapping{r, r, r, VK_COMPONENT_SWIZZLE_G}
+                                                   : VkComponentMapping{};
   const VkImageViewCreateInfo viewInfo{
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = texture->image,
       .viewType = VK_IMAGE_VIEW_TYPE_2D,
       .format = info.format,
+      .components = components,
       .subresourceRange = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, info.mipLevels, 0, 1},
   };
   if (!succeeded(vkCreateImageView(g_device, &viewInfo, nullptr, &texture->view), "vkCreateImageView")) {

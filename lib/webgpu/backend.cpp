@@ -80,12 +80,18 @@ namespace aurora::gfx {
 using webgpu::g_device;
 
 namespace {
-bool setup_swizzle(wgpu::TextureComponentSwizzleDescriptor& swizzle, u32 format) noexcept {
+bool setup_swizzle(wgpu::TextureComponentSwizzleDescriptor& swizzle, u32 format, TextureFormat uploadFormat) noexcept {
   if (!webgpu::g_textureComponentSwizzleSupported) {
     return false;
   }
 
   switch (format) {
+  case GX_TF_I8:
+    // Uploaded as R8 by convert_texture; an EFB copy's I8 texture is RGBA8 and needs nothing.
+    if (uploadFormat != TextureFormat::R8Unorm) {
+      return false;
+    }
+    [[fallthrough]];
   case GX_TF_R8_PC:
     swizzle.swizzle.r = wgpu::ComponentSwizzle::R;
     swizzle.swizzle.g = wgpu::ComponentSwizzle::R;
@@ -141,7 +147,7 @@ std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept {
       .mipLevelCount = desc.mips,
   };
   wgpu::TextureComponentSwizzleDescriptor swizzle;
-  if (desc.usage == TextureUsage::Sampled && setup_swizzle(swizzle, desc.gxFormat)) {
+  if (desc.usage == TextureUsage::Sampled && setup_swizzle(swizzle, desc.gxFormat, desc.format)) {
     textureViewDescriptor.nextInChain = &swizzle;
   }
   auto view = texture.CreateView(&textureViewDescriptor);

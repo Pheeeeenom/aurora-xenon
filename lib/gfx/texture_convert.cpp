@@ -239,6 +239,18 @@ struct TextureDecoderI8 {
   }
 };
 
+// I8 as one byte a texel, for a backend that samples R8 as intensity (Limits::componentSwizzle).
+struct TextureDecoderI8R8 {
+  using Source = uint8_t;
+  using Target = uint8_t;
+
+  static constexpr uint32_t Frac = 1;
+  static constexpr uint32_t BlockWidth = 8;
+  static constexpr uint32_t BlockHeight = 4;
+
+  static void decode_texel(Target* target, const Source* in, const uint32_t x) { target[x] = in[x]; }
+};
+
 struct TextureDecoderRG8 {
   struct Source {
     uint8_t intensity;
@@ -673,8 +685,11 @@ static ByteBuffer BuildRGBA8FromBC1(uint32_t width, uint32_t height, uint32_t mi
 ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
   ZoneScoped;
   ByteBuffer converted;
-  bool cmprArbMips = false;
+  // Arbitrary mips from an RGBA8 decode of its own, for a texture uploaded in another format.
+  bool decodedArbMips = false;
   bool cmprBc1 = false;
+  // I8 stays one byte a texel where the backend samples R8 as intensity; EFB copies to I8 keep upload_format's RGBA8.
+  bool i8AsR8 = false;
   switch (format) {
     DEFAULT_FATAL("convert_texture: unknown texture format {}", format);
   case GX_TF_R8_PC:
@@ -703,6 +718,14 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     converted = DecodeTiled<TextureDecoderI4>(width, height, mips, data);
     break;
   case GX_TF_I8:
+    if (backend::limits().componentSwizzle) {
+      if (mips > 1) {
+        decodedArbMips = arb_mip_check(width, height, mips, DecodeTiled<TextureDecoderI8>(width, height, mips, data));
+      }
+      converted = DecodeTiled<TextureDecoderI8R8>(width, height, mips, data);
+      i8AsR8 = true;
+      break;
+    }
     converted = DecodeTiled<TextureDecoderI8>(width, height, mips, data);
     break;
   case GX_TF_IA4:
@@ -733,7 +756,7 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     if (cmpr_uses_bc1(width, height, mips, data)) {
       // arb_mip_check reads RGBA8, so it gets a decode of its own.
       if (mips > 1) {
-        cmprArbMips = arb_mip_check(width, height, mips, BuildRGBA8FromCMPR(width, height, mips, data));
+        decodedArbMips = arb_mip_check(width, height, mips, BuildRGBA8FromCMPR(width, height, mips, data));
       }
       converted = BuildBC1FromCMPR(width, height, mips, data);
       cmprBc1 = true;
@@ -743,12 +766,14 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     break;
   }
   const auto uploadFormat = upload_format(format);
-  bool hasArbitraryMips = cmprArbMips;
-  if (!cmprBc1 && !is_pc_texture_format(format) && uploadFormat == TextureFormat::RGBA8Unorm && mips > 1) {
+  bool hasArbitraryMips = decodedArbMips;
+  if (!cmprBc1 && !i8AsR8 && !is_pc_texture_format(format) && uploadFormat == TextureFormat::RGBA8Unorm && mips > 1) {
     hasArbitraryMips = arb_mip_check(width, height, mips, converted);
   }
   return {
-      .format = cmprBc1 ? TextureFormat::BC1RGBAUnorm : uploadFormat,
+      .format = cmprBc1  ? TextureFormat::BC1RGBAUnorm
+                : i8AsR8 ? TextureFormat::R8Unorm
+                         : uploadFormat,
       .width = width,
       .height = height,
       .mips = mips,

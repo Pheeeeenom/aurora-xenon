@@ -22,13 +22,17 @@ VkQueue g_queue = VK_NULL_HANDLE;
 
 namespace {
 // Allocations share blocks: each vkAllocateMemory is xsdk_gpu_alloc's physical memory in 64 KiB pages, at most 4096
-// (vulkan4xenon's docs/SUPPORT.md, Memory and buffers). The layer has one memory type, which both pools take: the
-// first in 8 MiB blocks while it can, then exact ones, the second in exact ones.
+// (vulkan4xenon's docs/SUPPORT.md, Memory and buffers). The GPU's memory type is both the first pools': the first in
+// 8 MiB blocks while it can, then exact ones, the second in exact ones. The third takes the layer's cached type, which
+// it offers only to buffers that are only copied from: copies run on the CPU, which reads cached memory at the cache's
+// speed, where the GPU's is read uncached.
 constexpr VkDeviceSize MemoryBlockSize = 8 * 1024 * 1024;
 constexpr VkDeviceSize VideoRamGranularity = 64 * 1024;
 constexpr VkDeviceSize MainRamGranularity = 64 * 1024;
+constexpr VkDeviceSize CachedGranularity = 4 * 1024;
 constexpr uint32_t VideoPool = 0;
 constexpr uint32_t MainPool = 1;
+constexpr uint32_t CachedPool = 2;
 // The waiter only waits: 64 KiB, not a pthread's default.
 constexpr size_t WaiterStackSize = 64 * 1024;
 
@@ -91,13 +95,20 @@ std::array<VkRenderPass, 3> g_colorPasses{};
 std::array<VkRenderPass, 3> g_presentPasses{};
 
 std::mutex g_memoryMutex;
-std::array<MemoryPool, 2> g_pools{
+std::array<MemoryPool, 3> g_pools{
     MemoryPool{.name = "memory in whole blocks", .granularity = VideoRamGranularity},
     MemoryPool{.name = "memory in exact blocks",
                .granularity = MainRamGranularity,
                .wholeBlocksFirst = false,
                .wholeBlocks = false},
+    MemoryPool{.name = "cached memory", .granularity = CachedGranularity},
 };
+
+// Whether the cached pool can hold what has these memory type bits: a type of its own the requirements list.
+bool fits_cached(uint32_t memoryTypeBits) noexcept {
+  const uint32_t type = g_pools[CachedPool].type;
+  return type != g_pools[VideoPool].type && (memoryTypeBits & (1u << type)) != 0;
+}
 
 VkCommandPool g_commandPool = VK_NULL_HANDLE;
 std::array<VkCommandBuffer, detail::FrameSlotCount> g_commands{};
@@ -323,16 +334,27 @@ bool create_instance() noexcept {
 bool find_memory_types() noexcept {
   VkPhysicalDeviceMemoryProperties properties;
   vkGetPhysicalDeviceMemoryProperties(g_physicalDevice, &properties);
-  // The layer's one type, device-local and host-visible (its docs/SUPPORT.md, Memory and buffers), for both pools.
+  // The GPU's type, device-local and host-visible, for the first pools, then the cached one, host-visible and cached,
+  // for the third (its docs/SUPPORT.md, Memory and buffers); without it, the third is the first's and never taken.
   for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
     if ((properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
       g_pools[VideoPool].type = i;
       g_pools[MainPool].type = i;
-      return true;
+      g_pools[CachedPool].type = i;
+      break;
     }
   }
-  Log.error("No host-visible memory type");
-  return false;
+  if (g_pools[VideoPool].type == UINT32_MAX) {
+    Log.error("No host-visible memory type");
+    return false;
+  }
+  for (uint32_t i = 0; i < properties.memoryTypeCount; ++i) {
+    if ((properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) {
+      g_pools[CachedPool].type = i;
+      break;
+    }
+  }
+  return true;
 }
 
 bool create_surface() noexcept {
@@ -668,9 +690,10 @@ void shutdown_device() noexcept {
 // device).
 bool allocate(const VkMemoryRequirements& requirements, Allocation& out) noexcept {
   std::lock_guard lock{g_memoryMutex};
-  for (uint32_t poolIndex : {VideoPool, MainPool}) {
+  for (uint32_t poolIndex : {CachedPool, VideoPool, MainPool}) {
     auto& pool = g_pools[poolIndex];
-    if ((requirements.memoryTypeBits & (1u << pool.type)) == 0) {
+    if ((requirements.memoryTypeBits & (1u << pool.type)) == 0 ||
+        (poolIndex == CachedPool && !fits_cached(requirements.memoryTypeBits))) {
       continue;
     }
     for (size_t attempt = 0; attempt < 2; ++attempt) {
@@ -754,7 +777,7 @@ bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool videoRam, c
   }
   VkMemoryRequirements requirements;
   vkGetBufferMemoryRequirements(g_device, out.buffer, &requirements);
-  const uint32_t poolIndex = videoRam ? VideoPool : MainPool;
+  const uint32_t poolIndex = fits_cached(requirements.memoryTypeBits) ? CachedPool : videoRam ? VideoPool : MainPool;
   const VkMemoryAllocateInfo allocateInfo{
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = requirements.size,

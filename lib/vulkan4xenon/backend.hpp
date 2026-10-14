@@ -149,7 +149,8 @@ VkPipeline present_pipeline() noexcept;
 
 // backend.cpp: textures and descriptor sets.
 bool initialize_textures() noexcept;
-// Tiled, as every image the layer makes is. R32Float only sampled, as the range fog table.
+// Tiled, as every image the layer makes is. R32Float only sampled, as the range fog table; R8 and RG8 only sampled, as
+// intensity, and as intensity and alpha.
 std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc) noexcept;
 void shutdown_textures() noexcept;
 VkDescriptorSet allocate_set(VkDescriptorSetLayout layout) noexcept;
@@ -173,8 +174,10 @@ struct Texture {
   vulkan4xenon::Allocation memory;
   uint32_t width = 0;
   uint32_t height = 0;
-  // BC1 blocks of 4x4 texels, 8 bytes each, rather than RGBA8 texels.
+  // BC1 blocks of 4x4 texels, 8 bytes each, rather than texels.
   bool bc1 = false;
+  // A texel's bytes: 1 for R8, 2 for RG8, else 4.
+  uint32_t texelBytes = 4;
   // Render worker only: the levels uploaded so far, so an upload over one waits for the scenes before it; the
   // texture as a colour target, with the depth it was made with or alone; and as a copy's source.
   uint32_t uploadedLevels = 0;
