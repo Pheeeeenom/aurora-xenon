@@ -7,11 +7,11 @@ each program's SPIR-V by its source's hash, and v4x_shader_bundle, which the lay
     build_glsl_pack.py --vulkan4xenon ../vulkan4xenon --xost ../Xbox-360-SDK/xenos-toolchain \
         --output platforms/xenon/glsl_pack platforms/xenon/shaders
 
---optimize has xost rewrite each program's instructions first (xost:xasm/optimize.py), as the Xbox 360's pixel
+--optimize has xost rewrite each program's instructions first (xsdk:src/xsc_optimize.c), as the Xbox 360's pixel
 shading is most of a frame's GPU time.
 
 A program glslang or xost refuses, as xost does one past its kind's share of xsdk's registers, is left out and listed;
-the backend then logs it as missing and skips its draws. Run it from the game's repository root, as build_shaders.py
+the backend then compiles it on the console, where it's refused again, logged, and its draws skipped. Run it from the game's repository root, as build_shaders.py
 wants paths relative.
 """
 

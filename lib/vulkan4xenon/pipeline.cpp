@@ -1,10 +1,7 @@
-// The vulkan4xenon backend's programs and pipelines: GLSL compiled offline and found in the game's pack, the pipeline
-// layouts, and the pipelines for clears, EFB copies and the present.
+// The vulkan4xenon backend's pipelines: layouts, and the pipelines for GX, clears, EFB copies and the present.
 #include "backend.hpp"
 
 #include "../gx/gx.hpp"
-
-#include <aurora/glsl_pack.h>
 
 #include <absl/container/flat_hash_map.h>
 #include <fmt/format.h>
@@ -14,16 +11,10 @@
 #include <mutex>
 #include <span>
 #include <string>
-#include <unordered_set>
 #include <vector>
-
-// Without a pack linked in, none: every program is reported missing.
-extern "C" __attribute__((weak)) const AuroraGlslPack aurora_glsl_pack{};
 
 namespace aurora::gfx::vulkan4xenon {
 namespace {
-using Program = std::span<const uint32_t>;
-
 // The full-screen triangle's: positions in clip space, and texture coordinates from the top left.
 constexpr std::array<float, 12> TriangleVertices{
     -1.f, -1.f, 0.f, 0.f, //
@@ -32,9 +23,8 @@ constexpr std::array<float, 12> TriangleVertices{
 };
 constexpr uint32_t TriangleStride = 4 * sizeof(float);
 
-// Pipelines are made one at a time, which also guards the missing programs logged.
+// Pipelines are made one at a time, which also guards program.cpp's programs.
 std::mutex g_pipelineMutex;
-std::unordered_set<uint64_t> g_missing;
 
 VkDescriptorSetLayout g_uniformSetLayout = VK_NULL_HANDLE;
 VkDescriptorSetLayout g_textureSetLayout = VK_NULL_HANDLE;
@@ -50,22 +40,6 @@ std::string g_clearFragment;
 std::string g_copyVertex;
 // Render worker only. By format, and whether the copy reads alpha as 1.
 absl::flat_hash_map<std::pair<GXTexFmt, bool>, VkPipeline> g_copyPipelines;
-
-// The SPIR-V the offline step compiled for a program, from the game's pack: none, logged once, for a program it
-// doesn't hold, whose pipeline isn't made and whose draws are skipped. Under g_pipelineMutex.
-Program load_program(const std::string& source, bool fragment) noexcept {
-  const uint64_t hash = glsl::program_hash(source, fragment);
-  const std::span programs{aurora_glsl_pack.programs, aurora_glsl_pack.count};
-  const auto found = std::ranges::lower_bound(programs, hash, {}, &AuroraGlslProgram::hash);
-  if (found != programs.end() && found->hash == hash) {
-    return {found->spirv, found->bytes / sizeof(uint32_t)};
-  }
-  if (g_missing.insert(hash).second) {
-    Log.error("{:016x}.{} isn't in the shader pack: record it on the null backend and rebuild the pack", hash,
-              fragment ? "frag" : "vert");
-  }
-  return {};
-}
 
 bool create_module(Program program, VkShaderModule& out) noexcept {
   const VkShaderModuleCreateInfo info{
@@ -381,12 +355,12 @@ std::array<VkVertexInputAttributeDescription, 2> triangle_attributes() noexcept 
   };
 }
 
-// A copy's pipeline into a render pass of the target's format; null when its programs aren't in the pack.
+// A copy's pipeline into a render pass of the target's format; null when glslang refuses its programs.
 VkPipeline make_copy_pipeline(GXTexFmt format, bool opaqueAlpha, VkRenderPass renderPass) noexcept {
   const auto attributes = triangle_attributes();
   std::lock_guard lock{g_pipelineMutex};
-  const auto vertex = load_program(g_copyVertex, false);
-  const auto fragment = load_program(glsl::copy_fragment(format, opaqueAlpha), true);
+  const auto vertex = find_program(g_copyVertex, false);
+  const auto fragment = find_program(glsl::copy_fragment(format, opaqueAlpha), true);
   if (vertex.empty() || fragment.empty()) {
     return VK_NULL_HANDLE;
   }
@@ -411,7 +385,7 @@ bool initialize_pipelines() noexcept {
   g_clearVertex = glsl::clear_vertex();
   g_clearFragment = glsl::clear_fragment();
   g_copyVertex = glsl::copy_vertex();
-  Log.info("Shader pack: {} programs", aurora_glsl_pack.count);
+  initialize_programs();
   // The present copies the EFB to the swapchain's B8G8R8A8 images.
   g_presentPipeline = make_copy_pipeline(GX_TF_RGBA8, false, present_pass(Load::DontCare));
   return true;
@@ -433,6 +407,7 @@ void shutdown_pipelines() noexcept {
     *layout = VK_NULL_HANDLE;
   }
   destroy_buffer(g_triangle);
+  shutdown_programs();
 }
 
 VkDescriptorSetLayout uniform_set_layout() noexcept { return g_uniformSetLayout; }
@@ -459,8 +434,8 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const clear::PipelineConfig& co
   }
   const auto attributes = triangle_attributes();
   std::lock_guard lock{g_pipelineMutex};
-  const auto vertex = load_program(g_clearVertex, false);
-  const auto fragment = load_program(g_clearFragment, true);
+  const auto vertex = find_program(g_clearVertex, false);
+  const auto fragment = find_program(g_clearFragment, true);
   if (vertex.empty() || fragment.empty()) {
     return nullptr;
   }
@@ -504,8 +479,8 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& confi
     });
   }
   std::lock_guard lock{g_pipelineMutex};
-  const auto vertex = load_program(programs.vertex, false);
-  const auto fragment = load_program(programs.fragment, true);
+  const auto vertex = find_program(programs.vertex, false);
+  const auto fragment = find_program(programs.fragment, true);
   if (vertex.empty() || fragment.empty()) {
     return nullptr;
   }

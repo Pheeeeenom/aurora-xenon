@@ -77,12 +77,15 @@ elseif (AURORA_GFX_BACKEND STREQUAL "vulkan4xenon")
             lib/vulkan4xenon/encoding.cpp
             lib/vulkan4xenon/glsl.cpp
             lib/vulkan4xenon/pipeline.cpp
+            lib/vulkan4xenon/program.cpp
             lib/null/texture_replacement.cpp
     )
     target_compile_definitions(aurora_gx PRIVATE
             AURORA_VULKAN4XENON_VERTEX_CACHE_BYTES=${AURORA_VULKAN4XENON_VERTEX_CACHE_BYTES})
     # The layer, and the game's shader pack (aurora/glsl_pack.h) with its bundle, which the game links.
     target_link_libraries(aurora_gx PUBLIC vulkan4xenon)
+    # glslang-xenon, which compiles the programs the pack doesn't hold on the console.
+    target_link_libraries(aurora_gx PRIVATE glslang glslang-default-resource-limits)
 else ()
     target_sources(aurora_gx PRIVATE
             lib/null/backend.cpp

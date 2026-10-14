@@ -17,6 +17,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <string>
 
 namespace aurora::gfx::vulkan4xenon {
 inline constexpr Module Log{"aurora::vulkan4xenon"};
@@ -120,9 +122,16 @@ uint64_t next_frame_serial() noexcept;
 // for a submitted frame ends. A frame not yet submitted is logged and not waited for: false.
 bool wait_for_frame(uint64_t serial) noexcept;
 
-// pipeline.cpp: the shader pack's programs, pipeline layouts and pipelines.
+// pipeline.cpp: pipeline layouts and pipelines.
 bool initialize_pipelines() noexcept;
 void shutdown_pipelines() noexcept;
+
+// program.cpp: each program's SPIR-V, from the game's pack, the disk or glslang. Called under pipeline.cpp's lock.
+using Program = std::span<const uint32_t>;
+void initialize_programs() noexcept;
+void shutdown_programs() noexcept;
+// Empty when glslang refuses the program, which is logged once; its pipeline isn't made, and its draws are skipped.
+Program find_program(const std::string& source, bool fragment) noexcept;
 
 // Set 0 of the GX layout: the frame's uniform buffer, dynamic, once per uniform piece. Set 1: the 8 GX texture maps.
 VkDescriptorSetLayout uniform_set_layout() noexcept;
