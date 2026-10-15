@@ -1,7 +1,6 @@
 // GLSL programs for a GX shader config, after gx/shader.cpp's WGSL in the form xost compiles; glsl.hpp has the
-// bindings they read. Configs needing what these programs don't express yet are refused: lines and points, emboss,
-// binormal and tangent texgens, and more interpolants than xost gives a program (vulkan4xenon's ROADMAP.md, milestone
-// 11).
+// bindings they read. Configs needing what these programs don't express yet are refused: emboss, binormal and tangent
+// texgens, and more interpolants than xost gives a program (vulkan4xenon's ROADMAP.md, milestones 11 and 14).
 #include "glsl.hpp"
 
 #include "../gfx/hash.hpp"
@@ -13,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <mutex>
 #include <string_view>
 #include <unordered_set>
@@ -87,9 +87,6 @@ void refuse(const gx::ShaderConfig& config, const Needs& needs) {
 
 // The plan for config's programs, or false with all it needs that they don't express.
 bool make_plan(const gx::ShaderConfig& config, Plan& plan, Needs& needs) {
-  if (config.lineMode != 0) {
-    needs.push_back("lines and points"s);
-  }
   if (config.tevStageCount == 0 || config.tevStageCount > gx::MaxTevStages) {
     needs.push_back(fmt::format("{} TEV stages", config.tevStageCount));
     return false; // the rest reads the stages
@@ -321,6 +318,37 @@ void light_term(LitHalf& half, u32 j, std::string& body) {
   half.sum = fmt::format("{}_sum{}", name, j);
 }
 
+// A line's or point's corner as the WGSL puts it (gx/shader.cpp): out from its end's clip position, by half the width
+// across the segment, or to the point's corner. The width is GX's, in pixels of the game's viewport, scaled to the one
+// drawn into; a segment whose ends meet runs along x.
+std::string corner_position(const gx::ShaderConfig& config, bool perVertex) {
+  std::string body =
+      "\n    vec2 viewport_scale = uview.viewport_sizes.xy / max(uview.viewport_sizes.zw, vec2(1.0, 1.0));"
+      "\n    float line_width = uview.line_params.x * min(viewport_scale.x, viewport_scale.y);";
+  if (config.lineMode == 3) {
+    body += "\n    vec2 corner_offset = in_corner * line_width / uview.viewport_sizes.xy;";
+  } else {
+    body += fmt::format(
+        "{}"
+        "\n    vec4 other4 = vec4(in_other_pos, 1.0);"
+        "\n    vec4 mv_other4 = vec4({}, 1.0);"
+        "\n    vec4 clip_other = vec4(dot(uview.proj[0], mv_other4), dot(uview.proj[1], mv_other4),"
+        " dot(uview.proj[2], mv_other4), dot(uview.proj[3], mv_other4));"
+        "\n    vec2 line_delta = (clip_other.xy / clip_other.w - clip_pos.xy / clip_pos.w) *"
+        " (uview.viewport_sizes.xy * 0.5);"
+        "\n    float line_len2 = dot(line_delta, line_delta);"
+        "\n    vec2 line_dir = mix(vec2(1.0, 0.0), line_delta * inversesqrt(max(line_len2, 1e-20)),"
+        " step(1e-10, line_len2));"
+        "\n    vec2 corner_offset = vec2(line_dir.y * -1.0, line_dir.x) * (line_width * in_corner.x) /"
+        " uview.viewport_sizes.xy;",
+        perVertex ? "\n    int other_pnmtx = int(in_other_pnmtx);"sv : ""sv,
+        perVertex ? mul3x4_at("upos.mtx"sv, "other_pnmtx"sv, "other4"sv) : mul3x4("upush.pos_mtx"sv, 0, "other4"sv));
+  }
+  body +=
+      "\n    gl_Position = vec4(clip_pos.xy + corner_offset * clip_pos.w, clip_pos.zw) * vec4(1.0, -1.0, 1.0, 1.0);";
+  return body;
+}
+
 // The texgens' types and sources are ones make_plan lets through. Sets normalMatrix when the program reads the
 // current normal matrix from its push constant.
 void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bool, gx::MaxVtxAttr>& inputs,
@@ -336,10 +364,11 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
       "\n    vec4 pos4 = vec4({}, 1.0);"
       "\n    vec4 mv_pos4 = vec4({}, 1.0);"
       "\n    vec4 clip_pos = vec4(dot(uview.proj[0], mv_pos4), dot(uview.proj[1], mv_pos4),"
-      " dot(uview.proj[2], mv_pos4), dot(uview.proj[3], mv_pos4));"
-      "\n    gl_Position = clip_pos * vec4(1.0, -1.0, 1.0, 1.0);",
+      " dot(uview.proj[2], mv_pos4), dot(uview.proj[3], mv_pos4));",
       vtx_attr(config, GX_VA_POS, inputs),
       perVertex ? mul3x4_at("upos.mtx"sv, "pnmtx"sv, "pos4"sv) : mul3x4("upush.pos_mtx"sv, 0, "pos4"sv));
+  body += config.lineMode == 0 ? "\n    gl_Position = clip_pos * vec4(1.0, -1.0, 1.0, 1.0);"s
+                               : corner_position(config, perVertex);
 
   // A channel's colour or alpha from its material source, or its ambient and material sources when it's lit.
   const auto source = [&](u32 channel, GXColorSrc src, u32 slot) {
@@ -476,6 +505,17 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
                           mul3x4("uview.postmtx"sv, (tcg.postMtx - GX_PTTEXMTX0) / 3 * 3, fmt::format("tc{}_post", i)));
       projected = fmt::format("tc{}_proj", i);
     }
+    if (config.lineMode != 0) {
+      // The texture offset, where the draw's mask moves this coordinate: on a segment's moved side, or a point's right
+      // and lower corners.
+      const auto moved = fmt::format("(uview.line_params.z * upush.line_mask[{}].{})", i / 4, "xyzw"[i % 4]);
+      body +=
+          config.lineMode == 3
+              ? fmt::format("\n    vec3 tc{0}_line = {1} + vec3(in_corner * 0.5 + 0.5, 0.0) * {2};", i, projected,
+                            moved)
+              : fmt::format("\n    vec3 tc{0}_line = {1} + vec3(0.0, in_corner.y, 0.0) * {2};", i, projected, moved);
+      projected = fmt::format("tc{}_line", i);
+    }
     if (tcg.type == GX_TG_MTX3x4) {
       body += fmt::format("\n    out_tex{}_uvw = {};", i, projected);
     } else {
@@ -488,8 +528,8 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
 }
 
 // Attribute locations as xost gives them usages: position 0, colour 0 1, texture coordinates from 2 (resolve.py), and
-// the rest after them, in decode_vertices' order.
-VertexLayout make_layout(const std::array<bool, gx::MaxVtxAttr>& inputs) {
+// the rest after them, in decode_vertices' order; a line's or point's corners' own values last.
+VertexLayout make_layout(const gx::ShaderConfig& config, const std::array<bool, gx::MaxVtxAttr>& inputs) {
   VertexLayout layout;
   const auto add = [&](GXAttr attr, uint32_t location, AttrFormat format, uint32_t size) {
     layout.attributes.push_back({location, format, layout.stride, attr});
@@ -516,7 +556,32 @@ VertexLayout make_layout(const std::array<bool, gx::MaxVtxAttr>& inputs) {
       add(static_cast<GXAttr>(attr), location++, AttrFormat::F32x1, 4);
     }
   }
+  const auto corner = [&](CornerValue value, AttrFormat format, uint32_t size) {
+    layout.corners.push_back({location++, format, layout.stride, value});
+    layout.stride += size;
+  };
+  if (config.lineMode != 0) {
+    corner(CornerValue::Corner, AttrFormat::F32x2, 8);
+  }
+  if (config.lineMode == 1 || config.lineMode == 2) {
+    corner(CornerValue::OtherPos, AttrFormat::F32x3, 12);
+    if (inputs[GX_VA_PNMTXIDX]) {
+      corner(CornerValue::OtherPnmtx, AttrFormat::F32x1, 4);
+    }
+  }
   return layout;
+}
+
+std::string corner_name(CornerValue value) {
+  switch (value) {
+  case CornerValue::Corner:
+    return "in_corner"s;
+  case CornerValue::OtherPos:
+    return "in_other_pos"s;
+  case CornerValue::OtherPnmtx:
+    return "in_other_pnmtx"s;
+  }
+  return {};
 }
 
 std::string_view input_type(AttrFormat format) {
@@ -534,13 +599,21 @@ std::string_view input_type(AttrFormat format) {
 }
 
 std::string vertex_source(const Plan& plan, const VertexLayout& layout, const std::string& body, bool normalMatrix) {
-  std::string decls =
-      normalMatrix
-          ? "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n    vec4 nrm_mtx[3];\n} upush;\n"
-          : "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n} upush;\n";
+  // A line's or point's mask sits after both matrices, at LineMaskOffset, whether the normal matrix is read or not.
+  std::string decls = !layout.corners.empty()
+                          ? "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n    vec4 nrm_mtx[3];\n"
+                            "    vec4 line_mask[2];\n} upush;\n"s
+                      : normalMatrix
+                          ? "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n    vec4 nrm_mtx[3];\n"
+                            "} upush;\n"s
+                          : "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n} upush;\n"s;
   for (const auto& attribute : layout.attributes) {
     decls += fmt::format("layout(location = {}) in {} {};\n", attribute.location, input_type(attribute.format),
                          input_name(attribute.attr));
+  }
+  for (const auto& corner : layout.corners) {
+    decls += fmt::format("layout(location = {}) in {} {};\n", corner.location, input_type(corner.format),
+                         corner_name(corner.value));
   }
   for (size_t i = 0; i < plan.interpolants.size(); ++i) {
     decls +=
@@ -1330,10 +1403,73 @@ Programs build_programs(const gx::ShaderConfig& config) {
     refuse(config, {"an alpha compare that discards every fragment"s});
     return {};
   }
-  programs.layout = make_layout(inputs);
+  programs.layout = make_layout(config, inputs);
   programs.vertex = vertex_source(plan, programs.layout, body, programs.normalMatrix);
   programs.fogRange = reads_fog_range(config, plan.info);
   return programs;
+}
+
+uint32_t stream_vertices(const gx::ShaderConfig& config, uint32_t count) noexcept {
+  switch (config.lineMode) {
+  case 1: // GX_LINES
+    return count / 2 * 6;
+  case 2: // GX_LINESTRIP
+    return count < 2 ? 0 : (count - 1) * 6;
+  case 3: // GX_POINTS
+    return count * 6;
+  default:
+    return count;
+  }
+}
+
+namespace {
+// A quad's corners in the order the WebGPU backend's indices draw them (gx/command_processor.cpp, prepare_idx_buffer):
+// corner k is on a segment's second end, or a point's lower side, when k is 2 or 3, and on the side the texture offset
+// moves, or a point's right, when k is odd.
+constexpr std::array<uint32_t, 6> CornerOrder{0, 1, 3, 3, 2, 0};
+
+uint32_t attribute_offset(const VertexLayout& layout, GXAttr attr) noexcept {
+  const auto it = std::ranges::find(layout.attributes, attr, &Attribute::attr);
+  return it != layout.attributes.end() ? it->offset : 0;
+}
+} // namespace
+
+void write_corners(const gx::ShaderConfig& config, const VertexLayout& layout, const uint8_t* decoded, uint32_t count,
+                   uint8_t* out) noexcept {
+  const uint32_t stride = layout.stride;
+  const uint32_t position = attribute_offset(layout, GX_VA_POS);
+  const uint32_t pnmtx = attribute_offset(layout, GX_VA_PNMTXIDX);
+  const bool points = config.lineMode == 3;
+  const uint32_t primitives = stream_vertices(config, count) / 6;
+  for (uint32_t p = 0; p < primitives; ++p) {
+    const uint32_t first = config.lineMode == 1 ? p * 2 : p;
+    const uint32_t second = points ? first : first + 1;
+    for (const uint32_t k : CornerOrder) {
+      const bool atSecond = k >= 2;
+      const float side = (k & 1) != 0 ? 1.f : -1.f;
+      const uint8_t* end = decoded + size_t{atSecond ? second : first} * stride;
+      const uint8_t* other = decoded + size_t{atSecond ? first : second} * stride;
+      std::memcpy(out, end, stride);
+      for (const auto& corner : layout.corners) {
+        switch (corner.value) {
+        case CornerValue::Corner: {
+          // From the second end the segment points back, so its sides swap.
+          const std::array<float, 2> value = points ? std::array{side, atSecond ? 1.f : -1.f}
+                                                    : std::array{atSecond ? -side : side, (k & 1) != 0 ? 1.f : 0.f};
+          std::memcpy(out + corner.offset, value.data(), sizeof(value));
+          break;
+        }
+        case CornerValue::OtherPos:
+          std::memcpy(out + corner.offset, other + position, 3 * sizeof(float));
+          break;
+        case CornerValue::OtherPnmtx:
+          std::memcpy(out + corner.offset, other + pnmtx, sizeof(float));
+          break;
+        }
+      }
+      out += stride;
+    }
+  }
 }
 } // namespace aurora::gfx::vulkan4xenon::glsl
 
@@ -1424,6 +1560,25 @@ bool converts(GXTexFmt format) noexcept {
          std::ranges::find(CopyConversions, format, &CopyConversion::format) != CopyConversions.end();
 }
 
+std::string palette_fragment(bool fourBit) {
+  // Rounded, not truncated: a texel scaled back to its index may land a hair under it. xost takes vectors here.
+  return fmt::format(
+      "#version 450\n"
+      "layout(set = 0, binding = 0) uniform sampler2D source;\n"
+      "layout(set = 1, binding = 0) uniform sampler2D palette;\n"
+      "layout(push_constant, std140) uniform Push {{\n"
+      "    vec4 uv_transform;\n"
+      "    vec4 palette_scale;\n"
+      "}} upush;\n"
+      "layout(location = 0) in vec2 in_uv;\n"
+      "layout(location = 0) out vec4 o_color;\n"
+      "void main() {{\n"
+      "    vec4 index = floor(texture(source, in_uv) * {}.0 + 0.5);\n"
+      "    o_color = texture(palette, index.xx * upush.palette_scale.xy + upush.palette_scale.zw);\n"
+      "}}\n",
+      fourBit ? 15 : 255);
+}
+
 std::vector<std::pair<std::string, bool>> fixed_programs() {
   std::vector<std::pair<std::string, bool>> programs{
       {clear_vertex(), false},
@@ -1434,6 +1589,9 @@ std::vector<std::pair<std::string, bool>> fixed_programs() {
     for (const bool opaqueAlpha : {false, true}) {
       programs.emplace_back(copy_fragment(conversion.format, opaqueAlpha), true);
     }
+  }
+  for (const bool fourBit : {false, true}) {
+    programs.emplace_back(palette_fragment(fourBit), true);
   }
   return programs;
 }

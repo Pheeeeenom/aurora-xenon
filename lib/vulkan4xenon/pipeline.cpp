@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,6 +33,7 @@ VkDescriptorSetLayout g_sourceSetLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_gxLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_clearLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_copyLayout = VK_NULL_HANDLE;
+VkPipelineLayout g_paletteLayout = VK_NULL_HANDLE;
 Buffer g_triangle;
 VkPipeline g_presentPipeline = VK_NULL_HANDLE;
 
@@ -40,6 +42,9 @@ std::string g_clearFragment;
 std::string g_copyVertex;
 // Render worker only. By format, and whether the copy reads alpha as 1.
 absl::flat_hash_map<std::pair<GXTexFmt, bool>, VkPipeline> g_copyPipelines;
+// Render worker only. For 8-bit indices, then 4-bit; made at the first conversion, null kept when they failed.
+std::array<std::optional<VkPipeline>, 2> g_palettePipelines;
+std::array<std::string, 2> g_paletteFragments;
 
 bool create_module(Program program, VkShaderModule& out) noexcept {
   const VkShaderModuleCreateInfo info{
@@ -214,10 +219,14 @@ bool create_layouts() noexcept {
   }
   // Set 2 is the range fog table, one texture as a copy's source is (glsl.hpp).
   const std::array gxSets{g_uniformSetLayout, g_textureSetLayout, g_sourceSetLayout};
-  // The GX programs' current position and normal matrices, the clear's colour, and a copy's source rectangle.
-  return create_layout(gxSets, VK_SHADER_STAGE_VERTEX_BIT, 2 * sizeof(Mat3x4<float>), g_gxLayout) &&
+  // The GX programs' current position and normal matrices and a line's or point's mask (glsl.hpp), the clear's colour,
+  // and a copy's source rectangle.
+  static_assert(glsl::LineMaskOffset == 2 * sizeof(Mat3x4<float>));
+  return create_layout(gxSets, VK_SHADER_STAGE_VERTEX_BIT, glsl::LineMaskOffset + glsl::LineMaskBytes, g_gxLayout) &&
          create_layout({}, VK_SHADER_STAGE_FRAGMENT_BIT, 16, g_clearLayout) &&
-         create_layout(std::span{&g_sourceSetLayout, 1}, VK_SHADER_STAGE_VERTEX_BIT, 16, g_copyLayout);
+         create_layout(std::span{&g_sourceSetLayout, 1}, VK_SHADER_STAGE_VERTEX_BIT, 16, g_copyLayout) &&
+         create_layout(std::array{g_sourceSetLayout, g_sourceSetLayout},
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 32, g_paletteLayout);
 }
 
 // GX's blend, depth and cull state as Dawn's backend sets it (webgpu/backend.cpp, build_pipeline).
@@ -385,6 +394,8 @@ bool initialize_pipelines() noexcept {
   g_clearVertex = glsl::clear_vertex();
   g_clearFragment = glsl::clear_fragment();
   g_copyVertex = glsl::copy_vertex();
+  g_paletteFragments[0] = glsl::palette_fragment(false);
+  g_paletteFragments[1] = glsl::palette_fragment(true);
   initialize_programs();
   // The present copies the EFB to the swapchain's B8G8R8A8 images.
   g_presentPipeline = make_copy_pipeline(GX_TF_RGBA8, false, present_pass(Load::DontCare));
@@ -396,9 +407,15 @@ void shutdown_pipelines() noexcept {
     vkDestroyPipeline(g_device, pipeline, nullptr);
   }
   g_copyPipelines.clear();
+  for (auto& pipeline : g_palettePipelines) {
+    if (pipeline) {
+      vkDestroyPipeline(g_device, *pipeline, nullptr);
+    }
+    pipeline.reset();
+  }
   vkDestroyPipeline(g_device, g_presentPipeline, nullptr);
   g_presentPipeline = VK_NULL_HANDLE;
-  for (auto* layout : {&g_gxLayout, &g_clearLayout, &g_copyLayout}) {
+  for (auto* layout : {&g_gxLayout, &g_clearLayout, &g_copyLayout, &g_paletteLayout}) {
     vkDestroyPipelineLayout(g_device, *layout, nullptr);
     *layout = VK_NULL_HANDLE;
   }
@@ -417,6 +434,8 @@ VkDescriptorSetLayout texture_set_layout() noexcept { return g_textureSetLayout;
 VkDescriptorSetLayout source_set_layout() noexcept { return g_sourceSetLayout; }
 
 VkPipelineLayout copy_layout() noexcept { return g_copyLayout; }
+
+VkPipelineLayout palette_layout() noexcept { return g_paletteLayout; }
 
 VkBuffer triangle_buffer() noexcept { return g_triangle.buffer; }
 
@@ -478,6 +497,14 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& confi
         .offset = attribute.offset,
     });
   }
+  for (const auto& corner : pipeline->vertexLayout.corners) {
+    attributes.push_back({
+        .location = corner.location,
+        .binding = 0,
+        .format = attribute_format(corner.format),
+        .offset = corner.offset,
+    });
+  }
   std::lock_guard lock{g_pipelineMutex};
   const auto vertex = find_program(programs.vertex, false);
   const auto fragment = find_program(programs.fragment, true);
@@ -515,6 +542,26 @@ VkPipeline copy_pipeline(GXTexFmt format, bool opaqueAlpha) noexcept {
   // Kept even when it failed, so a broken copy logs once.
   g_copyPipelines.emplace(std::pair{format, opaqueAlpha}, pipeline);
   return pipeline;
+}
+
+VkPipeline palette_pipeline(bool fourBit) noexcept {
+  auto& pipeline = g_palettePipelines[fourBit ? 1 : 0];
+  if (!pipeline) {
+    const auto attributes = triangle_attributes();
+    std::lock_guard lock{g_pipelineMutex};
+    const auto vertex = find_program(g_copyVertex, false);
+    const auto fragment = find_program(g_paletteFragments[fourBit ? 1 : 0], true);
+    pipeline = vertex.empty() || fragment.empty() ? VK_NULL_HANDLE
+                                                  : create_pipeline({
+                                                        .vertex = vertex,
+                                                        .fragment = fragment,
+                                                        .layout = g_paletteLayout,
+                                                        .renderPass = color_pass(Load::DontCare),
+                                                        .stride = TriangleStride,
+                                                        .attributes = attributes,
+                                                    });
+  }
+  return *pipeline;
 }
 
 VkPipeline present_pipeline() noexcept { return g_presentPipeline; }

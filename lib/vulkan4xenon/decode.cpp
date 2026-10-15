@@ -500,12 +500,11 @@ void run_plan_firsts(const gx::ShaderConfig& config, const VertexLayout& layout,
     out += layout.stride;
   }
 }
-} // namespace
 
 // Layouts of the planned formats take a plan of one operation per attribute, chosen once for the draw, rather than
 // branching on each attribute's format for every vertex. Other layouts keep that per-vertex decode.
-bool decode_vertices(const gx::ShaderConfig& config, const VertexLayout& layout, const gx::DrawData& draw, Pool verts,
-                     Pool storage, const ArrayEnds& ends, uint8_t* out) noexcept {
+bool decode_gx_vertices(const gx::ShaderConfig& config, const VertexLayout& layout, const gx::DrawData& draw,
+                        Pool verts, Pool storage, const ArrayEnds& ends, uint8_t* out) noexcept {
   std::array<Step, MaxSteps> steps;
   size_t count = 0;
   Reach reach{ends};
@@ -515,6 +514,27 @@ bool decode_vertices(const gx::ShaderConfig& config, const VertexLayout& layout,
     decode_any(config, layout, draw, verts, storage, reach, out);
   }
   return reach.inside;
+}
+} // namespace
+
+// A line or point draw's GX vertices are decoded once, and their corners written from them, both in the CPU's cached
+// memory; the corners then go into the vertex cache a word at a time, as write_floats writes.
+bool decode_vertices(const gx::ShaderConfig& config, const VertexLayout& layout, const gx::DrawData& draw, Pool verts,
+                     Pool storage, const ArrayEnds& ends, uint8_t* out) noexcept {
+  if (layout.corners.empty()) {
+    return decode_gx_vertices(config, layout, draw, verts, storage, ends, out);
+  }
+  std::vector<uint8_t> decoded(size_t{draw.vtxCount} * layout.stride);
+  const bool inside = decode_gx_vertices(config, layout, draw, verts, storage, ends, decoded.data());
+  std::vector<uint8_t> corners(size_t{glsl::stream_vertices(config, draw.vtxCount)} * layout.stride);
+  glsl::write_corners(config, layout, decoded.data(), draw.vtxCount, corners.data());
+  auto* words = reinterpret_cast<volatile uint32_t*>(out);
+  for (size_t i = 0; i < corners.size() / sizeof(uint32_t); ++i) {
+    uint32_t word;
+    std::memcpy(&word, corners.data() + i * sizeof(uint32_t), sizeof(word));
+    words[i] = word;
+  }
+  return inside;
 }
 
 void decode_vertices(const gx::ShaderConfig& config, const VertexLayout& layout, const gx::DrawData& draw, Pool verts,
@@ -793,6 +813,14 @@ uint64_t decode_format(const gx::ShaderConfig& config, const VertexLayout& layou
     put(bytes, attribute.slice);
     put(bytes, attribute.offset);
     put(bytes, config.attrs[attribute.attr]);
+  }
+  // A line or point draw's corners: which primitive, and where each corner's values go.
+  if (!layout.corners.empty()) {
+    put(bytes, static_cast<uint8_t>(config.lineMode));
+    for (const auto& corner : layout.corners) {
+      put(bytes, corner.value);
+      put(bytes, corner.offset);
+    }
   }
   return XXH3_64bits(bytes.data(), bytes.size());
 }

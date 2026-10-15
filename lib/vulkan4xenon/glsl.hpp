@@ -14,7 +14,12 @@
 // - The vertex stage's push constant is the current position matrix's three rows, 48 bytes, then, where Programs'
 //   normalMatrix says, the current normal matrix's, 48 more: the matrices the draw selects. A matrix picked per vertex
 //   is read from its piece at its first row, a vertex attribute (decode.cpp), as xost reads a block's array at an
-//   index known only at run time (its docs/xsc.md).
+//   index known only at run time (its docs/xsc.md). A line or point program's has, at byte LineMaskOffset, 1 or 0 for
+//   each texture coordinate, whether the line's or point's texture offset moves it: the view piece's mask, which xost
+//   can't read bit by bit.
+// - A line or point draw is drawn as the WebGPU backend's (gx/shader.cpp): each segment or point a quad in screen
+//   space. The stream holds six vertices for each, two triangles, written by write_corners: each one of its ends' GX
+//   vertex, then its corner's own values (VertexLayout::corners).
 // - One vertex stream, binding 0, in the layout below. Locations follow xost's usages: position at 0, colour 0 at 1,
 //   texture coordinates from 2 (xost:xsc/resolve.py).
 // - The vertex program writes the WGSL's position with y negated, Vulkan's clip space.
@@ -35,6 +40,9 @@ namespace aurora::gfx::vulkan4xenon::glsl {
 inline constexpr uint32_t FogRangeSet = 2;
 inline constexpr uint32_t FogRangeTableWidth = 64;
 inline constexpr uint32_t FogRangeTableHeight = 32;
+// Where a line or point program's texture coordinate mask sits in the push constant, after both matrices: two vec4s.
+inline constexpr uint32_t LineMaskOffset = 96;
+inline constexpr uint32_t LineMaskBytes = 32;
 
 // vulkan4xenon's vertex formats, named here so the generator builds without Vulkan headers.
 enum class AttrFormat : uint8_t {
@@ -58,10 +66,36 @@ struct Attribute {
   NbtSlice slice = NbtSlice::Normal; // which vector of an NBT normal, for GX_VA_NRM
 };
 
+// A corner's own values, after its GX vertex's attributes.
+enum class CornerValue : uint8_t {
+  // vec2. A segment's: x, which side of it the corner is on, -1 or 1, as seen from its own end towards the other; y, 1
+  // on the side the texture offset moves, else 0. A point's: which corner, x and y each -1 or 1.
+  Corner,
+  OtherPos,   // vec3, a segment's: the other end's position
+  OtherPnmtx, // float, a segment's with a position matrix per vertex: the other end's matrix's first row
+};
+
+struct CornerAttribute {
+  uint32_t location;
+  AttrFormat format;
+  uint32_t offset; // bytes into the vertex
+  CornerValue value;
+};
+
 struct VertexLayout {
-  std::vector<Attribute> attributes;
+  std::vector<Attribute> attributes;    // a GX vertex's, as decode_vertices writes them
+  std::vector<CornerAttribute> corners; // a line or point config's, after them; none for others
   uint32_t stride = 0;
 };
+
+// How many vertices a draw of count GX vertices takes in the stream: six for each segment or point of a line or point
+// config, one for each vertex otherwise.
+uint32_t stream_vertices(const gx::ShaderConfig& config, uint32_t count) noexcept;
+
+// A line or point draw's stream from its count GX vertices, decoded at layout's stride: each segment's or point's six
+// corners, written to out, in the CPU's cached memory: its stores aren't the vertex cache's word at a time.
+void write_corners(const gx::ShaderConfig& config, const VertexLayout& layout, const uint8_t* decoded, uint32_t count,
+                   uint8_t* out) noexcept;
 
 struct Programs {
   VertexLayout layout;  // exactly the attributes the vertex program reads
@@ -87,6 +121,8 @@ std::string copy_vertex();
 // it doesn't convert. GX_TF_RGBA8 copies the texels as they are, as the present does.
 std::string copy_fragment(GXTexFmt format, bool opaqueAlpha);
 bool converts(GXTexFmt format) noexcept;
+// An EFB copy's 4- or 8-bit indices through the palette at set 1; the second push vector is (1, 0, 0.5, 0.5 N) / N.
+std::string palette_fragment(bool fourBit);
 // Every one of those programs, and whether it's a fragment program, for the recorder.
 std::vector<std::pair<std::string, bool>> fixed_programs();
 

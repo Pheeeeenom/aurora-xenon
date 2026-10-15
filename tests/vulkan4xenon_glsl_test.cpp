@@ -7,11 +7,14 @@
 #include <fmt/format.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 // What shader_info.cpp's uniform building reads, which the generator doesn't call.
 namespace aurora {
@@ -437,6 +440,128 @@ gx::ShaderConfig fogged(u8 type, bool range) {
   return config;
 }
 
+// GX lines, a line strip or points (lineMode 1 to 3), TEV stage 0 sampling map 0 at texture coordinate 0, TEX0 as it
+// is, times the rasterized colour; by the current position matrix or the one each vertex picks.
+gx::ShaderConfig lines(u8 lineMode, bool perVertex) {
+  auto config = rasterized();
+  config.lineMode = lineMode;
+  config.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32, .offset = 12};
+  config.vtxStride = 20;
+  if (perVertex) {
+    config.attrs[GX_VA_PNMTXIDX] = {.attrType = GX_DIRECT, .cnt = 1, .compType = GX_U8, .offset = 20};
+    config.vtxStride = 21;
+  }
+  config.tcgs[0] = {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0, .mtx = GX_IDENTITY};
+  auto& stage = config.tevStages[0];
+  stage.texCoordId = GX_TEXCOORD0;
+  stage.texMapId = GX_TEXMAP0;
+  stage.colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
+  return config;
+}
+
+TEST(Lines, AreQuadsAcrossEachSegment) {
+  for (const u8 mode : {1, 2}) {
+    for (const bool perVertex : {false, true}) {
+      const auto programs = built(lines(mode, perVertex));
+      ASSERT_FALSE(programs.vertex.empty()) << int{mode} << perVertex;
+      const auto& corners = programs.layout.corners;
+      ASSERT_EQ(corners.size(), perVertex ? 3u : 2u);
+      EXPECT_EQ(corners[0].value, glsl::CornerValue::Corner);
+      EXPECT_EQ(corners[1].value, glsl::CornerValue::OtherPos);
+      EXPECT_TRUE(has(programs.vertex, "vec4 line_mask[2];"));
+      EXPECT_TRUE(has(programs.vertex, "vec2(line_dir.y * -1.0, line_dir.x) * (line_width * in_corner.x)"));
+      EXPECT_EQ(has(programs.vertex, "upos.mtx[other_pnmtx]"), perVertex);
+      EXPECT_TRUE(has(programs.vertex, "vec3(0.0, in_corner.y, 0.0) * (uview.line_params.z * upush.line_mask[0].x)"));
+    }
+  }
+}
+
+TEST(Points, AreSquaresAboutEachPoint) {
+  const auto programs = built(lines(3, false));
+  ASSERT_EQ(programs.layout.corners.size(), 1u);
+  EXPECT_TRUE(has(programs.vertex, "vec2 corner_offset = in_corner * line_width / uview.viewport_sizes.xy;"));
+  EXPECT_TRUE(has(programs.vertex, "vec3(in_corner * 0.5 + 0.5, 0.0) * (uview.line_params.z * upush.line_mask[0].x)"));
+}
+
+TEST(Corners, CountSixASegmentOrPoint) {
+  EXPECT_EQ(glsl::stream_vertices(lines(1, false), 5), 12u);
+  EXPECT_EQ(glsl::stream_vertices(lines(2, false), 4), 18u);
+  EXPECT_EQ(glsl::stream_vertices(lines(2, false), 1), 0u);
+  EXPECT_EQ(glsl::stream_vertices(lines(3, false), 3), 18u);
+  EXPECT_EQ(glsl::stream_vertices(rasterized(), 7), 7u);
+}
+
+// Each corner write_corners writes, from decoded vertices whose position's x is their number and TEX0 ten times it:
+// the end it holds, the other end, and its corner values.
+struct Corner {
+  float end;
+  float other;
+  float x;
+  float y;
+};
+
+std::vector<Corner> corners_of(const gx::ShaderConfig& config, uint32_t count) {
+  const auto layout = glsl::build_programs(config).layout;
+  std::vector<uint8_t> decoded(size_t{count} * layout.stride);
+  for (uint32_t v = 0; v < count; ++v) {
+    const float values[5]{static_cast<float>(v), 0.f, 0.f, 10.f * v, 0.f};
+    std::memcpy(decoded.data() + size_t{v} * layout.stride, values, sizeof(values));
+  }
+  std::vector<uint8_t> out(size_t{glsl::stream_vertices(config, count)} * layout.stride);
+  glsl::write_corners(config, layout, decoded.data(), count, out.data());
+  std::vector<Corner> corners;
+  for (size_t i = 0; i < out.size(); i += layout.stride) {
+    Corner corner{};
+    float tex = 0.f;
+    std::memcpy(&corner.end, out.data() + i, sizeof(float));
+    std::memcpy(&tex, out.data() + i + 12, sizeof(float));
+    EXPECT_EQ(tex, 10.f * corner.end);
+    corner.other = -1.f;
+    for (const auto& value : layout.corners) {
+      if (value.value == glsl::CornerValue::Corner) {
+        std::memcpy(&corner.x, out.data() + i + value.offset, sizeof(float));
+        std::memcpy(&corner.y, out.data() + i + value.offset + 4, sizeof(float));
+      } else if (value.value == glsl::CornerValue::OtherPos) {
+        std::memcpy(&corner.other, out.data() + i + value.offset, sizeof(float));
+      }
+    }
+    corners.push_back(corner);
+  }
+  return corners;
+}
+
+void expect_corners(const std::vector<Corner>& got, const std::vector<Corner>& want) {
+  ASSERT_EQ(got.size(), want.size());
+  for (size_t i = 0; i < got.size(); ++i) {
+    EXPECT_EQ(got[i].end, want[i].end) << i;
+    EXPECT_EQ(got[i].other, want[i].other) << i;
+    EXPECT_EQ(got[i].x, want[i].x) << i;
+    EXPECT_EQ(got[i].y, want[i].y) << i;
+  }
+}
+
+// WebGPU's corners 0, 1, 3, 3, 2, 0: 2 and 3 at the second end, odd ones on the side the texture offset moves. Seen
+// from the second end, that side is the other one across.
+TEST(Corners, AreEachSegmentsEndsWithTheOtherEnd) {
+  const std::vector<Corner> segment01{{0, 1, -1, 0}, {0, 1, 1, 1}, {1, 0, -1, 1},
+                                      {1, 0, -1, 1}, {1, 0, 1, 0}, {0, 1, -1, 0}};
+  auto twoSegments = segment01;
+  for (const auto& corner : segment01) {
+    twoSegments.push_back({corner.end + 2, corner.other + 2, corner.x, corner.y});
+  }
+  expect_corners(corners_of(lines(1, false), 4), twoSegments);
+  auto strip = segment01;
+  for (const auto& corner : segment01) {
+    strip.push_back({corner.end + 1, corner.other + 1, corner.x, corner.y});
+  }
+  expect_corners(corners_of(lines(2, false), 3), strip);
+}
+
+TEST(Corners, AreEachPointsFourCorners) {
+  expect_corners(corners_of(lines(3, false), 1),
+                 {{0, -1, -1, -1}, {0, -1, 1, -1}, {0, -1, 1, 1}, {0, -1, 1, 1}, {0, -1, -1, 1}, {0, -1, -1, -1}});
+}
+
 TEST(MathCases, AreWritten) {
   named("lit_spot_clamp", lit(GX_DF_CLAMP, GX_AF_SPOT, 0x05));
   named("lit_spec_sign_alpha", lit(GX_DF_SIGN, GX_AF_SPEC, 0x06, true));
@@ -467,5 +592,19 @@ TEST(MathCases, AreWritten) {
     named("indirect_bump", config);
   }
   named("scene", scene());
+  named("line_current", lines(1, false));
+  named("line_picked", lines(2, true));
+  named("points", lines(3, false));
+}
+
+// An EFB copy's index, 8 or 4 bits, scaled back from the copy's texel and looked up halfway into its palette entry.
+TEST(PaletteConversion, ScalesTheIndexByItsBitsAndReadsTheEntrysMiddle) {
+  EXPECT_TRUE(has(glsl::palette_fragment(false), "floor(texture(source, in_uv) * 255.0 + 0.5)"));
+  EXPECT_TRUE(has(glsl::palette_fragment(true), "floor(texture(source, in_uv) * 15.0 + 0.5)"));
+  EXPECT_TRUE(has(glsl::palette_fragment(false), "index.xx * upush.palette_scale.xy + upush.palette_scale.zw"));
+  const auto programs = glsl::fixed_programs();
+  for (const bool fourBit : {false, true}) {
+    EXPECT_NE(std::ranges::find(programs, std::pair{glsl::palette_fragment(fourBit), true}), programs.end());
+  }
 }
 } // namespace

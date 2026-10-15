@@ -139,6 +139,8 @@ VkDescriptorSetLayout texture_set_layout() noexcept;
 // The one texture a copy or the present samples, and set 2 of the GX layout, the range fog table (glsl.hpp).
 VkDescriptorSetLayout source_set_layout() noexcept;
 VkPipelineLayout copy_layout() noexcept;
+// A palette conversion's: the copy at set 0, the palette at set 1, and the copy's push constant with 1 / its entries.
+VkPipelineLayout palette_layout() noexcept;
 // Three vertices covering any framebuffer: positions and texture coordinates.
 VkBuffer triangle_buffer() noexcept;
 
@@ -153,6 +155,8 @@ bool converts(GXTexFmt format) noexcept;
 // Render worker: the pipeline drawing a copy to `format`, with alpha read as 1 when opaqueAlpha is set (copies from an
 // EFB without alpha, as tex_copy_conv's are); null when it can't be made.
 VkPipeline copy_pipeline(GXTexFmt format, bool opaqueAlpha) noexcept;
+// Render worker: the pipeline converting a copy's 8-bit or 4-bit indices through a palette; null when it can't be made.
+VkPipeline palette_pipeline(bool fourBit) noexcept;
 // The copy of the EFB into a swapchain image; null when its programs aren't in the pack.
 VkPipeline present_pipeline() noexcept;
 

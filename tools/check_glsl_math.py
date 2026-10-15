@@ -3,7 +3,7 @@
 writes for its named configs (MathCases, AURORA_GLSL_NAMED_DIR) on xost's simulator, compiled as the game's pack is,
 glslang to SPIR-V and xost to Xenos microcode, and compares what they compute with this tool's own reference of
 lib/gx/shader.cpp's WGSL: lighting, fog with its range adjustment, matrices picked per vertex and indirect texturing
-(vulkan4xenon's milestone 11, step 5).
+(vulkan4xenon's milestone 11, step 5), and the corners of lines and points (milestone 14).
 
     check_glsl_math.py --xost <xost tree> [--glslang <glslang>] <directory of named programs>
 
@@ -534,9 +534,92 @@ def check_scene(programs, name, failures):
         failures.append(f"{name}: colour {color}, want {want}")
 
 
+# Lines and points (milestone 14): GX's line width 54, in sixths of a pixel, and a texture offset; the render viewport
+# twice the logical one across and half again down, so the width scales by the smaller, 1.5. A segment's two ends, or
+# the point at the first: position, TEX0 and the matrix it picks.
+LINE_WIDTH = 9.0
+LINE_TEX_OFFSET = 0.25
+LINE_VIEWPORT = [1280.0, 720.0, 640.0, 480.0]
+LINE_ENDS = [([0.3, -0.2, 0.5], [0.35, 0.65], 2), ([-0.4, 0.25, 0.1], [0.8, 0.15], 5)]
+
+
+def line_uniforms(mask):
+    values = uniforms()
+    values["uview.viewport_sizes"] = [LINE_VIEWPORT]
+    values["uview.line_params"] = [[LINE_WIDTH, 1.0, LINE_TEX_OFFSET, 0.0]]
+    values["upush.line_mask"] = [[1.0 if mask >> i & 1 else 0.0 for i in range(k, k + 4)] for k in (0, 4)]
+    return values
+
+
+def clip_of(position, pnmtx):
+    mv = rows3x4(pos_matrix(pnmtx), position + [1.0])
+    return [dot(row, mv + [1.0]) for row in PROJ]
+
+
+def ref_corner(points, vidx, picked, mask):
+    """shader.cpp's corner vidx of the segment between LINE_ENDS, or of the point at the first: its clip position, and
+    TEX0 moved by the texture offset where the mask says."""
+    render, logical = LINE_VIEWPORT[:2], LINE_VIEWPORT[2:]
+    width = LINE_WIDTH * min(render[0] / max(logical[0], 1.0), render[1] / max(logical[1], 1.0))
+
+    def clip_at(end):
+        return clip_of(LINE_ENDS[end][0], LINE_ENDS[end][2] if picked else CURRENT_PNMTX)
+
+    if points:
+        clip = clip_at(0)
+        sign = [1.0 if vidx & 1 else -1.0, 1.0 if vidx >= 2 else -1.0]
+        offset = [s * (width / 2.0) * 2.0 / r for s, r in zip(sign, render)]
+        uv = list(LINE_ENDS[0][1])
+        if mask & 1:
+            uv = [uv[0] + (LINE_TEX_OFFSET if vidx & 1 else 0.0), uv[1] + (LINE_TEX_OFFSET if vidx >= 2 else 0.0)]
+    else:
+        clip_a, clip_b = clip_at(0), clip_at(1)
+        delta = [(b[k] / b[3] - a[k] / a[3]) / 2.0 * render[k] for a, b, k in ((clip_a, clip_b, 0), (clip_a, clip_b, 1))]
+        direction = normalize(delta) if dot(delta, delta) > 1e-10 else [1.0, 0.0]
+        perp = [-direction[1], direction[0]]
+        side = 1.0 if vidx & 1 else -1.0
+        offset = [p * (width / 2.0) * side * 2.0 / r for p, r in zip(perp, render)]
+        clip = clip_b if vidx >= 2 else clip_a
+        uv = list(LINE_ENDS[1 if vidx >= 2 else 0][1])
+        if mask & 1 and vidx & 1:
+            uv[1] += LINE_TEX_OFFSET
+    return [clip[0] + offset[0] * clip[3], clip[1] + offset[1] * clip[3], clip[2], clip[3]], uv
+
+
+def corner_attributes(points, vidx, picked):
+    """What lib/vulkan4xenon/glsl.cpp's write_corners puts in corner vidx's vertex."""
+    second = vidx >= 2 and not points
+    end, other = (1, 0) if second else (0, 1)
+    side = 1.0 if vidx & 1 else -1.0
+    corner = [side, 1.0 if vidx >= 2 else -1.0] if points else [-side if second else side, 1.0 if vidx & 1 else 0.0]
+    attributes = {"in_pos": LINE_ENDS[end][0], "in_tex0_uv": LINE_ENDS[end][1], "in_corner": corner}
+    if not points:
+        attributes["in_other_pos"] = LINE_ENDS[other][0]
+    if picked:
+        attributes["in_pnmtxidx"] = [LINE_ENDS[end][2] * 3.0]
+        attributes["in_other_pnmtx"] = [LINE_ENDS[other][2] * 3.0]
+    return attributes
+
+
+def check_lines(programs, name, failures):
+    points, picked = name == "points", name == "line_picked"
+    for mask in (0, 1):
+        for vidx in range(4):
+            where = f"{name} mask {mask} corner {vidx}"
+            outputs, position = programs.vertex(line_uniforms(mask), corner_attributes(points, vidx, picked))
+            clip, uv = ref_corner(points, vidx, picked, mask)
+            want = [clip[0], -clip[1], clip[2], clip[3]]
+            # Closer than check_position: the corner's move is a few hundredths of the position.
+            if not close(position, want, 1e-5):
+                failures.append(f"{where}: position {position}, want {want}")
+            if not close(outputs.get("out_tex0_uv"), uv, 1e-5):
+                failures.append(f"{where}: tex0_uv {outputs.get('out_tex0_uv')}, want {uv}")
+
+
 CHECKS = {**{name: check_lit for name in LIT}, **{name: check_fog for name in FOG},
           "texmtx_fixed": check_texmtx, "texmtx_picked": check_texmtx, "indirect_mtx": check_indirect,
-          "indirect_dynamic_s": check_indirect, "indirect_bump": check_indirect, "scene": check_scene}
+          "indirect_dynamic_s": check_indirect, "indirect_bump": check_indirect, "scene": check_scene,
+          "line_current": check_lines, "line_picked": check_lines, "points": check_lines}
 
 
 def main():

@@ -109,9 +109,12 @@ PipelineRef g_currentPipeline = UINTPTR_MAX;
 std::shared_ptr<backend::Pipeline> g_currentPipelineObject;
 VkPipelineLayout g_currentLayout = VK_NULL_HANDLE;
 VkDescriptorSet g_boundTextures = VK_NULL_HANDLE;
-// The position and normal matrices last pushed, by their places in the frame's uniform data.
+// The position and normal matrices last pushed, by their places in the frame's uniform data, and a line or point
+// draw's texture coordinate mask (glsl.hpp), NoLineMask for none.
 const uint8_t* g_pushedMatrix = nullptr;
 const uint8_t* g_pushedNormalMatrix = nullptr;
+constexpr uint32_t NoLineMask = UINT32_MAX;
+uint32_t g_pushedLineMask = NoLineMask;
 // The texture set last looked up, by its ref: consecutive draws often share one, and texture_set takes a lock and a
 // lookup. A ref's set stays the same while a pass is recorded; expire_texture_sets runs after the frame's last.
 std::optional<BindGroupRef> g_lookedUpRef;
@@ -329,10 +332,11 @@ VkDescriptorSet source_set(backend::Texture& texture, bool linear) noexcept {
   return set;
 }
 
-// A pass drawing one texture over a target, for copies and the present. source is offset and scale in it.
-void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
-                  const VkViewport& viewport, VkPipeline pipeline, VkDescriptorSet set,
-                  const std::array<float, 4>& source) noexcept {
+// A pass drawing the triangle over a target through layout's sets and push constants.
+void draw_triangle(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
+                   const VkViewport& viewport, VkPipeline pipeline, VkPipelineLayout layout,
+                   std::span<const VkDescriptorSet> sets, VkShaderStageFlags pushStages,
+                   std::span<const float> push) noexcept {
   const VkClearValue black{};
   const VkRenderPassBeginInfo begin{
       .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -344,8 +348,9 @@ void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer fr
   };
   vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copy_layout(), 0, 1, &set, 0, nullptr);
-  vkCmdPushConstants(cmd, copy_layout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(source), source.data());
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, static_cast<uint32_t>(sets.size()),
+                          sets.data(), 0, nullptr);
+  vkCmdPushConstants(cmd, layout, pushStages, 0, static_cast<uint32_t>(push.size_bytes()), push.data());
   vkCmdSetViewport(cmd, 0, 1, &viewport);
   const VkRect2D scissor{{0, 0}, extent};
   vkCmdSetScissor(cmd, 0, 1, &scissor);
@@ -354,6 +359,14 @@ void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer fr
   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
   vkCmdDraw(cmd, 3, 1, 0, 0);
   vkCmdEndRenderPass(cmd);
+}
+
+// A pass drawing one texture over a target, for copies and the present. source is offset and scale in it.
+void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
+                  const VkViewport& viewport, VkPipeline pipeline, VkDescriptorSet set,
+                  const std::array<float, 4>& source) noexcept {
+  draw_triangle(cmd, renderPass, framebuffer, extent, viewport, pipeline, copy_layout(), std::span{&set, 1},
+                VK_SHADER_STAGE_VERTEX_BIT, source);
 }
 
 // The bytes the game recorded into a CPU pool since the last copy, up to the op's high-water mark, into the GPU's.
@@ -422,6 +435,7 @@ void use_pipeline(PipelineRef ref, std::shared_ptr<backend::Pipeline> pipeline, 
     g_boundFogRange = VK_NULL_HANDLE;
     g_pushedMatrix = nullptr;
     g_pushedNormalMatrix = nullptr;
+    g_pushedLineMask = NoLineMask;
   }
   g_currentPipeline = ref;
   g_currentPipelineObject = std::move(pipeline);
@@ -447,6 +461,7 @@ void reset_bindings() noexcept {
   g_boundFogRange = VK_NULL_HANDLE;
   g_pushedMatrix = nullptr;
   g_pushedNormalMatrix = nullptr;
+  g_pushedLineMask = NoLineMask;
   g_lookedUpRef.reset();
 }
 
@@ -549,6 +564,11 @@ const decode::IndexList& listed_draw_list(size_t i, std::span<const uint8_t> ver
                      stride, count);
 }
 
+// An unlisted draw's bytes in the vertex cache: a line or point draw's corners.
+VkDeviceSize stream_bytes(const decode::KeyedDraw& keyed) noexcept {
+  return VkDeviceSize{glsl::stream_vertices(*keyed.config, keyed.draw->vtxCount)} * keyed.layout->stride;
+}
+
 // Where a draw's vertices, and a listed draw's list before them, are in the vertex cache.
 void set_place(PassDraw& draw, VkDeviceSize offset, const decode::KeyedDraw& keyed) noexcept {
   draw.indices = keyed.listed ? offset : NoIndices;
@@ -576,9 +596,8 @@ void forget_reads_past_arrays(FrameState& state, std::span<const uint8_t> verts,
     const decode::KeyedDraw& keyed = g_keyedDraws[i];
     PassDraw& draw = g_passDraws[g_keyedPlaces[i]];
     const decode::IndexList* list = keyed.listed ? &listed_draw_list(i, verts) : nullptr;
-    const auto place =
-        g_cache.place(std::nullopt, list != nullptr ? decode::listed_entry_size(*list, keyed.layout->stride)
-                                                    : VkDeviceSize{keyed.draw->vtxCount} * keyed.layout->stride);
+    const auto place = g_cache.place(
+        std::nullopt, list != nullptr ? decode::listed_entry_size(*list, keyed.layout->stride) : stream_bytes(keyed));
     if (!place) {
       ++state.verticesSkipped;
       draw.decoded = false;
@@ -657,7 +676,7 @@ void lay_out_pass(const detail::FramePacket& frame, FrameState& state, const det
         place = g_cache.place(g_drawKeys[i], decode::listed_entry_size(*list, keyed.layout->stride));
       }
     } else {
-      place = g_cache.place(g_drawKeys[i], VkDeviceSize{keyed.draw->vtxCount} * keyed.layout->stride);
+      place = g_cache.place(g_drawKeys[i], stream_bytes(keyed));
     }
     if (!place) {
       ++state.verticesSkipped;
@@ -727,8 +746,28 @@ void draw_gx(const FrameState& state, const gx::DrawData& data, const PassDraw& 
       g_pushedNormalMatrix = normal;
     }
   }
+  // A line or point program's texture coordinates the offset moves, from the view piece's mask.
+  if (!pipeline.vertexLayout.corners.empty()) {
+    uint32_t mask = 0;
+    std::memcpy(&mask,
+                state.uniformData.get() + data.uniformOffsets[gx::UniformView] +
+                    offsetof(gx::ViewUniform, lineTexCoordMask),
+                sizeof(mask));
+    if (g_pushedLineMask != mask) {
+      std::array<float, glsl::LineMaskBytes / sizeof(float)> moved{};
+      for (size_t i = 0; i < moved.size(); ++i) {
+        moved[i] = (mask >> i & 1) != 0 ? 1.f : 0.f;
+      }
+      vkCmdPushConstants(cmd, pipeline.layout, VK_SHADER_STAGE_VERTEX_BIT, glsl::LineMaskOffset, glsl::LineMaskBytes,
+                         moved.data());
+      g_pushedLineMask = mask;
+    }
+  }
   vkCmdBindVertexBuffers(cmd, 0, 1, &g_vertexCache.buffer, &offset);
-  if (draw.indices != NoIndices) {
+  if (!pipeline.vertexLayout.corners.empty()) {
+    // Two triangles a segment or point, whatever indices the draw came with.
+    vkCmdDraw(cmd, glsl::stream_vertices(pipeline.shaderConfig, data.vtxCount), 1, 0, 0);
+  } else if (draw.indices != NoIndices) {
     // Each vertex names its first equal vertex, decoded once: the same triangles, and the GPU transforms each distinct
     // vertex once.
     vkCmdBindIndexBuffer(cmd, g_vertexCache.buffer, draw.indices, VK_INDEX_TYPE_UINT16);
@@ -792,14 +831,44 @@ void encode_copy(const detail::RenderPass& pass, backend::Texture& source, VkCom
   draw_texture(cmd, color_pass(Load::DontCare), framebuffer, extent, viewport, pipeline, set, sourceRect);
 }
 
+// An EFB copy's indices through a palette into its RGBA8 texture, as the WebGPU backend's tex_palette_conv does.
+void encode_palette_conv(const tex_palette_conv::ConvRequest& conv, VkCommandBuffer cmd) noexcept {
+  // gx/texture.cpp asks for 8-bit and 4-bit indices only, from EFB copies.
+  if (conv.variant == tex_palette_conv::Variant::Direct) {
+    static std::once_flag once;
+    std::call_once(once, [] { Log.error("Palette conversions of 16-bit indices aren't supported"); });
+    return;
+  }
+  backend::Texture* const source = conv.src ? conv.src->gpu.get() : nullptr;
+  backend::Texture* const target = conv.dst ? conv.dst->gpu.get() : nullptr;
+  backend::Texture* const palette = conv.tlut ? conv.tlut->gpu.get() : nullptr;
+  if (source == nullptr || target == nullptr || palette == nullptr || palette->width == 0) {
+    return;
+  }
+  const VkPipeline pipeline = palette_pipeline(conv.variant == tex_palette_conv::Variant::FromFloat4);
+  const VkFramebuffer framebuffer = target_framebuffer(*target, nullptr);
+  const std::array sets{source_set(*source, false), source_set(*palette, false)};
+  if (pipeline == VK_NULL_HANDLE || framebuffer == VK_NULL_HANDLE || sets[0] == VK_NULL_HANDLE ||
+      sets[1] == VK_NULL_HANDLE) {
+    return;
+  }
+  // The whole copy, texel for texel; then an index's scale and offset to the middle of its entry in the palette.
+  const float entry = 1.f / static_cast<float>(palette->width);
+  const std::array<float, 8> push{0.f, 0.f, 1.f, 1.f, entry, 0.f, 0.5f * entry, 0.5f};
+  const VkExtent2D extent{target->width, target->height};
+  const VkViewport viewport{0.f, 0.f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.f, 1.f};
+  draw_triangle(cmd, color_pass(Load::DontCare), framebuffer, extent, viewport, pipeline, palette_layout(), sets,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, push);
+}
+
 void encode_pass(const detail::FramePacket& frame, FrameState& state, const detail::FrameOp& op,
                  detail::RenderPass& pass, VkCommandBuffer cmd) noexcept {
   if (!pass.sealed) {
     return;
   }
-  if (!pass.paletteConvs.empty()) {
-    static std::once_flag once;
-    std::call_once(once, [] { Log.error("Palette conversions of EFB copies aren't supported"); });
+  // Before the pass, where the WebGPU backend runs them (gfx/encoding.cpp, render).
+  for (const auto& conv : pass.paletteConvs) {
+    encode_palette_conv(conv, cmd);
   }
   if (pass.discardable) {
     return;

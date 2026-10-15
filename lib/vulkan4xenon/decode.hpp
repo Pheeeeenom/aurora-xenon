@@ -24,7 +24,8 @@ using NbtSlice = glsl::NbtSlice;
 using Attribute = glsl::Attribute;
 using VertexLayout = glsl::VertexLayout;
 
-// Render worker, per draw: the draw's vertices in layout's stream, from the frame's vertex and storage pools.
+// Render worker, per draw: the draw's vertices in layout's stream, from the frame's vertex and storage pools; a line or
+// point draw's corners (glsl::write_corners), glsl::stream_vertices of them.
 void decode_vertices(const gx::ShaderConfig& config, const VertexLayout& layout, const gx::DrawData& draw,
                      std::span<const uint8_t> verts, std::span<const uint8_t> storage, uint8_t* out) noexcept;
 
