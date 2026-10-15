@@ -1497,6 +1497,43 @@ constexpr std::array CopyConversions{
     CopyConversion{GX_CTF_RG8, "c.rrrg"sv},
     CopyConversion{GX_CTF_GB8, "c.gggb"sv},
 };
+
+// z24's second and low bytes, for the programs that write them (depth_fragment).
+constexpr std::string_view MiddleByte = "    vec4 middle = floor(z24 * (1.0 / 256.0)) - high * 256.0;\n"sv;
+constexpr std::string_view LowByte = "    vec4 low = z24 - floor(z24 * (1.0 / 256.0)) * 256.0;\n"sv;
+
+// What a depth copy writes: tex_copy_conv.cpp's FragZ8, z24's high byte as intensity, and FragZ16, its high byte as
+// intensity and the next as alpha (depth_fragment).
+struct DepthCopy {
+  GXTexFmt format;
+  std::string_view bytes;
+  std::string_view result;
+};
+constexpr std::array DepthCopies{
+    DepthCopy{GX_TF_Z8, ""sv, "high * (1.0 / 255.0)"sv},
+    DepthCopy{GX_TF_Z16, MiddleByte, "vec4(high.xyz, middle.x) * (1.0 / 255.0)"sv},
+};
+
+// A depth copy's or snapshot's program: z24, GX's 24-bit z of the depth sampled, as tex_copy_conv.cpp's gx_z24 takes
+// it from reversed Z (gx::UseReversedZ), and high, its high byte; then the bytes's statements and what it writes. The
+// samples are nearest, the layer's only filter for D24S8 (vulkan4xenon's docs/SUPPORT.md, Images), which lands on the
+// texel gx_z24's floor does. The bytes come from multiplies by powers of two, which are exact, and floors. All of it
+// is in vectors, as xost lowers a component taken out of one only into another (xsdk:src/xsc_lower.c, value_operand).
+std::string depth_fragment(std::string_view bytes, std::string_view result) {
+  static_assert(gx::UseReversedZ);
+  return fmt::format(
+      "#version 450\n"
+      "layout(set = 0, binding = 0) uniform sampler2D source;\n"
+      "layout(location = 0) in vec2 in_uv;\n"
+      "layout(location = 0) out vec4 o_color;\n"
+      "void main() {{\n"
+      "    vec4 z24 = min(floor(clamp(1.0 - texture(source, in_uv).rrrr, 0.0, 1.0) * 16777215.0 + 0.5), 16777215.0);\n"
+      "    vec4 high = floor(z24 * (1.0 / 65536.0));\n"
+      "{}"
+      "    o_color = {};\n"
+      "}}\n",
+      bytes, result);
+}
 } // namespace
 
 std::string clear_vertex() {
@@ -1535,6 +1572,9 @@ std::string copy_vertex() {
 
 // Sampled alpha is read as 1 in a copy from an EFB without alpha (tex_copy_conv.cpp, sample_efb).
 std::string copy_fragment(GXTexFmt format, bool opaqueAlpha) {
+  if (const auto depth = std::ranges::find(DepthCopies, format, &DepthCopy::format); depth != DepthCopies.end()) {
+    return depth_fragment(depth->bytes, depth->result);
+  }
   const auto conversion = std::ranges::find(CopyConversions, format, &CopyConversion::format);
   if (conversion == CopyConversions.end()) {
     return {};
@@ -1556,8 +1596,13 @@ std::string copy_fragment(GXTexFmt format, bool opaqueAlpha) {
 }
 
 bool converts(GXTexFmt format) noexcept {
-  return format != GX_TF_RGBA8 &&
-         std::ranges::find(CopyConversions, format, &CopyConversion::format) != CopyConversions.end();
+  return (format != GX_TF_RGBA8 &&
+          std::ranges::find(CopyConversions, format, &CopyConversion::format) != CopyConversions.end()) ||
+         std::ranges::find(DepthCopies, format, &DepthCopy::format) != DepthCopies.end();
+}
+
+std::string depth_peek_fragment() {
+  return depth_fragment(fmt::format("{}{}", MiddleByte, LowByte), "vec4(high.x, middle.x, low.x, 0.0) * (1.0 / 255.0)"sv);
 }
 
 std::string palette_fragment(bool fourBit) {
@@ -1590,6 +1635,10 @@ std::vector<std::pair<std::string, bool>> fixed_programs() {
       programs.emplace_back(copy_fragment(conversion.format, opaqueAlpha), true);
     }
   }
+  for (const auto& copy : DepthCopies) {
+    programs.emplace_back(copy_fragment(copy.format, false), true);
+  }
+  programs.emplace_back(depth_peek_fragment(), true);
   for (const bool fourBit : {false, true}) {
     programs.emplace_back(palette_fragment(fourBit), true);
   }

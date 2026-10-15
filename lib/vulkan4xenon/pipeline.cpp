@@ -45,6 +45,8 @@ absl::flat_hash_map<std::pair<GXTexFmt, bool>, VkPipeline> g_copyPipelines;
 // Render worker only. For 8-bit indices, then 4-bit; made at the first conversion, null kept when they failed.
 std::array<std::optional<VkPipeline>, 2> g_palettePipelines;
 std::array<std::string, 2> g_paletteFragments;
+// Made on GXPeekZ's first snapshot.
+std::optional<VkPipeline> g_depthPeekPipeline;
 
 bool create_module(Program program, VkShaderModule& out) noexcept {
   const VkShaderModuleCreateInfo info{
@@ -413,6 +415,10 @@ void shutdown_pipelines() noexcept {
     }
     pipeline.reset();
   }
+  if (g_depthPeekPipeline) {
+    vkDestroyPipeline(g_device, *g_depthPeekPipeline, nullptr);
+  }
+  g_depthPeekPipeline.reset();
   vkDestroyPipeline(g_device, g_presentPipeline, nullptr);
   g_presentPipeline = VK_NULL_HANDLE;
   for (auto* layout : {&g_gxLayout, &g_clearLayout, &g_copyLayout, &g_paletteLayout}) {
@@ -562,6 +568,25 @@ VkPipeline palette_pipeline(bool fourBit) noexcept {
                                                     });
   }
   return *pipeline;
+}
+
+VkPipeline depth_peek_pipeline() noexcept {
+  if (!g_depthPeekPipeline) {
+    const auto attributes = triangle_attributes();
+    std::lock_guard lock{g_pipelineMutex};
+    const auto vertex = find_program(g_copyVertex, false);
+    const auto fragment = find_program(glsl::depth_peek_fragment(), true);
+    g_depthPeekPipeline = vertex.empty() || fragment.empty() ? VK_NULL_HANDLE
+                                                             : create_pipeline({
+                                                                   .vertex = vertex,
+                                                                   .fragment = fragment,
+                                                                   .layout = g_copyLayout,
+                                                                   .renderPass = color_pass(Load::DontCare),
+                                                                   .stride = TriangleStride,
+                                                                   .attributes = attributes,
+                                                               });
+  }
+  return *g_depthPeekPipeline;
 }
 
 VkPipeline present_pipeline() noexcept { return g_presentPipeline; }

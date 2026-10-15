@@ -88,8 +88,9 @@ VkExtent2D g_swapchainExtent{};
 std::vector<VkImage> g_swapchainImages;
 std::vector<VkImageView> g_swapchainViews;
 std::vector<VkFramebuffer> g_swapchainFramebuffers;
-// By whether depth is stored, then colour load op, then depth load op. Scenes only load or clear.
-std::array<std::array<std::array<VkRenderPass, 3>, 3>, 2> g_scenePasses{};
+// By how depth is left (DepthStore), whether a loaded depth was left to be read, then colour load op, then depth load
+// op. Scenes only load or clear.
+std::array<std::array<std::array<std::array<VkRenderPass, 3>, 3>, 2>, 3> g_scenePasses{};
 std::array<VkRenderPass, 3> g_colorPasses{};
 // The swapchain's, cleared and left as it is, by Load.
 std::array<VkRenderPass, 3> g_presentPasses{};
@@ -109,6 +110,9 @@ bool fits_cached(uint32_t memoryTypeBits) noexcept {
   const uint32_t type = g_pools[CachedPool].type;
   return type != g_pools[VideoPool].type && (memoryTypeBits & (1u << type)) != 0;
 }
+
+// The most anisotropy samplers may ask for: the layer's limit when it has the samplerAnisotropy feature, else 1.
+float g_maxAnisotropy = 1.f;
 
 VkCommandPool g_commandPool = VK_NULL_HANDLE;
 std::array<VkCommandBuffer, detail::FrameSlotCount> g_commands{};
@@ -224,8 +228,8 @@ bool add_block(MemoryPool& pool, VkDeviceSize minSize) noexcept {
   return true;
 }
 
-bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, bool storeDepth, VkRenderPass& out,
-                        VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM) noexcept {
+bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore depthStore, bool fromRead,
+                        VkRenderPass& out, VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM) noexcept {
   const auto load_op = [](Load load) {
     switch (load) {
     case Load::Load:
@@ -237,8 +241,15 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, bool storeDe
     }
     return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   };
-  // The layer replays in order and its barriers record nothing (its docs/SUPPORT.md, Commands), so layouts change
-  // nothing, and GENERAL suits every use.
+  // The layer replays in order and its barriers record nothing (its docs/SUPPORT.md, Commands), so colour's layouts
+  // change nothing, and GENERAL suits every use. Depth's say when a shader reads it next: the layer copies it out of
+  // eDRAM into its image only for a pass that stores it and leaves it to be read (its docs/SUPPORT.md, Images), so
+  // passes the next one loads keep it as an attachment.
+  const VkImageLayout depthBefore = depthLoad != Load::Load ? VK_IMAGE_LAYOUT_UNDEFINED
+                                    : fromRead              ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                            : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  const VkImageLayout depthAfter = depthStore == DepthStore::Read ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                                  : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
   const std::array attachments{
       VkAttachmentDescription{
           .format = colorFormat,
@@ -254,15 +265,16 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, bool storeDe
           .format = VK_FORMAT_D24_UNORM_S8_UINT,
           .samples = VK_SAMPLE_COUNT_1_BIT,
           .loadOp = load_op(depthLoad),
-          .storeOp = storeDepth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .storeOp = depthStore == DepthStore::Dropped ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                                       : VK_ATTACHMENT_STORE_OP_STORE,
           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
           .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-          .initialLayout = VK_IMAGE_LAYOUT_GENERAL,
-          .finalLayout = VK_IMAGE_LAYOUT_GENERAL,
+          .initialLayout = depthBefore,
+          .finalLayout = depthAfter,
       },
   };
   const VkAttachmentReference colorRef{.attachment = 0, .layout = VK_IMAGE_LAYOUT_GENERAL};
-  const VkAttachmentReference depthRef{.attachment = 1, .layout = VK_IMAGE_LAYOUT_GENERAL};
+  const VkAttachmentReference depthRef{.attachment = 1, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
   const VkSubpassDescription subpass{
       .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
       .colorAttachmentCount = 1,
@@ -281,24 +293,28 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, bool storeDe
 
 bool create_render_passes() noexcept {
   constexpr std::array SceneLoads{Load::Load, Load::Clear};
-  for (const bool storeDepth : {true, false}) {
-    for (const Load color : SceneLoads) {
-      for (const Load depth : SceneLoads) {
-        if (!create_render_pass(true, color, depth, storeDepth,
-                                g_scenePasses[storeDepth][static_cast<size_t>(color)][static_cast<size_t>(depth)])) {
-          return false;
+  for (const DepthStore store : {DepthStore::Kept, DepthStore::Read, DepthStore::Dropped}) {
+    for (const bool fromRead : {false, true}) {
+      for (const Load color : SceneLoads) {
+        for (const Load depth : SceneLoads) {
+          if (!create_render_pass(true, color, depth, store, fromRead,
+                                  g_scenePasses[static_cast<size_t>(store)][fromRead][static_cast<size_t>(color)]
+                                               [static_cast<size_t>(depth)])) {
+            return false;
+          }
         }
       }
     }
   }
   for (const Load color : {Load::Load, Load::Clear, Load::DontCare}) {
-    if (!create_render_pass(false, color, Load::DontCare, true, g_colorPasses[static_cast<size_t>(color)])) {
+    if (!create_render_pass(false, color, Load::DontCare, DepthStore::Kept, false,
+                            g_colorPasses[static_cast<size_t>(color)])) {
       return false;
     }
   }
   for (const Load color : {Load::Clear, Load::DontCare}) {
-    if (!create_render_pass(false, color, Load::DontCare, true, g_presentPasses[static_cast<size_t>(color)],
-                            VK_FORMAT_B8G8R8A8_UNORM)) {
+    if (!create_render_pass(false, color, Load::DontCare, DepthStore::Kept, false,
+                            g_presentPasses[static_cast<size_t>(color)], VK_FORMAT_B8G8R8A8_UNORM)) {
       return false;
     }
   }
@@ -391,15 +407,25 @@ bool create_device() noexcept {
       .pQueuePriorities = &priority,
   };
   const std::array extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+  // Sampler anisotropy, where the layer has it, for GX's GX_ANISO_2 and GX_ANISO_4 (gfx/texture.cpp, anisotropy).
+  VkPhysicalDeviceFeatures supported{};
+  vkGetPhysicalDeviceFeatures(g_physicalDevice, &supported);
+  const VkPhysicalDeviceFeatures features{.samplerAnisotropy = supported.samplerAnisotropy};
   const VkDeviceCreateInfo info{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &queue,
       .enabledExtensionCount = extensions.size(),
       .ppEnabledExtensionNames = extensions.data(),
+      .pEnabledFeatures = &features,
   };
   if (!succeeded(vkCreateDevice(g_physicalDevice, &info, nullptr, &g_device), "vkCreateDevice")) {
     return false;
+  }
+  if (supported.samplerAnisotropy) {
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(g_physicalDevice, &properties);
+    g_maxAnisotropy = properties.limits.maxSamplerAnisotropy;
   }
   vkGetDeviceQueue(g_device, 0, 0, &g_queue);
   return true;
@@ -650,10 +676,12 @@ void shutdown_device() noexcept {
     g_swapchain = VK_NULL_HANDLE;
   }
   for (auto& stored : g_scenePasses) {
-    for (auto& passes : stored) {
-      for (auto& pass : passes) {
-        vkDestroyRenderPass(g_device, pass, nullptr);
-        pass = VK_NULL_HANDLE;
+    for (auto& loaded : stored) {
+      for (auto& passes : loaded) {
+        for (auto& pass : passes) {
+          vkDestroyRenderPass(g_device, pass, nullptr);
+          pass = VK_NULL_HANDLE;
+        }
       }
     }
   }
@@ -830,6 +858,10 @@ void collect_retired() noexcept { run_retired(g_completed.load(std::memory_order
 
 uint64_t next_frame_serial() noexcept { return g_submitted.load(std::memory_order_acquire) + 1; }
 
+bool frame_done(uint64_t serial) noexcept { return g_completed.load(std::memory_order_acquire) >= serial; }
+
+float max_anisotropy() noexcept { return g_maxAnisotropy; }
+
 bool wait_for_frame(uint64_t serial) noexcept {
   if (serial > g_submitted.load(std::memory_order_acquire)) {
     Log.error("Not waiting for frame {}: the last submitted is {}", serial, g_submitted.load());
@@ -842,8 +874,9 @@ bool wait_for_frame(uint64_t serial) noexcept {
   return true;
 }
 
-VkRenderPass scene_pass(Load color, Load depth, bool storeDepth) noexcept {
-  return g_scenePasses[storeDepth][static_cast<size_t>(color)][static_cast<size_t>(depth)];
+VkRenderPass scene_pass(Load color, Load depth, DepthStore depthStore, bool fromRead) noexcept {
+  return g_scenePasses[static_cast<size_t>(depthStore)][fromRead][static_cast<size_t>(color)]
+                      [static_cast<size_t>(depth)];
 }
 
 VkRenderPass color_pass(Load color) noexcept { return g_colorPasses[static_cast<size_t>(color)]; }

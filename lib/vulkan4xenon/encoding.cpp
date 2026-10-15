@@ -1,6 +1,7 @@
 // The vulkan4xenon backend's frames: Aurora's recorded passes as Vulkan commands, its EFB copies, and the present.
 #include "backend.hpp"
 
+#include "../dolphin/vi/vi_internal.hpp"
 #include "../gfx/frame_packet.hpp"
 #include "../gfx/pipeline_cache.hpp"
 #include "../gfx/render_worker.hpp"
@@ -157,6 +158,22 @@ std::vector<size_t> g_decodeDraws; // each job's draw in g_keyedDraws
 
 constexpr std::array<float, 4> WholeSource{0.f, 0.f, 1.f, 1.f};
 
+// GXPeekZ, as depth_peek.cpp takes it on the WebGPU backend: while the game asks, at most 30 times a second, the
+// frame's last pass leaves its depth to be read, which the layer copies out of eDRAM into the depth image, and a draw
+// packs GX's 24-bit z from it, at the GX framebuffer's size, into an RGBA8 slot (glsl.hpp, depth_peek_fragment).
+// read_depth reads a word of the newest slot whose frame is done, on the game thread. Of the two slots, one is drawn
+// into only once the other's frame is done, so the slot read_depth reads is never one the GPU is drawing.
+constexpr auto DepthPeekInterval = std::chrono::nanoseconds{1'000'000'000 / 30};
+struct DepthPeekSlot {
+  std::shared_ptr<backend::Texture> texture;
+  // The frame that drew it; 0 for none yet.
+  uint64_t serial = 0;
+};
+std::mutex g_depthPeekMutex;
+std::array<DepthPeekSlot, 2> g_depthPeekSlots;
+bool g_depthPeekRequested = false;
+std::chrono::steady_clock::time_point g_nextDepthPeek{};
+
 #ifdef AURORA_DIAGNOSTICS
 // The most a frame's decoded vertices took of the cache; only the render worker writes it.
 std::atomic<uint64_t> g_decodedPeak = 0;
@@ -305,7 +322,8 @@ VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture
   return color.framebuffer;
 }
 
-// The set a copy or the present samples a colour target through, filtered or not.
+// The set a copy or the present samples a colour target through, filtered or not, or a copy or GXPeekZ's snapshot a
+// depth target's depth, nearest.
 VkDescriptorSet source_set(backend::Texture& texture, bool linear) noexcept {
   auto& set = texture.sourceSets[linear ? 1 : 0];
   if (set != VK_NULL_HANDLE) {
@@ -316,10 +334,11 @@ VkDescriptorSet source_set(backend::Texture& texture, bool linear) noexcept {
     return set;
   }
   const auto filter = linear ? SamplerFilter::Linear : SamplerFilter::Nearest;
+  const bool depth = texture.depthView != VK_NULL_HANDLE;
   const VkDescriptorImageInfo image{
       .sampler = sampler({.magFilter = filter, .minFilter = filter}),
-      .imageView = texture.view,
-      .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .imageView = depth ? texture.depthView : texture.view,
+      .imageLayout = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
   };
   const VkWriteDescriptorSet write{
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -799,25 +818,107 @@ void draw_clear(const clear::DrawData& data, const TextureExtent& size, VkComman
   vkCmdDraw(cmd, 3, 1, 0, 0);
 }
 
-void encode_copy(const detail::RenderPass& pass, backend::Texture& source, VkCommandBuffer cmd) noexcept {
-  const GXTexFmt format = pass.resolveFormat;
-  if (gx::is_depth_format(format)) {
-    static std::once_flag once;
-    std::call_once(once,
-                   [format] { Log.error("Depth copies (format {}) aren't supported", static_cast<int>(format)); });
+// Render worker: the slot a snapshot of the frame's last pass goes into, its texture at the GX framebuffer's size; null
+// when none is wanted yet, the other slot's frame isn't done, or the slot or its pipeline can't be made.
+DepthPeekSlot* due_depth_peek() noexcept {
+  const auto size = vi::configured_fb_size();
+  std::lock_guard lock{g_depthPeekMutex};
+  const auto now = std::chrono::steady_clock::now();
+  if (!g_depthPeekRequested || now < g_nextDepthPeek || size.x == 0 || size.y == 0) {
+    return nullptr;
+  }
+  auto& [first, second] = g_depthPeekSlots;
+  const bool firstNewest = first.serial >= second.serial;
+  const DepthPeekSlot& newest = firstNewest ? first : second;
+  DepthPeekSlot& slot = firstNewest ? second : first;
+  if (newest.serial != 0 && !frame_done(newest.serial)) {
+    return nullptr;
+  }
+  if (!slot.texture || slot.texture->width != size.x || slot.texture->height != size.y) {
+    slot.serial = 0;
+    slot.texture = backend::create_texture({
+        .width = size.x,
+        .height = size.y,
+        .mips = 1,
+        .format = TextureFormat::RGBA8Unorm,
+        .gxFormat = InvalidTextureFormat,
+        .usage = backend::TextureUsage::Render,
+        .label = "Depth peek",
+    });
+  }
+  if (!slot.texture || depth_peek_pipeline() == VK_NULL_HANDLE) {
+    return nullptr;
+  }
+  g_depthPeekRequested = false;
+  g_nextDepthPeek = now + DepthPeekInterval;
+  return &slot;
+}
+
+// Where the GX framebuffer of width by height sits in a source of sourceWidth by sourceHeight: depth_peek.cpp's
+// make_params, offset and scale in source texels.
+std::array<float, 4> peek_placement(uint32_t sourceWidth, uint32_t sourceHeight, uint32_t width,
+                                    uint32_t height) noexcept {
+  const auto policy = gx::g_gxState.viewportPolicy;
+  if (policy == AURORA_VIEWPORT_NATIVE) {
+    return {0.f, 0.f, 1.f, 1.f};
+  }
+  const float scaleX = static_cast<float>(sourceWidth) / static_cast<float>(width);
+  const float scaleY = static_cast<float>(sourceHeight) / static_cast<float>(height);
+  if (policy == AURORA_VIEWPORT_STRETCH) {
+    return {0.f, 0.f, scaleX, scaleY};
+  }
+  const float scale = std::min(scaleX, scaleY);
+  return {(static_cast<float>(sourceWidth) - static_cast<float>(width) * scale) * 0.5f,
+          (static_cast<float>(sourceHeight) - static_cast<float>(height) * scale) * 0.5f, scale, scale};
+}
+
+// The snapshot's draw: each texel of the slot GX's z of the depth texel under its centre, as depth_peek.cpp's compute
+// pass finds it, then the slot marked as this frame's.
+void encode_depth_peek(DepthPeekSlot& slot, backend::Texture& depth, VkCommandBuffer cmd) noexcept {
+  backend::Texture& target = *slot.texture;
+  const VkFramebuffer framebuffer = target_framebuffer(target, nullptr);
+  const VkDescriptorSet set = source_set(depth, false);
+  if (framebuffer == VK_NULL_HANDLE || set == VK_NULL_HANDLE) {
     return;
   }
+  const auto [offsetX, offsetY, scaleX, scaleY] = peek_placement(depth.width, depth.height, target.width, target.height);
+  const auto width = static_cast<float>(depth.width);
+  const auto height = static_cast<float>(depth.height);
+  const std::array<float, 4> source{offsetX / width, offsetY / height, static_cast<float>(target.width) * scaleX / width,
+                                    static_cast<float>(target.height) * scaleY / height};
+  const VkExtent2D extent{target.width, target.height};
+  const VkViewport viewport{0.f, 0.f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.f, 1.f};
+  draw_texture(cmd, color_pass(Load::DontCare), framebuffer, extent, viewport, depth_peek_pipeline(), set, source);
+  std::lock_guard lock{g_depthPeekMutex};
+  slot.serial = next_frame_serial();
+}
+
+// A copy of the pass's colour, or of its depth where the pass left it to be read (depthRead): depth copies sample
+// nearest, as tex_copy_conv.cpp's textureLoad does.
+void encode_copy(const detail::RenderPass& pass, backend::Texture& color, backend::Texture* depth, bool depthRead,
+                 VkCommandBuffer cmd) noexcept {
+  const GXTexFmt format = pass.resolveFormat;
+  const bool fromDepth = gx::is_depth_format(format);
+  if (fromDepth && (!depthRead || !converts(format))) {
+    static std::once_flag once;
+    std::call_once(once, [format, depth] {
+      Log.error("Depth copies (format {}) aren't supported{}", static_cast<int>(format),
+                depth != nullptr && depth->depthView == VK_NULL_HANDLE ? " from depth the layer can't sample" : "");
+    });
+    return;
+  }
+  backend::Texture& source = fromDepth ? *depth : color;
   backend::Texture* target = pass.resolveTarget->gpu.get();
   if (target == nullptr) {
     return;
   }
-  const VkPipeline pipeline =
-      copy_pipeline(converts(format) ? format : GX_TF_RGBA8, !gx::efb_has_alpha(pass.resolveSourceFormat));
+  const VkPipeline pipeline = copy_pipeline(converts(format) ? format : GX_TF_RGBA8,
+                                            !fromDepth && !gx::efb_has_alpha(pass.resolveSourceFormat));
   const VkFramebuffer framebuffer = target_framebuffer(*target, nullptr);
   const auto& rect = pass.resolveRect;
   const bool scaled =
       target->width != static_cast<uint32_t>(rect.width) || target->height != static_cast<uint32_t>(rect.height);
-  const VkDescriptorSet set = source_set(source, scaled);
+  const VkDescriptorSet set = source_set(source, scaled && !fromDepth);
   if (pipeline == VK_NULL_HANDLE || framebuffer == VK_NULL_HANDLE || set == VK_NULL_HANDLE) {
     return;
   }
@@ -879,16 +980,25 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
   if (color == nullptr || (pass.hasDepth && depth == nullptr)) {
     return;
   }
+  // A depth copy or GXPeekZ's snapshot samples the pass's depth, which the layer copies out of eDRAM only from a pass
+  // that leaves it to be read; one with nothing to draw is encoded all the same to leave it so.
+  const bool sampledDepth = pass.hasDepth && depth->depthView != VK_NULL_HANDLE;
+  const bool depthCopy = pass.resolveTarget && gx::is_depth_format(pass.resolveFormat);
+  DepthPeekSlot* const peek = pass.captureDepthSnapshot && sampledDepth ? due_depth_peek() : nullptr;
+  const bool depthRead = sampledDepth && (depthCopy || peek != nullptr);
   // A pass with nothing to draw leaves its targets as they are, so only its copy is encoded.
-  if (pass.has_content()) {
+  if (pass.has_content() || depthRead) {
     const VkFramebuffer framebuffer = target_framebuffer(*color, pass.hasDepth ? depth : nullptr);
     if (framebuffer == VK_NULL_HANDLE) {
       return;
     }
     const Load colorLoad = colorAttachment.clear ? Load::Clear : Load::Load;
-    // The frame's last pass (recording.cpp's finish marks it) leaves the EFB's depth unstored: the next frame's first
-    // pass clears it, and nothing here reads it back (no GXPeekZ, no depth copies).
-    const bool storeDepth = !(pass.captureDepthSnapshot && !pass.depthTarget);
+    // The frame's last pass (recording.cpp's finish marks it) drops the EFB's depth unless a snapshot reads it: the
+    // next frame's first pass clears it.
+    const DepthStore depthStore = depthRead                                         ? DepthStore::Read
+                                  : pass.captureDepthSnapshot && !pass.depthTarget ? DepthStore::Dropped
+                                                                                    : DepthStore::Kept;
+    const bool fromRead = pass.hasDepth && depth->depthLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
     const std::array clearValues{
         VkClearValue{.color = {.float32 = {colorAttachment.clearValue.x(), colorAttachment.clearValue.y(),
                                            colorAttachment.clearValue.z(), colorAttachment.clearValue.w()}}},
@@ -896,8 +1006,9 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
     };
     const VkRenderPassBeginInfo begin{
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = pass.hasDepth ? scene_pass(colorLoad, pass.clearDepth ? Load::Clear : Load::Load, storeDepth)
-                                    : color_pass(colorLoad),
+        .renderPass = pass.hasDepth
+                          ? scene_pass(colorLoad, pass.clearDepth ? Load::Clear : Load::Load, depthStore, fromRead)
+                          : color_pass(colorLoad),
         .framebuffer = framebuffer,
         .renderArea = {{0, 0}, {color->width, color->height}},
         .clearValueCount = pass.hasDepth ? 2u : 1u,
@@ -939,9 +1050,16 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
       }
     }
     vkCmdEndRenderPass(cmd);
+    if (pass.hasDepth) {
+      depth->depthLayout = depthStore == DepthStore::Read ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                          : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    }
+  }
+  if (peek != nullptr) {
+    encode_depth_peek(*peek, *depth, cmd);
   }
   if (pass.resolveTarget) {
-    encode_copy(pass, *color, cmd);
+    encode_copy(pass, *color, depth, depthRead, cmd);
   }
 }
 } // namespace
@@ -1020,6 +1138,9 @@ void shutdown_frames() noexcept {
   g_passFogRanges.clear();
   reset_bindings();
   g_passDraws.clear();
+  std::lock_guard lock{g_depthPeekMutex};
+  g_depthPeekSlots = {};
+  g_depthPeekRequested = false;
 }
 
 TextureExtent efb_size() noexcept { return g_efbSize; }
@@ -1027,6 +1148,29 @@ TextureExtent efb_size() noexcept { return g_efbSize; }
 
 namespace aurora::gfx::backend {
 using namespace vulkan4xenon;
+
+void request_depth_snapshot() noexcept {
+  std::lock_guard lock{g_depthPeekMutex};
+  g_depthPeekRequested = true;
+}
+
+bool read_depth(uint16_t x, uint16_t y, uint32_t& z) noexcept {
+  std::lock_guard lock{g_depthPeekMutex};
+  const DepthPeekSlot* newest = nullptr;
+  for (const auto& slot : g_depthPeekSlots) {
+    if (slot.serial != 0 && frame_done(slot.serial) && (newest == nullptr || slot.serial > newest->serial)) {
+      newest = &slot;
+    }
+  }
+  if (newest == nullptr || x >= newest->texture->width || y >= newest->texture->height) {
+    return false;
+  }
+  // Write-combined memory, a word at a time. A texel's bytes run red to alpha in memory (write_capture), so the word's
+  // top three bytes are z, its high byte first.
+  const auto* texels = reinterpret_cast<const volatile uint32_t*>(newest->texture->memory.mapped);
+  z = texels[tiled_index(x, y, (newest->texture->width + 31) & ~31u)] >> 8;
+  return true;
+}
 
 bool begin_frame(detail::FramePacket& frame) noexcept {
   auto& state = g_frames[frame.slot];

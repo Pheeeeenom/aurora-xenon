@@ -399,13 +399,11 @@ TEST(SceneConfigs, AreWritten) {
 // The configs Aurora's tools/check_glsl_math.py runs on xost's simulator against its own reference of the WGSL's
 // math, each written as <name>.vert and <name>.frag when AURORA_GLSL_NAMED_DIR is set. A case's config is here and
 // what the tool feeds it and expects is there, under the same name.
-void named(std::string_view name, const gx::ShaderConfig& config) {
-  const auto programs = built(config);
-  ASSERT_FALSE(programs.vertex.empty()) << name;
-  ASSERT_FALSE(programs.fragment.empty()) << name;
+void named_programs(std::string_view name, const std::string& vertex, const std::string& fragment) {
+  ASSERT_FALSE(vertex.empty()) << name;
+  ASSERT_FALSE(fragment.empty()) << name;
   if (const char* dir = std::getenv("AURORA_GLSL_NAMED_DIR")) {
-    for (const auto& [suffix, text] :
-         {std::pair{".vert"sv, &programs.vertex}, std::pair{".frag"sv, &programs.fragment}}) {
+    for (const auto& [suffix, text] : {std::pair{".vert"sv, &vertex}, std::pair{".frag"sv, &fragment}}) {
       const auto path = fmt::format("{}/{}{}", dir, name, suffix);
       std::FILE* file = std::fopen(path.c_str(), "wb");
       ASSERT_NE(file, nullptr) << path;
@@ -413,6 +411,11 @@ void named(std::string_view name, const gx::ShaderConfig& config) {
       std::fclose(file);
     }
   }
+}
+
+void named(std::string_view name, const gx::ShaderConfig& config) {
+  const auto programs = built(config);
+  named_programs(name, programs.vertex, programs.fragment);
 }
 
 // TEV stage 0 sampling map 0 at texture coordinate 1, generated from TEX0 by texture matrix 3 or the matrix each
@@ -595,6 +598,30 @@ TEST(MathCases, AreWritten) {
   named("line_current", lines(1, false));
   named("line_picked", lines(2, true));
   named("points", lines(3, false));
+  named_programs("depth_z8", glsl::copy_vertex(), glsl::copy_fragment(GX_TF_Z8, false));
+  named_programs("depth_z16", glsl::copy_vertex(), glsl::copy_fragment(GX_TF_Z16, false));
+  named_programs("depth_peek", glsl::copy_vertex(), glsl::depth_peek_fragment());
+}
+
+// Depth copies to Z8 and Z16, and GXPeekZ's snapshot, take GX's z from the sampled depth's red, reversed, as
+// tex_copy_conv.cpp's gx_z24 does; the other depth formats aren't converted. Their numbers are check_glsl_math.py's.
+TEST(DepthPrograms, TakeGXsZFromTheSampledDepth) {
+  for (const auto format : {GX_TF_Z8, GX_TF_Z16}) {
+    EXPECT_TRUE(has(glsl::copy_fragment(format, false), "clamp(1.0 - texture(source, in_uv).rrrr, 0.0, 1.0)"));
+    EXPECT_TRUE(glsl::converts(format));
+  }
+  EXPECT_TRUE(has(glsl::copy_fragment(GX_TF_Z8, false), "o_color = high * (1.0 / 255.0);"));
+  EXPECT_TRUE(has(glsl::copy_fragment(GX_TF_Z16, false), "o_color = vec4(high.xyz, middle.x) * (1.0 / 255.0);"));
+  EXPECT_TRUE(has(glsl::depth_peek_fragment(), "o_color = vec4(high.x, middle.x, low.x, 0.0) * (1.0 / 255.0);"));
+  for (const auto format : {GX_TF_Z24X8, GX_CTF_Z4, GX_CTF_Z8M, GX_CTF_Z8L, GX_CTF_Z16L}) {
+    EXPECT_FALSE(glsl::converts(format)) << format;
+    EXPECT_TRUE(glsl::copy_fragment(format, false).empty()) << format;
+  }
+  const auto programs = glsl::fixed_programs();
+  for (const auto& fragment :
+       {glsl::copy_fragment(GX_TF_Z8, false), glsl::copy_fragment(GX_TF_Z16, false), glsl::depth_peek_fragment()}) {
+    EXPECT_NE(std::ranges::find(programs, std::pair{fragment, true}), programs.end());
+  }
 }
 
 // An EFB copy's index, 8 or 4 bits, scaled back from the copy's texel and looked up halfway into its palette entry.

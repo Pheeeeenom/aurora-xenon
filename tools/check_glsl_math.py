@@ -3,7 +3,8 @@
 writes for its named configs (MathCases, AURORA_GLSL_NAMED_DIR) on xost's simulator, compiled as the game's pack is,
 glslang to SPIR-V and xost to Xenos microcode, and compares what they compute with this tool's own reference of
 lib/gx/shader.cpp's WGSL: lighting, fog with its range adjustment, matrices picked per vertex and indirect texturing
-(vulkan4xenon's milestone 11, step 5), and the corners of lines and points (milestone 14).
+(vulkan4xenon's milestone 11, step 5), the corners of lines and points (milestone 14), and GX's z in depth copies
+and GXPeekZ's snapshot (milestone 14, step 5).
 
     check_glsl_math.py --xost <xost tree> [--glslang <glslang>] <directory of named programs>
 
@@ -616,10 +617,52 @@ def check_lines(programs, name, failures):
                 failures.append(f"{where}: tex0_uv {outputs.get('out_tex0_uv')}, want {uv}")
 
 
+# ---- depth copies and GXPeekZ's snapshot (milestone 14, step 5) ----
+
+# Depths as the layer returns them in red: the ends, halves and thirds, a step of D24 from each end, ones a step under
+# a byte's edge in z, and two besides.
+DEPTHS = [0.0, 1.0, 0.5, 0.25, 1.0 / 3.0, 2.0 / 3.0, 1.0 / 16777215.0, 1.0 - 1.0 / 16777215.0,
+          1.0 - 65535.0 / 16777215.0, 1.0 - 255.0 / 16777215.0, 0.123456, 0.987654]
+DEPTH_UV = [0.25, 0.75]
+
+
+def ref_z24(depth):
+    """tex_copy_conv.cpp's gx_z24 in f32 from reversed Z, then u32 and its min."""
+    d = single(depth)
+    return min(int(single(single(clamp(single(1.0 - d)) * 16777215.0) + 0.5)), 0xFFFFFF)
+
+
+def ref_depth_output(name, z24):
+    """FragZ8's high byte as intensity, FragZ16's high byte as intensity and the next as alpha, and the snapshot's
+    three bytes, high first, with alpha 0."""
+    high, middle, low = z24 >> 16, z24 >> 8 & 0xFF, z24 & 0xFF
+    if name == "depth_z8":
+        return [high / 255.0] * 4
+    if name == "depth_z16":
+        return [high / 255.0] * 3 + [middle / 255.0]
+    return [high / 255.0, middle / 255.0, low / 255.0, 0.0]
+
+
+def check_depth(programs, name, failures):
+    outputs, _ = programs.vertex({"upush.uv_transform": [[0.0, 0.0, 1.0, 1.0]]},
+                                 {"in_position": [-1.0, 1.0], "in_uv": DEPTH_UV})
+    for depth in DEPTHS:
+        sampled = {}
+        got, _ = programs.fragment({}, outputs, {(0, 0): lambda u, v, d=depth: [single(d), 0.0, 0.0, 1.0]}, sampled)
+        z24 = ref_z24(depth)
+        want = ref_depth_output(name, z24)
+        # A byte off is 1/255 away: closer than that, so each byte must be right.
+        if not close(got, want, 1e-4):
+            failures.append(f"{name} at depth {depth!r} (z {z24:06X}): {got}, want {want}")
+        if not all(close(at, DEPTH_UV, 1e-6) for at in sampled.get((0, 0), [None])):
+            failures.append(f"{name}: sampled at {sampled.get((0, 0))}, not {DEPTH_UV}")
+
+
 CHECKS = {**{name: check_lit for name in LIT}, **{name: check_fog for name in FOG},
           "texmtx_fixed": check_texmtx, "texmtx_picked": check_texmtx, "indirect_mtx": check_indirect,
           "indirect_dynamic_s": check_indirect, "indirect_bump": check_indirect, "scene": check_scene,
-          "line_current": check_lines, "line_picked": check_lines, "points": check_lines}
+          "line_current": check_lines, "line_picked": check_lines, "points": check_lines,
+          "depth_z8": check_depth, "depth_z16": check_depth, "depth_peek": check_depth}
 
 
 def main():

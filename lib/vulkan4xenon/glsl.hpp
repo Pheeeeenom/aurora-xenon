@@ -118,9 +118,12 @@ std::string clear_fragment();
 // stage's push constant; set 0's binding 0 the source.
 std::string copy_vertex();
 // A copy to format, as tex_copy_conv.cpp converts it, with alpha read as 1 when opaqueAlpha is set; empty for a format
-// it doesn't convert. GX_TF_RGBA8 copies the texels as they are, as the present does.
+// it doesn't convert. GX_TF_RGBA8 copies the texels as they are, as the present does. GX_TF_Z8 and GX_TF_Z16 sample a
+// depth image, whose depth the layer returns in red, and take GX's 24-bit z from it; opaqueAlpha means nothing there.
 std::string copy_fragment(GXTexFmt format, bool opaqueAlpha);
 bool converts(GXTexFmt format) noexcept;
+// GXPeekZ's snapshot: GX's 24-bit z of the sampled depth in red, green and blue, its high byte first, and 0 in alpha.
+std::string depth_peek_fragment();
 // An EFB copy's 4- or 8-bit indices through the palette at set 1; the second push vector is (1, 0, 0.5, 0.5 N) / N.
 std::string palette_fragment(bool fourBit);
 // Every one of those programs, and whether it's a fragment program, for the recorder.

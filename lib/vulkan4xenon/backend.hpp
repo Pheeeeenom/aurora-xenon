@@ -94,8 +94,18 @@ enum class Load : uint8_t {
   Clear,
   DontCare,
 };
-// RGBA8 colour and, for scenes, D24S8 depth; both stored, but for a scene's depth without storeDepth.
-VkRenderPass scene_pass(Load color, Load depth, bool storeDepth = true) noexcept;
+// How a scene pass leaves its depth: stored as an attachment for the passes after; stored and left to be read, which
+// the layer copies out of eDRAM into the depth image for a depth copy or snapshot to sample (its docs/SUPPORT.md,
+// Images); or dropped.
+enum class DepthStore : uint8_t {
+  Kept,
+  Read,
+  Dropped,
+};
+// RGBA8 colour, stored, and, for scenes, D24S8 depth, left as depthStore says. A loaded depth comes in as the pass
+// before left it: to be read when fromRead is set, else as an attachment.
+VkRenderPass scene_pass(Load color, Load depth, DepthStore depthStore = DepthStore::Kept,
+                        bool fromRead = false) noexcept;
 VkRenderPass color_pass(Load color) noexcept;
 // B8G8R8A8 colour, the swapchain's only format (vulkan4xenon's docs/SUPPORT.md, Display and swapchain), cleared or
 // left as it is: what the present draws into.
@@ -117,6 +127,10 @@ bool submit_frame(size_t slot, uint32_t imageIndex, bool present, uint64_t frame
 void collect_retired() noexcept;
 // Render worker: the number the next frame it submits will get; submit_frame numbers frames from 1, in order.
 uint64_t next_frame_serial() noexcept;
+// Any thread: whether the GPU has finished the frame submitted as `serial`, without waiting.
+bool frame_done(uint64_t serial) noexcept;
+// The most anisotropy a sampler may ask for: 1 where the layer has no samplerAnisotropy.
+float max_anisotropy() noexcept;
 // Render worker: blocks until the frame submitted as `serial` is done on the GPU, and returns true. The GPU waiter
 // marks frames done in order, and a submitted frame's fence depends on nothing the render worker does next, so a wait
 // for a submitted frame ends. A frame not yet submitted is logged and not waited for: false.
@@ -157,6 +171,9 @@ bool converts(GXTexFmt format) noexcept;
 VkPipeline copy_pipeline(GXTexFmt format, bool opaqueAlpha) noexcept;
 // Render worker: the pipeline converting a copy's 8-bit or 4-bit indices through a palette; null when it can't be made.
 VkPipeline palette_pipeline(bool fourBit) noexcept;
+// Render worker: the pipeline packing a depth image's GX z into an RGBA8 snapshot for GXPeekZ (glsl.hpp,
+// depth_peek_fragment) through the copy layout; null when it can't be made.
+VkPipeline depth_peek_pipeline() noexcept;
 // The copy of the EFB into a swapchain image; null when its programs aren't in the pack.
 VkPipeline present_pipeline() noexcept;
 
@@ -191,8 +208,12 @@ struct Texture {
   bool bc1 = false;
   // A texel's bytes: 1 for R8, 2 for RG8, else 4.
   uint32_t texelBytes = 4;
+  // A depth target's depth alone, to sample; null where the layer can't sample it (make_texture).
+  VkImageView depthView = VK_NULL_HANDLE;
   // Render worker only: the levels uploaded so far, so an upload over one waits for the scenes before it; the
-  // texture as a colour target, with the depth it was made with or alone; and as a copy's source.
+  // texture as a colour target, with the depth it was made with or alone; and as a copy's source. A depth target's
+  // layout as the last pass left it: as an attachment, or to be read.
+  VkImageLayout depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   uint32_t uploadedLevels = 0;
   VkFramebuffer framebuffer = VK_NULL_HANDLE;
   const Texture* framebufferDepth = nullptr;

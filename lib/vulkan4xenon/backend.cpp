@@ -24,6 +24,9 @@ namespace {
 // gfx/resource_cache.cpp).
 constexpr uint32_t TextureSetRetainFrames = 32;
 constexpr uint32_t TextureSetSweepPeriod = 16;
+// A depth image this many texels or fewer on a side can't be sampled: a resolve can't write its packed mip tail
+// (vulkan4xenon's docs/SUPPORT.md, Images).
+constexpr uint32_t SampledDepthMinSide = 16;
 
 struct CachedSet {
   VkDescriptorSet set = VK_NULL_HANDLE;
@@ -98,6 +101,7 @@ uint64_t sampler_key(const SamplerConfig& config) noexcept {
   hasher.update(config.mipFilter);
   hasher.update(std::bit_cast<uint32_t>(config.minLod));
   hasher.update(std::bit_cast<uint32_t>(config.maxLod));
+  hasher.update(config.maxAnisotropy);
   return hasher.digest();
 }
 
@@ -230,9 +234,10 @@ VkSampler sampler(const SamplerConfig& config) noexcept {
   }
   // The layer refuses a minLod above 0 and ignores maxLod (vulkan4xenon's docs/SUPPORT.md, Samplers), and GX's
   // come in sixteenths. So a texture GX keeps off its finest levels draws sharper here, and one it keeps off its
-  // coarsest samples them anyway. No anisotropy: maxSamplerAnisotropy is 1 (vulkan4xenon's docs/SUPPORT.md, Physical
-  // device).
+  // coarsest samples them anyway. Anisotropy as Aurora's rules give it (gfx/texture.cpp, sampler_config), at most the
+  // layer's 16, which its sampler rounds down to a power of two.
   const bool linearMips = config.mipFilter == SamplerMipFilter::Linear;
+  const float anisotropy = std::min(static_cast<float>(config.maxAnisotropy), max_anisotropy());
   const VkSamplerCreateInfo info{
       .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
       .magFilter = filter(config.magFilter),
@@ -242,15 +247,18 @@ VkSampler sampler(const SamplerConfig& config) noexcept {
       .addressModeU = address_mode(config.wrapS),
       .addressModeV = address_mode(config.wrapT),
       .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .anisotropyEnable = anisotropy > 1.f,
+      .maxAnisotropy = std::max(anisotropy, 1.f),
       .minLod = 0.f,
       .maxLod = linearMips ? std::floor(config.maxLod) : config.maxLod,
   };
   VkSampler value = VK_NULL_HANDLE;
   if (!succeeded(vkCreateSampler(g_device, &info, nullptr, &value), "vkCreateSampler")) {
     // Under its key all the same, so it fails once.
-    Log.error("Drawing with the fallback sampler in place of one vulkan4xenon refused (filters {} {} {}, LOD {} to {})",
+    Log.error("Drawing with the fallback sampler in place of one vulkan4xenon refused (filters {} {} {}, LOD {} to {}, "
+              "anisotropy {})",
               static_cast<int>(config.magFilter), static_cast<int>(config.minFilter),
-              static_cast<int>(config.mipFilter), config.minLod, config.maxLod);
+              static_cast<int>(config.mipFilter), config.minLod, config.maxLod, config.maxAnisotropy);
     value = g_fallbackSampler;
   }
   g_samplers.emplace(key, value);
@@ -304,7 +312,10 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
     info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     break;
   case TextureUsage::Depth:
-    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    // Sampled too, for depth copies and GXPeekZ, where the layer can resolve into it: more than 16 texels on a side
+    // (vulkan4xenon's docs/SUPPORT.md, Images).
+    info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                 (desc.width > SampledDepthMinSide && desc.height > SampledDepthMinSide ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
     break;
   }
   if (!succeeded(vkCreateImage(g_device, &info, nullptr, &texture->image), "vkCreateImage")) {
@@ -325,16 +336,24 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
   const VkComponentMapping components = red        ? VkComponentMapping{r, r, r, r}
                                         : redGreen ? VkComponentMapping{r, r, r, VK_COMPONENT_SWIZZLE_G}
                                                    : VkComponentMapping{};
-  const VkImageViewCreateInfo viewInfo{
+  // A depth target's attachment view has depth and stencil, and its sampled one depth alone.
+  VkImageViewCreateInfo viewInfo{
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = texture->image,
       .viewType = VK_IMAGE_VIEW_TYPE_2D,
       .format = info.format,
       .components = components,
-      .subresourceRange = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, info.mipLevels, 0, 1},
+      .subresourceRange = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                           0, info.mipLevels, 0, 1},
   };
   if (!succeeded(vkCreateImageView(g_device, &viewInfo, nullptr, &texture->view), "vkCreateImageView")) {
     return {};
+  }
+  if (depth && (info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0) {
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    if (!succeeded(vkCreateImageView(g_device, &viewInfo, nullptr, &texture->depthView), "vkCreateImageView")) {
+      return {};
+    }
   }
   return texture;
 }
@@ -376,11 +395,13 @@ Texture::~Texture() {
   if (g_device == VK_NULL_HANDLE) {
     return;
   }
-  retire([image = image, view = view, memory = memory, framebuffer = framebuffer, sourceSets = sourceSets] {
+  retire([image = image, view = view, depthView = depthView, memory = memory, framebuffer = framebuffer,
+          sourceSets = sourceSets] {
     vkDestroyFramebuffer(g_device, framebuffer, nullptr);
     for (const auto set : sourceSets) {
       free_set(set);
     }
+    vkDestroyImageView(g_device, depthView, nullptr);
     vkDestroyImageView(g_device, view, nullptr);
     vkDestroyImage(g_device, image, nullptr);
     free_allocation(memory);
@@ -502,18 +523,6 @@ void prepare_textures(BindGroupRef ref, const TextureSet& set) noexcept {
 }
 
 bool converts_copy(GXTexFmt format) noexcept { return converts(format); }
-
-// No GXPeekZ: nothing reads the EFB's depth back.
-void request_depth_snapshot() noexcept {}
-
-bool read_depth(uint16_t x, uint16_t y, uint32_t& z) noexcept {
-  (void)x;
-  (void)y;
-  (void)z;
-  static std::once_flag once;
-  std::call_once(once, [] { Log.error("GXPeekZ isn't supported; it reads nothing"); });
-  return false;
-}
 
 const Limits& limits() noexcept { return g_limits; }
 
