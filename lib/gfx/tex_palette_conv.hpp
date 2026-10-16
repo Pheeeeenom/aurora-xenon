@@ -17,8 +17,4 @@ struct ConvRequest {
   TextureHandle tlut;
 };
 
-void initialize();
-void shutdown();
-void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
-
 } // namespace aurora::gfx::tex_palette_conv

@@ -3,84 +3,104 @@
 #include <string>
 #include "command_processor.hpp"
 
-#include "../gfx/depth_peek.hpp"
+#include "../gfx/backend.hpp"
+#include "../gfx/frame.hpp"
 #include "../gfx/recording.hpp"
 #include "../internal.hpp"
 #include "dolphin/gd/GDGeometry.h"
 #include "dolphin/gx/GXAurora.h"
+#include "fifo.hpp"
 #include "gx.hpp"
 #include "pipeline.hpp"
 #include "regs.hpp"
 #include "shader_info.hpp"
 #include "texture.hpp"
 
+#include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
+
+// Quad, strip, fan, line and point draws of up to this many vertices take their indices from index_patterns(), not from
+// the frame's index pool; 0 builds every draw's into the pool.
+#ifndef AURORA_INDEX_PATTERN_VERTICES
+#define AURORA_INDEX_PATTERN_VERTICES 0
+#endif
 
 namespace aurora::gx::fifo {
 namespace {
 constexpr Module Log{"aurora::gx::fifo"};
+} // namespace
 
-u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
-  u16 numIndices = 0;
+u32 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
+  u32 numIndices = 0;
+  // Written in place: ByteBuffer::append costs a resize check and a memcpy per index.
   if (prim == GX_QUADS) {
-    buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
-
-    for (u16 v = 0; v < vtxCount; v += 4) {
-      u16 idx0 = vtxStart + v;
-      u16 idx1 = vtxStart + v + 1;
-      u16 idx2 = vtxStart + v + 2;
-      u16 idx3 = vtxStart + v + 3;
-
-      buf.append(idx0);
-      buf.append(idx1);
-      buf.append(idx2);
-      numIndices += 3;
-
-      buf.append(idx2);
-      buf.append(idx3);
-      buf.append(idx0);
-      numIndices += 3;
+    const u32 quads = vtxCount / 4;
+    numIndices = quads * 6;
+    u16* out = reinterpret_cast<u16*>(buf.append_uninitialized(numIndices * sizeof(u16)));
+    for (u32 q = 0; q < quads; ++q) {
+      const u16 idx0 = static_cast<u16>(vtxStart + q * 4);
+      out[0] = idx0;
+      out[1] = static_cast<u16>(idx0 + 1);
+      out[2] = static_cast<u16>(idx0 + 2);
+      out[3] = static_cast<u16>(idx0 + 2);
+      out[4] = static_cast<u16>(idx0 + 3);
+      out[5] = idx0;
+      out += 6;
     }
   } else if (prim == GX_TRIANGLES) {
-    buf.reserve_extra(vtxCount * sizeof(u16));
+    numIndices = vtxCount;
+    u16* out = reinterpret_cast<u16*>(buf.append_uninitialized(numIndices * sizeof(u16)));
     for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      buf.append(idx);
-      ++numIndices;
+      out[v] = static_cast<u16>(vtxStart + v);
     }
   } else if (prim == GX_TRIANGLEFAN) {
-    buf.reserve_extra(((u32(vtxCount) - 3) * 3 + 3) * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      if (v < 3) {
-        buf.append(idx);
-        ++numIndices;
-        continue;
+    if (vtxCount < 3) {
+      numIndices = vtxCount;
+      u16* out = reinterpret_cast<u16*>(buf.append_uninitialized(numIndices * sizeof(u16)));
+      for (u16 v = 0; v < vtxCount; ++v) {
+        out[v] = static_cast<u16>(vtxStart + v);
       }
-      buf.append(std::array{vtxStart, static_cast<u16>(idx - 1), idx});
-      numIndices += 3;
+    } else {
+      numIndices = (u32(vtxCount) - 2) * 3;
+      u16* out = reinterpret_cast<u16*>(buf.append_uninitialized(numIndices * sizeof(u16)));
+      for (u16 v = 2; v < vtxCount; ++v) {
+        const u16 idx = static_cast<u16>(vtxStart + v);
+        out[0] = vtxStart;
+        out[1] = static_cast<u16>(idx - 1);
+        out[2] = idx;
+        out += 3;
+      }
     }
   } else if (prim == GX_TRIANGLESTRIP) {
-    buf.reserve_extra(((static_cast<u32>(vtxCount) - 3) * 3 + 3) * sizeof(u16));
-    for (u16 v = 0; v < vtxCount; ++v) {
-      const u16 idx = vtxStart + v;
-      if (v < 3) {
-        buf.append(idx);
-        ++numIndices;
-        continue;
+    if (vtxCount < 3) {
+      numIndices = vtxCount;
+      u16* out = reinterpret_cast<u16*>(buf.append_uninitialized(numIndices * sizeof(u16)));
+      for (u16 v = 0; v < vtxCount; ++v) {
+        out[v] = static_cast<u16>(vtxStart + v);
       }
-      if ((v & 1) == 0) {
-        buf.append(std::array{static_cast<u16>(idx - 2), static_cast<u16>(idx - 1), idx});
-      } else {
-        buf.append(std::array{static_cast<u16>(idx - 1), static_cast<u16>(idx - 2), idx});
+    } else {
+      numIndices = (u32(vtxCount) - 2) * 3;
+      u16* out = reinterpret_cast<u16*>(buf.append_uninitialized(numIndices * sizeof(u16)));
+      for (u16 v = 2; v < vtxCount; ++v) {
+        const u16 idx = static_cast<u16>(vtxStart + v);
+        if ((v & 1) == 0) {
+          out[0] = static_cast<u16>(idx - 2);
+          out[1] = static_cast<u16>(idx - 1);
+        } else {
+          out[0] = static_cast<u16>(idx - 1);
+          out[1] = static_cast<u16>(idx - 2);
+        }
+        out[2] = idx;
+        out += 3;
       }
-      numIndices += 3;
     }
   } else if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
     buf.reserve_extra(6 * sizeof(u16));
@@ -96,6 +116,61 @@ u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxC
   return numIndices;
 }
 
+IndexPatterns build_index_patterns(u32 maxVertices) noexcept {
+  IndexPatterns patterns;
+  patterns.maxVertices = std::min<u32>(maxVertices, UINT16_MAX);
+  if (patterns.maxVertices == 0) {
+    return patterns;
+  }
+  constexpr std::array kinds{GX_QUADS, GX_TRIANGLESTRIP, GX_TRIANGLEFAN, GX_LINES};
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    // Aligned as push_indices aligns a draw's.
+    if (patterns.indices.size() % 4 != 0) {
+      patterns.indices.append<u16>(0);
+    }
+    patterns.offsets[i] = patterns.indices.size();
+    prepare_idx_buffer(patterns.indices, kinds[i], 0, patterns.maxVertices);
+  }
+  if (patterns.indices.size() % 4 != 0) {
+    patterns.indices.append<u16>(0);
+  }
+  return patterns;
+}
+
+const IndexPatterns& index_patterns() noexcept {
+  static const IndexPatterns patterns = build_index_patterns(AURORA_INDEX_PATTERN_VERTICES);
+  return patterns;
+}
+
+// The index counts are prepare_idx_buffer's.
+std::optional<gfx::Range> index_pattern_range(const IndexPatterns& patterns, GXPrimitive prim, u32 vtxCount) noexcept {
+  if (vtxCount > patterns.maxVertices || patterns.maxVertices == 0) {
+    return std::nullopt;
+  }
+  u32 pattern = 0;
+  u32 numIndices = 0;
+  switch (prim) {
+  case GX_QUADS:
+    numIndices = vtxCount / 4 * 6;
+    break;
+  case GX_TRIANGLESTRIP:
+  case GX_TRIANGLEFAN:
+    pattern = prim == GX_TRIANGLESTRIP ? 1 : 2;
+    numIndices = vtxCount < 3 ? vtxCount : (vtxCount - 2) * 3;
+    break;
+  case GX_LINES:
+  case GX_LINESTRIP:
+  case GX_POINTS:
+    pattern = 3;
+    numIndices = 6;
+    break;
+  default:
+    return std::nullopt;
+  }
+  return gfx::Range{patterns.offsets[pattern], static_cast<u32>(numIndices * sizeof(u16))};
+}
+
+namespace {
 // GX FIFO opcodes - use CP_ prefix to avoid clashing with GXCommandList.h macros
 constexpr u8 CP_CMD_NOP = GX_NOP;
 constexpr u8 CP_CMD_LOAD_CP_REG = GX_LOAD_CP_REG;
@@ -139,13 +214,157 @@ struct DrawCache {
   GXVtxFmt fmt = GX_MAX_VTXFMT;
   u8 lineMode = 0;
   bool hasPipeline = false;
-  gfx::Range uniformRange{};
+  // Where each uniform piece was last pushed this frame, and the pieces whose state changed since.
+  std::array<u32, UniformPieceCount> uniformOffsets{};
+  u8 staleUniforms = AllUniformPieces;
   gfx::Range fogRange{};
   FogRangeLutKey fogRangeKey{};
   bool hasFogRange = false;
   GXVtxFmt lastDrawFmt = GX_MAX_VTXFMT;
 };
 DrawCache sDrawCache;
+
+// A config's shader info depends on the config alone, and its pipeline on the config and the render target layout,
+// so each pair is analysed and looked up once.
+struct PipelineMemo {
+  ShaderInfo shaderInfo;
+  gfx::PipelineRef pipelineRef;
+};
+absl::flat_hash_map<HashType, PipelineMemo> sPipelineMemo;
+
+// The state populate_pipeline_config (gx.cpp) reads, and the render target layout the pipeline is looked up for, as
+// the last rebuild read them. A config built from the same state comes out the same, with the same shader info and
+// pipeline.
+struct PipelineInputs {
+  uint64_t targetLayoutKey = 0;
+  u8 lineMode = 0;
+  u8 numTevStages = 0;
+  u8 numIndStages = 0;
+  u8 numTexGens = 0;
+  GXFogType fogType = GX_FOG_NONE;
+  bool fogRangeEnabled = false;
+  GXPixelFmt pixelFmt = GX_PF_RGB8_Z24;
+  std::array<GXAttrType, MaxVtxAttr> vtxDesc{};
+  VtxFmt vtxFmt{};
+  std::array<u16, MaxVtxAttr> indexedArrays{}; // stride, and byte order in bit 8
+  std::array<TevSwap, MaxTevSwap> tevSwapTable{};
+  std::array<TevStage, MaxTevStages> tevStages{};
+  std::array<IndStage, MaxIndStages> indStages{};
+  std::array<ColorChannelConfig, MaxColorChannels> colorChannels{};
+  std::array<u8, GX::MaxLights> unitLightTerms{};
+  std::array<TcgConfig, MaxTexCoord> tcgs{};
+  AlphaCompare alphaCompare{};
+  GXCullMode cullMode = GX_CULL_NONE;
+  std::array<f32, 5> polygonOffset{};
+  GXCompare depthFunc = GX_NEVER;
+  GXBlendMode blendMode = GX_BM_NONE;
+  GXBlendFactor blendFacSrc = GX_BL_ZERO;
+  GXBlendFactor blendFacDst = GX_BL_ZERO;
+  GXLogicOp blendOp = GX_LO_CLEAR;
+  u32 dstAlpha = 0;
+  std::array<bool, 4> writes{}; // depth compare, depth, alpha and color updates
+};
+PipelineInputs sPipelineInputs;
+
+// Whether size bytes at a and b differ: the answer memcmp gives, without its branch on every word. The pipeline's
+// inputs below are about a kilobyte, compared for every draw. With GCC's vector extensions the loop compares a vector
+// at a time however the call is inlined; GCC's own vectoriser did so only where the size was a constant, and kept a
+// word loop as slow as memcmp's in the LTO build.
+ALWAYS_INLINE bool bytes_differ(const void* a, const void* b, size_t size) noexcept {
+  const auto* x = static_cast<const u8*>(a);
+  const auto* y = static_cast<const u8*>(b);
+  size_t i = 0;
+#ifdef USE_GCC_VECTOR_EXTENSIONS
+  typedef u32 Words __attribute__((vector_size(16)));
+  Words wide{};
+  for (; i + sizeof(Words) <= size; i += sizeof(Words)) {
+    Words u;
+    Words v;
+    std::memcpy(&u, x + i, sizeof(u));
+    std::memcpy(&v, y + i, sizeof(v));
+    wide |= u ^ v;
+  }
+  u32 diff = wide[0] | wide[1] | wide[2] | wide[3];
+#else
+  u32 diff = 0;
+#endif
+  for (; i + sizeof(u32) <= size; i += sizeof(u32)) {
+    u32 u;
+    u32 v;
+    std::memcpy(&u, x + i, sizeof(u));
+    std::memcpy(&v, y + i, sizeof(v));
+    diff |= u ^ v;
+  }
+  for (; i < size; ++i) {
+    diff |= x[i] ^ y[i];
+  }
+  return diff != 0;
+}
+
+// Puts now's bytes in kept, and says whether they differed. Bytes, as the config's hash sees them: 0.f and -0.f differ.
+// Inlined, so the compares of small fields stay a load and a compare.
+ALWAYS_INLINE bool keep_bytes(void* kept, const void* now, size_t size) noexcept {
+  if (!bytes_differ(kept, now, size)) {
+    return false;
+  }
+  std::memcpy(kept, now, size);
+  return true;
+}
+
+template <typename T>
+bool keep(T& kept, const T& now) noexcept {
+  return keep_bytes(&kept, &now, sizeof(T));
+}
+
+// The first count of an array, as populate_pipeline_config copies them.
+template <typename T, size_t N>
+bool keep_first(std::array<T, N>& kept, const std::array<T, N>& now, size_t count) noexcept {
+  return keep_bytes(kept.data(), now.data(), std::min(count, N) * sizeof(T));
+}
+
+// Whether the state populate_pipeline_config reads, or the layout, differs from inputs, which then hold them.
+bool update_pipeline_inputs(PipelineInputs& inputs, GXVtxFmt fmt, u8 lineMode, uint64_t targetLayoutKey) noexcept {
+  const auto& state = g_gxState;
+  std::array<u16, MaxVtxAttr> indexedArrays{};
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    if (state.vtxDesc[i] == GX_INDEX8 || state.vtxDesc[i] == GX_INDEX16) {
+      indexedArrays[i] = state.arrays[i].stride | (state.arrays[i].le ? 0x100 : 0);
+    }
+  }
+  bool changed = keep(inputs.targetLayoutKey, targetLayoutKey);
+  changed |= keep(inputs.lineMode, lineMode);
+  changed |= keep(inputs.numTevStages, state.numTevStages);
+  changed |= keep(inputs.numIndStages, state.numIndStages);
+  changed |= keep(inputs.numTexGens, state.numTexGens);
+  changed |= keep(inputs.fogType, state.fog.type);
+  changed |= keep(inputs.fogRangeEnabled, state.fog.rangeEnabled);
+  changed |= keep(inputs.pixelFmt, state.pixelFmt);
+  changed |= keep(inputs.vtxDesc, state.vtxDesc);
+  changed |= keep(inputs.vtxFmt, state.vtxFmts[fmt]);
+  changed |= keep(inputs.indexedArrays, indexedArrays);
+  changed |= keep(inputs.tevSwapTable, state.tevSwapTable);
+  changed |= keep_first(inputs.tevStages, state.tevStages, state.numTevStages);
+  changed |= keep_first(inputs.indStages, state.indStages, state.numIndStages);
+  changed |= keep(inputs.colorChannels, state.colorChannelConfig);
+  changed |= keep(inputs.unitLightTerms, state.unitLightTerms);
+  changed |= keep_first(inputs.tcgs, state.tcgs, state.numTexGens);
+  changed |= keep(inputs.alphaCompare, state.alphaCompare);
+  changed |= keep(inputs.cullMode, state.cullMode);
+  changed |=
+      keep(inputs.polygonOffset, {state.frontOffset, state.frontScale, state.backOffset, state.backScale, state.clamp});
+  changed |= keep(inputs.depthFunc, state.depthFunc);
+  changed |= keep(inputs.blendMode, state.blendMode);
+  changed |= keep(inputs.blendFacSrc, state.blendFacSrc);
+  changed |= keep(inputs.blendFacDst, state.blendFacDst);
+  changed |= keep(inputs.blendOp, state.blendOp);
+  changed |= keep(inputs.dstAlpha, state.dstAlpha);
+  changed |= keep(inputs.writes, {state.depthCompare, state.depthUpdate, state.alphaUpdate, state.colorUpdate});
+  return changed;
+}
+
+// Where each array this frame copied into the storage pool landed, so an array that a later draw points at again isn't
+// copied again.
+absl::flat_hash_map<std::pair<const void*, u32>, gfx::Range> sArrayRanges;
 
 FogRangeLutKey fog_range_lut_key() noexcept {
   const auto& state = g_gxState.fog;
@@ -161,6 +380,12 @@ FogRangeLutKey fog_range_lut_key() noexcept {
 }
 
 std::vector<f32> build_fog_range_lut(const FogRangeLutKey& key) {
+  // A backend whose GPU reads the table builds it as close as it can to that GPU's own arithmetic.
+  if (const auto build = gfx::backend::limits().fogRangeTable) {
+    std::vector<f32> lut(key.targetWidth);
+    build(key.rangeK, key.rangeCenter, key.renderWidth, lut);
+    return lut;
+  }
   std::array<f32, 10> rangeK;
   for (u32 i = 0; i < rangeK.size(); ++i) {
     const u32 source = (i & ~1u) | (1u - (i & 1u));
@@ -196,6 +421,10 @@ const std::vector<f32>& resolve_fog_range_lut(const FogRangeLutKey& key) {
 
 gfx::Range push_fog_range_lut(const FogRangeLutKey& key) {
   const auto& lut = resolve_fog_range_lut(key);
+  // The backend's own table goes where its GPU reads it; fogRangeBase then counts words of that pool.
+  if (gfx::backend::limits().fogRangeTable != nullptr) {
+    return gfx::push_uniform(reinterpret_cast<const u8*>(lut.data()), lut.size() * sizeof(f32));
+  }
   return gfx::push_storage(reinterpret_cast<const u8*>(lut.data()), lut.size() * sizeof(f32));
 }
 
@@ -216,7 +445,8 @@ u8 line_mode_for_prim(GXPrimitive prim) noexcept {
 static uint32_t sMarkerTag = 0;
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
-static void handle_aurora(ByteReader& reader) noexcept;
+// Returns the display list a GX_AURORA_CALL_DISPLAY_LIST names, or no bytes.
+static std::span<const u8> handle_aurora(ByteReader& reader) noexcept;
 
 ProcessResult process(const u8* data, u32 size) noexcept {
   ZoneScoped;
@@ -233,8 +463,12 @@ ProcessResult process(const u8* data, u32 size) noexcept {
     case CP_CMD_LOAD_BP_REG: {
       const u32 value = reader.read<u32>();
       handle_bp(value);
-      if (reg_get(value, 8, 24) == GX_BP_REG_DRAWDONE) {
+      const u32 reg = reg_get(value, 8, 24);
+      if (reg == GX_BP_REG_DRAWDONE) {
         return {static_cast<u32>(reader.offset()), true};
+      }
+      if (reg == GX_BP_REG_PETOKEN || reg == GX_BP_REG_PETOKENINT) {
+        pass_draw_sync(static_cast<u16>(value), reg == GX_BP_REG_PETOKENINT);
       }
       break;
     }
@@ -288,15 +522,22 @@ ProcessResult process(const u8* data, u32 size) noexcept {
     }
 
     case CP_CMD_INVAL_VTX: {
-      for (auto& array : g_gxState.arrays) {
-        array.cachedRange = {};
-      }
+      // The game changed vertex data.
+      clear_array_ranges();
       g_gxState.dirty |= DirtyImmediates;
       break;
     }
 
     case GX_AURORA: {
-      handle_aurora(reader);
+      // A frame's end is a position the game thread waits for, so processing stops there to say it got there.
+      const bool frameEnd =
+          reader.remaining() >= sizeof(u16) && read_bits<u16>(reader.data() + reader.offset()) == GX_AURORA_END_FRAME;
+      if (const auto list = handle_aurora(reader); list.data() != nullptr) {
+        return {static_cast<u32>(reader.offset()), false, list.data(), static_cast<u32>(list.size())};
+      }
+      if (frameEnd) {
+        return {static_cast<u32>(reader.offset()), false};
+      }
       break;
     }
 
@@ -384,8 +625,8 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
   return vtxSize;
 }
 
-static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
-                         u32 numIndices) noexcept {
+static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, u64 vertHash,
+                         gfx::Range idxRange, u32 numIndices, bool patternIndices) noexcept {
   auto& state = g_gxState;
   auto& cache = sDrawCache;
 
@@ -396,27 +637,48 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     }
     auto& array = state.arrays[i];
     if (array.cachedRange.size == 0) {
-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
+      // One copy a frame of each array, however many times an attribute is pointed back at it.
+      const auto [it, inserted] = sArrayRanges.try_emplace({array.data, array.size});
+      if (inserted) {
+        it->second = gfx::push_array(static_cast<const uint8_t*>(array.data), array.size);
+      }
+      array.cachedRange = it->second;
     }
     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
   }
 
   const u8 lineMode = line_mode_for_prim(prim);
-  const auto targetLayoutKey = gfx::get_render_target_layout().key;
+  const auto targetLayoutKey = gfx::get_render_target_layout_key();
   const bool pipelineValid = cache.hasPipeline && (state.dirty & DirtyPipeline) == 0 && cache.fmt == fmt &&
                              cache.lineMode == lineMode && cache.targetLayoutKey == targetLayoutKey;
   if (!pipelineValid) {
     const bool hadPipeline = cache.hasPipeline;
     const auto prevSampledTextures = cache.shaderInfo.sampledTextures;
     const auto prevSampledIndTextures = cache.shaderInfo.sampledIndTextures;
-    populate_pipeline_config(cache.config, prim, fmt);
-    cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
-    cache.pipelineRef = gfx::pipeline_ref(cache.config);
+    // A register write marks the pipeline dirty, but the state often changes and changes back between two draws; see
+    // PipelineInputs.
+    if (update_pipeline_inputs(sPipelineInputs, fmt, lineMode, targetLayoutKey) || !hadPipeline) {
+      populate_pipeline_config(cache.config, prim, fmt);
+      const HashType memoKey = xxh3_hash(cache.config, targetLayoutKey);
+      if (const auto it = sPipelineMemo.find(memoKey); it != sPipelineMemo.end()) {
+        cache.shaderInfo = it->second.shaderInfo;
+        cache.pipelineRef = it->second.pipelineRef;
+      } else {
+        cache.shaderInfo = build_shader_info(cache.config.shaderConfig);
+        cache.pipelineRef = gfx::pipeline_ref(cache.config);
+        sPipelineMemo.emplace(memoKey, PipelineMemo{cache.shaderInfo, cache.pipelineRef});
+      }
+    }
     cache.targetLayoutKey = targetLayoutKey;
     cache.fmt = fmt;
+    // The uniform pieces hold the same state for every pipeline, but for the material's sizes of the
+    // textures sampled.
+    if (prevSampledTextures != cache.shaderInfo.sampledTextures) {
+      state.dirty |= DirtyMaterial;
+    }
     cache.lineMode = lineMode;
     cache.hasPipeline = true;
-    state.dirty = (state.dirty & ~DirtyPipeline) | DirtyUniform;
+    state.dirty &= ~DirtyPipeline;
     if (!hadPipeline || prevSampledTextures != cache.shaderInfo.sampledTextures ||
         prevSampledIndTextures != cache.shaderInfo.sampledIndTextures) {
       cache.bindGeneration = 0;
@@ -448,16 +710,28 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     state.dirty &= ~DirtyTextures;
     // For texture_size_bias uniform
     if (cache.bindGroups.textureBindGroup != prevBindGroup) {
-      state.dirty |= DirtyUniform;
+      state.dirty |= DirtyMaterial;
     }
   }
 
-  const bool uniformValid = (state.dirty & DirtyUniform) == 0 && cache.uniformRange.size != 0;
-  if (!uniformValid) {
-    cache.uniformRange = build_uniform(cache.shaderInfo);
-    state.dirty &= ~DirtyUniform;
+  // A piece the shaders read is pushed again only if its state changed since its last push this frame; the draw binds
+  // the earlier copies of the rest. Line and point draws push the view each time, as its line state isn't tracked.
+  if (lineMode != 0) {
+    state.dirty |= DirtyView;
   }
-  if (cache.config.shaderConfig.fogRangeEnabled) {
+  cache.staleUniforms |= (state.dirty & DirtyUniform) >> DirtyUniformShift;
+  state.dirty &= ~DirtyUniform;
+  // A shader that writes the render target's normal attachment reads the normal matrices, lit or not.
+  u8 readPieces = cache.shaderInfo.uniformPieces;
+  if (cache.config.shaderConfig.attrs[GX_VA_NRM].attrType != GX_NONE && gfx::has_normal_attachment()) {
+    readPieces |= 1 << UniformNrmMtx;
+  }
+  if (const u8 stale = cache.staleUniforms & readPieces; stale != 0) {
+    push_uniforms(cache.shaderInfo, stale, cache.uniformOffsets);
+    cache.staleUniforms &= ~stale;
+  }
+  // Only fogged programs read the table (gx/shader.cpp), and a draw can have range fog on but fog off.
+  if (cache.config.shaderConfig.fogRangeEnabled && cache.shaderInfo.usesFog) {
     const auto key = fog_range_lut_key();
     if (!cache.hasFogRange || cache.fogRangeKey != key) {
       cache.fogRange = push_fog_range_lut(key);
@@ -550,7 +824,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .bindGroups = cache.bindGroups,
       .vertRange = vertRange,
       .idxRange = idxRange,
-      .uniformRange = cache.uniformRange,
+      .uniformOffsets = cache.uniformOffsets,
       .immediateData = immediates,
 #ifdef __EMSCRIPTEN__
       .immediateRange = gfx::push_uniform(immediates),
@@ -560,15 +834,32 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .instanceCount = instanceCount,
       .dstAlpha = state.dstAlpha,
       .tag = sMarkerTag,
+      .patternIndices = patternIndices,
+      .vertHash = vertHash,
   });
 }
 
-static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange) noexcept {
+// The draw's vertex bytes into the frame's pool, hashed as they're copied when the backend keys a cache by them.
+static gfx::Range push_draw_verts(std::span<const u8> bytes, size_t alignment, u64& hash) noexcept {
+  if (!gfx::backend::limits().contentHashes) {
+    hash = 0;
+    return gfx::push_verts(bytes.data(), bytes.size(), alignment);
+  }
+  return gfx::push_verts_hashed(bytes.data(), bytes.size(), alignment, hash);
+}
+
+static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange,
+                                 u64 vertHash) noexcept {
   ZoneScoped;
   u32 numIndices = 0;
   gfx::Range idxRange;
+  bool patternIndices = false;
 
-  if (prim != GX_TRIANGLES) {
+  if (const auto pattern = index_pattern_range(index_patterns(), prim, vtxCount)) {
+    idxRange = *pattern;
+    numIndices = pattern->size / sizeof(u16);
+    patternIndices = true;
+  } else if (prim != GX_TRIANGLES) {
     ZoneScopedN("build idx buffer");
     static ByteBuffer idxBuf;
     numIndices = prepare_idx_buffer(idxBuf, prim, 0, vtxCount);
@@ -576,7 +867,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
     idxBuf.clear();
   }
 
-  push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, numIndices);
+  push_gx_draw(prim, fmt, vtxCount, vertRange, vertHash, idxRange, numIndices, patternIndices);
 }
 
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& reader) noexcept {
@@ -632,10 +923,18 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
       }
     }
   }
-  gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
+  u64 vertHash = 0;
+  gfx::Range vertRange =
+      canMerge ? gfx::push_verts(vertexData.data(), vertexData.size(), 0) : push_draw_verts(vertexData, 4, vertHash);
 
   // Try to merge with previous draw call
   if (canMerge) {
+    if (lastDraw->patternIndices) {
+      // Merged indices go on from the previous draw's in the frame's pool, so its pattern's are copied there first.
+      lastDraw->idxRange =
+          gfx::push_indices(index_patterns().indices.data() + lastDraw->idxRange.offset, lastDraw->idxRange.size, 4);
+      lastDraw->patternIndices = false;
+    }
     u32 numIndices = 0;
     gfx::Range idxRange;
     static ByteBuffer idxBuf;
@@ -658,6 +957,8 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
             idxRange.offset);
     }
     lastDraw->vertRange.size += vertRange.size;
+    // Its bytes are two pushes' now; the backend hashes them itself.
+    lastDraw->vertHash = 0;
     if (lastDraw->idxRange.size == 0) {
       lastDraw->idxRange = idxRange;
     } else {
@@ -669,7 +970,7 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
     return;
   }
 
-  handle_draw_unmerged(prim, fmt, vtxCount, vertRange);
+  handle_draw_unmerged(prim, fmt, vtxCount, vertRange, vertHash);
 }
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
@@ -678,11 +979,34 @@ static void handle_draw(u8 cmd, ByteReader& reader) noexcept {
   draw_prim(prim, fmt, reader.read<u16>(), reader);
 }
 
-void handle_aurora(ByteReader& reader) noexcept {
+std::span<const u8> handle_aurora(ByteReader& reader) noexcept {
   ZoneScoped;
   const u16 subCmd = reader.read<u16>();
 
-  if (subCmd == GX_AURORA_LOAD_VIEWPORT_RENDER) {
+  if (subCmd == GX_AURORA_CALL_DISPLAY_LIST) {
+    const auto* list = reinterpret_cast<const u8*>(reader.read<u64>());
+    const u32 size = reader.read<u32>();
+    return {list, size};
+  } else if (subCmd == GX_AURORA_BEGIN_FRAME) {
+    const u8 slot = reader.read<u8>();
+    g_gxState.viewportPolicy = static_cast<AuroraViewportPolicy>(reader.read<u8>());
+    const u32 viWidth = reader.read<u32>();
+    const u32 viHeight = reader.read<u32>();
+    g_gxState.viSize = {viWidth, viHeight};
+    gfx::detail::begin_frame_recording(slot);
+  } else if (subCmd == GX_AURORA_END_FRAME) {
+    const u8 slot = reader.read<u8>();
+    const bool close = reader.read<u8>() != 0;
+    gfx::detail::note_fifo_done(slot);
+    // The draw cache holds offsets into this frame's pools.
+    clear_draw_cache();
+    texture::end_frame();
+    gfx::detail::end_frame_recording(slot, close);
+  } else if (subCmd == GX_AURORA_SET_VI_SIZE) {
+    const u32 viWidth = reader.read<u32>();
+    const u32 viHeight = reader.read<u32>();
+    g_gxState.viSize = {viWidth, viHeight};
+  } else if (subCmd == GX_AURORA_LOAD_VIEWPORT_RENDER) {
     const f32 left = reader.read<f32>();
     const f32 top = reader.read<f32>();
     const f32 width = reader.read<f32>();
@@ -714,12 +1038,15 @@ void handle_aurora(ByteReader& reader) noexcept {
     for (u32 reg = 0x20; reg <= 0x26; ++reg) {
       g_gxState.xfRegValid.reset(reg);
     }
-    g_gxState.dirty |= DirtyUniform;
+    g_gxState.dirty |= DirtyView;
   } else if (subCmd >= GX_AURORA_LOAD_ARRAYBASE && subCmd <= (GX_AURORA_LOAD_ARRAYBASE | 0x0f)) {
     const u32 attrIdx = subCmd - GX_AURORA_LOAD_ARRAYBASE + GX_VA_POS;
     const u64 arrayAddr = reader.read<u64>();
     const u32 arraySize = reader.read<u32>();
-    const bool le = reader.read<u8>() == 1;
+    // Games mark an array le when the host wrote it, in the host's byte order (GXSetArray; J3D's skinned vertices and
+    // matrices): little-endian on the PCs they were ported to, but GX's own, big-endian, on a big-endian host such as
+    // the Xbox 360.
+    const bool le = reader.read<u8>() == 1 && std::endian::native == std::endian::little;
 
     auto& array = g_gxState.arrays[attrIdx];
     const auto newData = reinterpret_cast<void*>(arrayAddr);
@@ -817,13 +1144,15 @@ void handle_aurora(ByteReader& reader) noexcept {
   } else if (subCmd == GX_AURORA_LOAD_COPY_DEST) {
     g_gxState.texCopyDest = reinterpret_cast<const void*>(reader.read<u64>());
   } else if (subCmd == GX_AURORA_REQUEST_DEPTH_SNAPSHOT) {
-    gfx::depth_peek::request_snapshot();
+    gfx::backend::request_depth_snapshot();
   } else if (subCmd == GX_AURORA_BEGIN_OFFSCREEN) {
     const u32 width = reader.read<u32>();
     const u32 height = reader.read<u32>();
     gfx::begin_offscreen(width, height);
   } else if (subCmd == GX_AURORA_END_OFFSCREEN) {
     gfx::end_offscreen();
+  } else if (subCmd == GX_AURORA_CLEAR_COPY_SRC) {
+    clear_copy_src();
   } else if (subCmd == GX_AURORA_DESTROY_TEXOBJ) {
     evict_texture_object(reader.read<u32>());
   } else if (subCmd == GX_AURORA_DESTROY_TLUT) {
@@ -869,9 +1198,10 @@ void handle_aurora(ByteReader& reader) noexcept {
     }
     const u32 totalVtxBytes = vtxCount * vtxSize;
     const auto vertexData = reader.take(totalVtxBytes);
-    const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+    u64 vertHash = 0;
+    const gfx::Range vertRange = push_draw_verts(vertexData, 4, vertHash);
     if (indexCount != 0) {
-      push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+      push_gx_draw(prim, fmt, vtxCount, vertRange, vertHash, idxRange, indexCount, false);
     }
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
     auto label = reader.read_string();
@@ -889,11 +1219,24 @@ void handle_aurora(ByteReader& reader) noexcept {
   else {
     Log.error("Unknown Aurora subcommand: {:04X}", subCmd);
   }
+  return {};
+}
+
+// erase_if keeps the table, where clear() frees one of 128 slots or more (absl raw_hash_set.h:2892).
+void clear_array_ranges() noexcept {
+  absl::erase_if(sArrayRanges, [](const auto&) { return true; });
+  for (auto& array : g_gxState.arrays) {
+    array.cachedRange = {};
+  }
 }
 
 void clear_draw_cache() noexcept {
+  // Bounded, as nothing else evicts from the memo.
+  if (sPipelineMemo.size() > 8192) {
+    sPipelineMemo.clear();
+  }
   sDrawCache.bindGeneration = 0;
-  sDrawCache.uniformRange = {};
+  sDrawCache.staleUniforms = AllUniformPieces; // The next frame has a new uniform pool
   sDrawCache.fogRange = {};
   sDrawCache.hasFogRange = false;
 }

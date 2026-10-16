@@ -4,13 +4,29 @@
 #include <cstddef>
 #include <cstdint>
 
-#include <webgpu/webgpu_cpp.h>
-
 namespace aurora::gfx {
 
-inline constexpr size_t InlineDrawPayloadSize = 128;
+// 144, for gx::DrawData's offset per uniform piece.
+inline constexpr size_t InlineDrawPayloadSize = 144;
 inline constexpr size_t MaxColorAttachments = 8;
 inline constexpr uint32_t SceneColorAttachmentIndex = 0;
+
+// The formats the GX path creates textures and render targets in, whatever API draws them, and the stencil of RmlUi's
+// passes. Each has WebGPU's value (WGPUTextureFormat), so a layout's formats read the same through the WebGPU
+// extension API below.
+enum class TextureFormat : uint32_t {
+  Undefined = 0x00,
+  R8Unorm = 0x01,
+  R16Sint = 0x08,
+  RG8Unorm = 0x0A,
+  R32Float = 0x0E,
+  RGBA8Unorm = 0x16,
+  BGRA8Unorm = 0x1B,
+  RGB10A2Unorm = 0x1E,
+  Stencil8 = 0x2C,
+  Depth32Float = 0x30,
+  BC1RGBAUnorm = 0x32,
+};
 
 enum class ColorAttachmentSemantic : uint8_t {
   SceneColor,
@@ -20,7 +36,7 @@ enum class ColorAttachmentSemantic : uint8_t {
 
 struct ColorAttachmentLayout {
   ColorAttachmentSemantic semantic = ColorAttachmentSemantic::Auxiliary;
-  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+  TextureFormat format = TextureFormat::Undefined;
   uint32_t width = 0;
   uint32_t height = 0;
 };
@@ -29,13 +45,24 @@ struct RenderTargetLayout {
   uint64_t key = 0;
   uint32_t colorAttachmentCount = 0;
   std::array<ColorAttachmentLayout, MaxColorAttachments> colorAttachments{};
-  wgpu::TextureFormat depthStencilFormat = wgpu::TextureFormat::Undefined;
+  TextureFormat depthStencilFormat = TextureFormat::Undefined;
   uint32_t sampleCount = 1;
 };
 
-/// Generational handle: 0 is never valid, and IDs are not reused after unregister_draw_type.
-using DrawTypeId = uint64_t;
-inline constexpr DrawTypeId InvalidDrawType = 0;
+struct Viewport {
+  float left;
+  float top;
+  float width;
+  float height;
+  float znear;
+  float zfar;
+
+  bool operator==(const Viewport& rhs) const {
+    return left == rhs.left && top == rhs.top && width == rhs.width && height == rhs.height && znear == rhs.znear &&
+           zfar == rhs.zfar;
+  }
+  bool operator!=(const Viewport& rhs) const { return !(*this == rhs); }
+};
 
 struct Range {
   uint32_t offset = 0;
@@ -44,6 +71,51 @@ struct Range {
   bool operator==(const Range& rhs) const { return offset == rhs.offset && size == rhs.size; }
   bool operator!=(const Range& rhs) const { return !(*this == rhs); }
 };
+
+/// Generational handle: 0 is never valid, and IDs are not reused after unregister_draw_type.
+using DrawTypeId = uint64_t;
+inline constexpr DrawTypeId InvalidDrawType = 0;
+
+/// Generational handle: 0 is never valid, and IDs are not reused after unregister_encoder_task_type.
+using EncoderTaskId = uint64_t;
+inline constexpr EncoderTaskId InvalidEncoderTask = 0;
+
+RenderTargetLayout scene_render_target_layout() noexcept;
+bool uses_reversed_z() noexcept;
+
+/// Append transient data to the shared per-frame streaming buffers. Returned
+/// ranges are valid for the current frame only. Returns an empty Range (with a
+/// warning) outside an active recording frame.
+Range push_verts(const uint8_t* data, size_t length, size_t alignment);
+Range push_indices(const uint8_t* data, size_t length, size_t alignment);
+Range push_uniform(const uint8_t* data, size_t length);
+Range push_storage(const uint8_t* data, size_t length);
+
+/// Opens an offscreen render pass (GXCreateFrameBuffer semantics): cleared
+/// single-sample color+depth at (width, height) with full-target
+/// viewport/scissor. Subsequent draws target it until resolve_pass restores the
+/// EFB. Nesting is unsupported: returns false (with a warning) outside an
+/// active render pass or while any offscreen pass is already open.
+bool create_pass(uint32_t width, uint32_t height);
+
+/// True while an offscreen pass (create_pass or GXCreateFrameBuffer) is open.
+bool is_offscreen() noexcept;
+
+/// Increments on aurora_end_frame.
+uint32_t current_frame() noexcept;
+
+/// Blocks until the render worker has drained its queue. After this returns,
+/// no draw callback is executing or queued to execute; used before unloading
+/// code that registered draw types. Callable from the game thread only.
+void synchronize();
+
+} // namespace aurora::gfx
+
+#ifdef AURORA_GFX_BACKEND_DAWN
+// The WebGPU extension API, for a game drawing with the Dawn backend.
+#include <webgpu/webgpu_cpp.h>
+
+namespace aurora::gfx {
 
 struct DrawContext {
   wgpu::Device device;
@@ -74,8 +146,6 @@ wgpu::Queue queue() noexcept;
 wgpu::TextureFormat color_format() noexcept;
 wgpu::TextureFormat depth_format() noexcept;
 uint32_t sample_count() noexcept;
-RenderTargetLayout scene_render_target_layout() noexcept;
-bool uses_reversed_z() noexcept;
 
 DrawTypeId register_draw_type(const DrawTypeDescriptor& desc);
 void unregister_draw_type(DrawTypeId type) noexcept;
@@ -83,10 +153,6 @@ void unregister_draw_type(DrawTypeId type) noexcept;
 /// current position in the command stream. Payload (<= InlineDrawPayloadSize)
 /// is copied. Returns false (with a warning) outside an active render pass.
 bool push_custom_draw(DrawTypeId type, const void* payload, size_t payloadSize);
-
-/// Generational handle: 0 is never valid, and IDs are not reused after unregister_encoder_task_type.
-using EncoderTaskId = uint64_t;
-inline constexpr EncoderTaskId InvalidEncoderTask = 0;
 
 struct EncoderTaskContext {
   wgpu::Device device;
@@ -133,14 +199,6 @@ void unregister_encoder_task_type(EncoderTaskId type) noexcept;
 /// is open.
 bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSize);
 
-/// Append transient data to the shared per-frame streaming buffers. Returned
-/// ranges are valid for the current frame only. Returns an empty Range (with a
-/// warning) outside an active recording frame.
-Range push_verts(const uint8_t* data, size_t length, size_t alignment);
-Range push_indices(const uint8_t* data, size_t length, size_t alignment);
-Range push_uniform(const uint8_t* data, size_t length);
-Range push_storage(const uint8_t* data, size_t length);
-
 struct ResolveDesc {
   bool color = true;
   bool depth = false;
@@ -178,22 +236,5 @@ struct ResolvedTargets {
 /// also be null in offscreen passes and when unsupported by the device.
 bool resolve_pass(const ResolveDesc& desc, ResolvedTargets& out);
 
-/// Opens an offscreen render pass (GXCreateFrameBuffer semantics): cleared
-/// single-sample color+depth at (width, height) with full-target
-/// viewport/scissor. Subsequent draws target it until resolve_pass restores the
-/// EFB. Nesting is unsupported: returns false (with a warning) outside an
-/// active render pass or while any offscreen pass is already open.
-bool create_pass(uint32_t width, uint32_t height);
-
-/// True while an offscreen pass (create_pass or GXCreateFrameBuffer) is open.
-bool is_offscreen() noexcept;
-
-/// Increments on aurora_end_frame.
-uint32_t current_frame() noexcept;
-
-/// Blocks until the render worker has drained its queue. After this returns,
-/// no draw callback is executing or queued to execute; used before unloading
-/// code that registered draw types. Callable from the game thread only.
-void synchronize();
-
 } // namespace aurora::gfx
+#endif

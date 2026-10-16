@@ -1,5 +1,6 @@
 #include "render_worker.hpp"
 
+#include "frame_path.hpp"
 #include "../thread.hpp"
 
 #include <algorithm>
@@ -18,6 +19,10 @@ thread::Thread g_thread;
 std::atomic_bool g_running = false;
 std::atomic_size_t g_pendingItems = 0;
 std::thread::id g_workerThreadId;
+#ifdef AURORA_DIAGNOSTICS
+// The worker's time in its items, which a game's benchmark takes each frame (aurora_render_take_busy_ns).
+std::atomic<uint64_t> g_busyNs{0};
+#endif
 
 void complete_sync(const std::shared_ptr<SyncState>& sync) {
   if (!sync) {
@@ -46,7 +51,18 @@ void worker_main(std::stop_token token) {
 
     if (item->work) {
       ZoneScopedN("QueueItem work");
+#ifdef AURORA_DIAGNOSTICS
+      const auto start = std::chrono::steady_clock::now();
+      if (item->type == ItemType::BeginFrame) {
+        note_frame_path(item->frameId, FramePath::RenderBegin, start);
+      }
+#endif
       item->work();
+#ifdef AURORA_DIAGNOSTICS
+      g_busyNs.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(),
+          std::memory_order_relaxed);
+#endif
     }
     complete_sync(item->sync);
     g_pendingItems.fetch_sub(1, std::memory_order_acq_rel);
@@ -135,43 +151,42 @@ size_t BoundedQueue::size() const {
   return m_items.size();
 }
 
-FrameSlotPool::FrameSlotPool(size_t slotCount) : m_freeSlots(slotCount, true) {}
+FrameSlotPool::FrameSlotPool(size_t slotCount) : m_slotCount(slotCount) { reset(); }
+
+// With m_mutex held and a slot free.
+size_t FrameSlotPool::take_oldest() {
+  const size_t slot = m_freeSlots.front();
+  m_freeSlots.pop_front();
+  return slot;
+}
 
 size_t FrameSlotPool::acquire() {
   std::unique_lock lock{m_mutex};
-  m_cv.wait(lock, [&] {
-    for (const bool free : m_freeSlots) {
-      if (free) {
-        return true;
-      }
-    }
-    return false;
-  });
-  for (size_t i = 0; i < m_freeSlots.size(); ++i) {
-    if (m_freeSlots[i]) {
-      m_freeSlots[i] = false;
-      return i;
-    }
+  m_cv.wait(lock, [&] { return !m_freeSlots.empty(); });
+  return take_oldest();
+}
+
+std::optional<size_t> FrameSlotPool::acquire_for(std::chrono::nanoseconds timeout) {
+  std::unique_lock lock{m_mutex};
+  if (!m_cv.wait_for(lock, timeout, [&] { return !m_freeSlots.empty(); })) {
+    return std::nullopt;
   }
-  return 0;
+  return take_oldest();
 }
 
 std::optional<size_t> FrameSlotPool::try_acquire() {
   std::lock_guard lock{m_mutex};
-  for (size_t i = 0; i < m_freeSlots.size(); ++i) {
-    if (m_freeSlots[i]) {
-      m_freeSlots[i] = false;
-      return i;
-    }
+  if (m_freeSlots.empty()) {
+    return std::nullopt;
   }
-  return std::nullopt;
+  return take_oldest();
 }
 
 void FrameSlotPool::release(size_t slot) {
   {
     std::lock_guard lock{m_mutex};
-    if (slot < m_freeSlots.size()) {
-      m_freeSlots[slot] = true;
+    if (slot < m_slotCount && std::ranges::find(m_freeSlots, slot) == m_freeSlots.end()) {
+      m_freeSlots.push_back(slot);
     }
   }
   m_cv.notify_one();
@@ -180,14 +195,17 @@ void FrameSlotPool::release(size_t slot) {
 void FrameSlotPool::reset() {
   {
     std::lock_guard lock{m_mutex};
-    std::fill(m_freeSlots.begin(), m_freeSlots.end(), true);
+    m_freeSlots.clear();
+    for (size_t slot = 0; slot < m_slotCount; ++slot) {
+      m_freeSlots.push_back(slot);
+    }
   }
   m_cv.notify_all();
 }
 
 size_t FrameSlotPool::free_count() const {
   std::lock_guard lock{m_mutex};
-  return static_cast<size_t>(std::ranges::count(m_freeSlots, true));
+  return m_freeSlots.size();
 }
 
 void initialize() {
@@ -277,3 +295,10 @@ bool is_worker_thread() noexcept { return g_workerThreadId == std::this_thread::
 bool is_idle() noexcept { return g_pendingItems.load(std::memory_order_acquire) == 0; }
 
 } // namespace aurora::gfx::render_worker
+
+#ifdef AURORA_DIAGNOSTICS
+// The render worker's time in its items since the last call.
+extern "C" unsigned long long aurora_render_take_busy_ns() {
+  return aurora::gfx::render_worker::g_busyNs.exchange(0, std::memory_order_relaxed);
+}
+#endif

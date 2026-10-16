@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 
 #include <tracy/Tracy.hpp>
@@ -238,6 +239,18 @@ struct TextureDecoderI8 {
   }
 };
 
+// I8 as one byte a texel, for a backend that samples R8 as intensity (Limits::componentSwizzle).
+struct TextureDecoderI8R8 {
+  using Source = uint8_t;
+  using Target = uint8_t;
+
+  static constexpr uint32_t Frac = 1;
+  static constexpr uint32_t BlockWidth = 8;
+  static constexpr uint32_t BlockHeight = 4;
+
+  static void decode_texel(Target* target, const Source* in, const uint32_t x) { target[x] = in[x]; }
+};
+
 struct TextureDecoderRG8 {
   struct Source {
     uint8_t intensity;
@@ -282,12 +295,15 @@ struct TextureDecoderIA8 {
   static constexpr uint32_t BlockWidth = 4;
   static constexpr uint32_t BlockHeight = 4;
 
+  // Alpha in a texel's first byte and intensity in its second, read as bytes so either host's order does: a
+  // little-endian load put intensity in the high byte, and a big-endian one would swap them.
   static void decode_texel(Target* target, const Source* in, const uint32_t x) {
-    const uint8_t intensity = in[x] >> 8;
+    const auto* texel = reinterpret_cast<const uint8_t*>(in + x);
+    const uint8_t intensity = texel[1];
     target[x].r = intensity;
     target[x].g = intensity;
     target[x].b = intensity;
-    target[x].a = in[x] & 0xff;
+    target[x].a = texel[0];
   }
 };
 
@@ -323,7 +339,9 @@ struct TextureDecoderC14X2 {
   static constexpr uint32_t BlockWidth = 4;
   static constexpr uint32_t BlockHeight = 4;
 
-  static void decode_texel(Target* target, const Source* in, const uint32_t x) { target[x] = bswap(in[x]) & 0x3fff; }
+  static void decode_texel(Target* target, const Source* in, const uint32_t x) {
+    target[x] = from_big_endian(in[x]) & 0x3fff;
+  }
 };
 
 struct TextureDecoderRGB565 {
@@ -335,7 +353,7 @@ struct TextureDecoderRGB565 {
   static constexpr uint32_t BlockHeight = 4;
 
   static void decode_texel(Target* target, const Source* in, const uint32_t x) {
-    const auto texel = bswap(in[x]);
+    const auto texel = from_big_endian(in[x]);
     target[x].r = ExpandTo8<5>(texel >> 11 & 0x1f);
     target[x].g = ExpandTo8<6>(texel >> 5 & 0x3f);
     target[x].b = ExpandTo8<5>(texel & 0x1f);
@@ -352,7 +370,7 @@ struct TextureDecoderRGB5A3 {
   static constexpr uint32_t BlockHeight = 4;
 
   static void decode_texel(Target* target, const Source* in, const uint32_t x) {
-    const auto texel = bswap(in[x]);
+    const auto texel = from_big_endian(in[x]);
     if ((texel & 0x8000) != 0) {
       target[x].r = ExpandTo8<5>(texel >> 10 & 0x1f);
       target[x].g = ExpandTo8<5>(texel >> 5 & 0x1f);
@@ -429,8 +447,8 @@ static ByteBuffer BuildRGBA8FromCMPR(uint32_t width, uint32_t height, uint32_t m
         for (uint32_t yb = 0; yb < 8; yb += 4) {
           for (uint32_t xb = 0; xb < 8; xb += 4) {
             // CMPR difference: Big-endian color1/2
-            const uint16_t color1 = bswap(*reinterpret_cast<const uint16_t*>(src));
-            const uint16_t color2 = bswap(*reinterpret_cast<const uint16_t*>(src + 2));
+            const uint16_t color1 = from_big_endian(*reinterpret_cast<const uint16_t*>(src));
+            const uint16_t color2 = from_big_endian(*reinterpret_cast<const uint16_t*>(src + 2));
             src += 4;
 
             // Fill in first two colors in color table.
@@ -496,6 +514,98 @@ static ByteBuffer BuildRGBA8FromCMPR(uint32_t width, uint32_t height, uint32_t m
   }
 
   return buf;
+}
+
+// Re-tiles CMPR's big-endian blocks as little-endian BC1, reversing each row's indices.
+static ByteBuffer BuildBC1FromCMPR(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
+  size_t total = 0;
+  for (uint32_t mip = 0, w = width, h = height; mip < mips; ++mip) {
+    total += static_cast<size_t>((w + 3) / 4) * ((h + 3) / 4) * 8;
+    if (w > 1) {
+      w /= 2;
+    }
+    if (h > 1) {
+      h /= 2;
+    }
+  }
+  ByteBuffer buf{total};
+
+  uint8_t* dst = buf.data();
+  const uint8_t* src = data.data();
+  uint32_t w = width;
+  uint32_t h = height;
+  for (uint32_t mip = 0; mip < mips; ++mip) {
+    // Source tiles are always whole, so mips under 8 texels carry blocks BC1 skips.
+    const uint32_t tilesW = (w + 7) / 8;
+    const uint32_t tilesH = (h + 7) / 8;
+    const uint32_t blocksW = (w + 3) / 4;
+    const uint32_t blocksH = (h + 3) / 4;
+    CHECK(static_cast<size_t>(src - data.data()) + static_cast<size_t>(tilesW) * tilesH * 32 <= data.size(),
+          "BuildBC1FromCMPR: expected {} bytes, got {}",
+          static_cast<size_t>(src - data.data()) + static_cast<size_t>(tilesW) * tilesH * 32, data.size());
+    for (uint32_t by = 0; by < blocksH; ++by) {
+      for (uint32_t bx = 0; bx < blocksW; ++bx) {
+        const uint8_t* s = src + (static_cast<size_t>(by / 2) * tilesW + (bx / 2)) * 32 + ((by % 2) * 2 + (bx % 2)) * 8;
+        dst[0] = s[1];
+        dst[1] = s[0];
+        dst[2] = s[3];
+        dst[3] = s[2];
+        for (uint32_t y = 0; y < 4; ++y) {
+          const uint8_t bits = s[4 + y];
+          dst[4 + y] = static_cast<uint8_t>(((bits & 0x03) << 6) | ((bits & 0x0C) << 2) | ((bits & 0x30) >> 2) |
+                                            ((bits & 0xC0) >> 6));
+        }
+        dst += 8;
+      }
+    }
+    src += static_cast<size_t>(tilesW) * tilesH * 32;
+    if (w > 1) {
+      w /= 2;
+    }
+    if (h > 1) {
+      h /= 2;
+    }
+  }
+
+  return buf;
+}
+
+// Only without transparent texels, which GX keeps coloured and BC1 makes black.
+bool cmpr_uses_bc1(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) noexcept {
+  if (!backend::limits().cmprAsBc1) {
+    return false;
+  }
+  // WebGPU needs a BC texture's mip 0 in whole blocks.
+  if (width % 4 != 0 || height % 4 != 0) {
+    return false;
+  }
+  if (backend::limits().bcPowerOfTwo && (!std::has_single_bit(width) || !std::has_single_bit(height))) {
+    return false;
+  }
+  size_t blocks = 0;
+  for (uint32_t mip = 0, w = width, h = height; mip < mips; ++mip) {
+    blocks += static_cast<size_t>((w + 7) / 8) * ((h + 7) / 8) * 4;
+    w = w > 1 ? w / 2 : 1;
+    h = h > 1 ? h / 2 : 1;
+  }
+  if (blocks * 8 > data.size()) {
+    return false;
+  }
+  const uint8_t* s = data.data();
+  for (size_t b = 0; b < blocks; ++b, s += 8) {
+    const uint16_t color0 = static_cast<uint16_t>((s[0] << 8) | s[1]);
+    const uint16_t color1 = static_cast<uint16_t>((s[2] << 8) | s[3]);
+    if (color0 > color1) {
+      continue;
+    }
+    for (uint32_t y = 0; y < 4; ++y) {
+      const uint8_t bits = s[4 + y];
+      if ((bits & 0x03) == 0x03 || (bits & 0x0C) == 0x0C || (bits & 0x30) == 0x30 || (bits & 0xC0) == 0xC0) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 static ByteBuffer BuildRGBA8FromBC1(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
@@ -575,6 +685,11 @@ static ByteBuffer BuildRGBA8FromBC1(uint32_t width, uint32_t height, uint32_t mi
 ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data) {
   ZoneScoped;
   ByteBuffer converted;
+  // Arbitrary mips from an RGBA8 decode of its own, for a texture uploaded in another format.
+  bool decodedArbMips = false;
+  bool cmprBc1 = false;
+  // I8 stays one byte a texel where the backend samples R8 as intensity; EFB copies to I8 keep upload_format's RGBA8.
+  bool i8AsR8 = false;
   switch (format) {
     DEFAULT_FATAL("convert_texture: unknown texture format {}", format);
   case GX_TF_R8_PC:
@@ -583,19 +698,19 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
           DecodeLinear<TextureDecoderI8>(static_cast<uint32_t>(ComputeMippedTexelCount(width, height, mips)), data);
       break;
     }
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = upload_format(format), .width = width, .height = height, .mips = mips};
   case GX_TF_RG8_PC:
     if (!uses_direct_texture_upload(format)) {
       converted =
           DecodeLinear<TextureDecoderRG8>(static_cast<uint32_t>(ComputeMippedTexelCount(width, height, mips)), data);
       break;
     }
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = upload_format(format), .width = width, .height = height, .mips = mips};
   case GX_TF_RGBA8_PC:
-    return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+    return {.format = upload_format(format), .width = width, .height = height, .mips = mips};
   case GX_TF_BC1_PC:
     if (uses_direct_texture_upload(format)) {
-      return {.format = to_wgpu(format), .width = width, .height = height, .mips = mips};
+      return {.format = upload_format(format), .width = width, .height = height, .mips = mips};
     }
     converted = BuildRGBA8FromBC1(width, height, mips, data);
     break;
@@ -603,6 +718,14 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     converted = DecodeTiled<TextureDecoderI4>(width, height, mips, data);
     break;
   case GX_TF_I8:
+    if (backend::limits().componentSwizzle) {
+      if (mips > 1) {
+        decodedArbMips = arb_mip_check(width, height, mips, DecodeTiled<TextureDecoderI8>(width, height, mips, data));
+      }
+      converted = DecodeTiled<TextureDecoderI8R8>(width, height, mips, data);
+      i8AsR8 = true;
+      break;
+    }
     converted = DecodeTiled<TextureDecoderI8>(width, height, mips, data);
     break;
   case GX_TF_IA4:
@@ -630,6 +753,15 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     converted = BuildRGBA8FromGCN(width, height, mips, data);
     break;
   case GX_TF_CMPR:
+    if (cmpr_uses_bc1(width, height, mips, data)) {
+      // arb_mip_check reads RGBA8, so it gets a decode of its own.
+      if (mips > 1) {
+        decodedArbMips = arb_mip_check(width, height, mips, BuildRGBA8FromCMPR(width, height, mips, data));
+      }
+      converted = BuildBC1FromCMPR(width, height, mips, data);
+      cmprBc1 = true;
+      break;
+    }
     converted = BuildRGBA8FromCMPR(width, height, mips, data);
     break;
 
@@ -651,13 +783,15 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
     converted = BuildRGBA8FromGCN(width, height, mips, data);
     break;
   }
-  const auto wgpuFormat = to_wgpu(format);
-  bool hasArbitraryMips = false;
-  if (!is_pc_texture_format(format) && wgpuFormat == wgpu::TextureFormat::RGBA8Unorm && mips > 1) {
+  const auto uploadFormat = upload_format(format);
+  bool hasArbitraryMips = decodedArbMips;
+  if (!cmprBc1 && !i8AsR8 && !is_pc_texture_format(format) && uploadFormat == TextureFormat::RGBA8Unorm && mips > 1) {
     hasArbitraryMips = arb_mip_check(width, height, mips, converted);
   }
   return {
-      .format = wgpuFormat,
+      .format = cmprBc1  ? TextureFormat::BC1RGBAUnorm
+                : i8AsR8 ? TextureFormat::R8Unorm
+                         : uploadFormat,
       .width = width,
       .height = height,
       .mips = mips,
@@ -681,7 +815,7 @@ ConvertedTexture convert_tlut(u32 format, uint32_t width, ArrayRef<uint8_t> data
     break;
   }
   return {
-      .format = wgpu::TextureFormat::RGBA8Unorm,
+      .format = TextureFormat::RGBA8Unorm,
       .width = width,
       .height = 1,
       .mips = 1,
@@ -739,12 +873,90 @@ ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint
 
   bool hasArbitraryMips = arb_mip_check(width, height, mips, pixels);
   return {
-      .format = wgpu::TextureFormat::RGBA8Unorm,
+      .format = TextureFormat::RGBA8Unorm,
       .width = width,
       .height = height,
       .mips = mips,
       .data = std::move(pixels),
       .hasArbitraryMips = hasArbitraryMips,
   };
+}
+
+ByteBuffer decode_rgba8(u32 format, uint32_t width, uint32_t height, ArrayRef<uint8_t> data, GXTlutFmt tlutFormat,
+                        uint16_t tlutEntries, ArrayRef<uint8_t> tlutData) {
+  ByteBuffer indices;
+  switch (format) {
+  default:
+    return {};
+  case GX_TF_I4:
+    return DecodeTiled<TextureDecoderI4>(width, height, 1, data);
+  case GX_TF_I8:
+    return DecodeTiled<TextureDecoderI8>(width, height, 1, data);
+  case GX_TF_IA4:
+    return DecodeTiled<TextureDecoderIA4>(width, height, 1, data);
+  case GX_TF_IA8:
+    return DecodeTiled<TextureDecoderIA8>(width, height, 1, data);
+  case GX_TF_RGB565:
+    return DecodeTiled<TextureDecoderRGB565>(width, height, 1, data);
+  case GX_TF_RGB5A3:
+    return DecodeTiled<TextureDecoderRGB5A3>(width, height, 1, data);
+  case GX_TF_RGBA8:
+    return BuildRGBA8FromGCN(width, height, 1, data);
+  case GX_TF_CMPR:
+    return BuildRGBA8FromCMPR(width, height, 1, data);
+  case GX_TF_C4:
+    indices = DecodeTiled<TextureDecoderC4>(width, height, 1, data);
+    break;
+  case GX_TF_C8:
+    indices = DecodeTiled<TextureDecoderC8>(width, height, 1, data);
+    break;
+  case GX_TF_C14X2:
+    indices = DecodeTiled<TextureDecoderC14X2>(width, height, 1, data);
+    break;
+  }
+
+  const auto palette = convert_tlut(tlut_texture_format(tlutFormat), tlutEntries, tlutData);
+  if (indices.empty() || palette.data.empty()) {
+    return {};
+  }
+  const size_t pixelCount = static_cast<size_t>(width) * height;
+  const auto* indexData = reinterpret_cast<const u16*>(indices.data());
+  ByteBuffer pixels;
+  pixels.reserve_extra(pixelCount * 4);
+  for (size_t i = 0; i < pixelCount; ++i) {
+    const u32 index = indexData[i];
+    constexpr uint8_t transparent[4] = {0, 0, 0, 0};
+    pixels.append(index < tlutEntries ? palette.data.data() + static_cast<size_t>(index) * 4 : transparent, 4);
+  }
+  return pixels;
+}
+
+TextureFormatInfo format_info(TextureFormat format) noexcept {
+  switch (format) {
+    DEFAULT_FATAL("format_info: no block layout for texture format {}", underlying(format));
+  case TextureFormat::R8Unorm:
+    return {1, 1, 1, false};
+  case TextureFormat::RG8Unorm:
+  case TextureFormat::R16Sint:
+    return {1, 1, 2, false};
+  case TextureFormat::RGBA8Unorm:
+  case TextureFormat::BGRA8Unorm:
+  case TextureFormat::RGB10A2Unorm:
+  case TextureFormat::Depth32Float:
+    return {1, 1, 4, false};
+  case TextureFormat::BC1RGBAUnorm:
+    return {4, 4, 8, true};
+  }
+}
+
+uint64_t calc_texture_size(TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept {
+  const auto info = format_info(format);
+  uint64_t total = 0;
+  for (uint32_t mip = 0; mip < mips; ++mip) {
+    const uint64_t widthBlocks = (std::max(width >> mip, 1u) + info.blockWidth - 1) / info.blockWidth;
+    const uint64_t heightBlocks = (std::max(height >> mip, 1u) + info.blockHeight - 1) / info.blockHeight;
+    total += widthBlocks * heightBlocks * info.blockSize;
+  }
+  return total;
 }
 } // namespace aurora::gfx

@@ -2,49 +2,63 @@
 
 #include "resources.hpp"
 #include "frame_packet.hpp"
+#include "frame_path.hpp"
 
 #include <optional>
+#include <string>
+
+namespace aurora::imgui {
+class DrawData;
+} // namespace aurora::imgui
+
+// Frames recorded or drawing at once, each with its own copy of the streaming pools: the CMake setting
+// AURORA_FRAME_SLOT_COUNT.
+#ifndef AURORA_FRAME_SLOT_COUNT
+#define AURORA_FRAME_SLOT_COUNT 2
+#endif
 
 namespace aurora::gfx::detail {
 
-inline constexpr size_t FrameSlotCount = 2;
-#ifdef __EMSCRIPTEN__
-// The browser renderer submits inline and yields between VI ticks. One mapped
-// staging set bounds GPU work in flight and avoids five 87 MiB allocations.
-inline constexpr size_t StagingBufferCount = 1;
-#elif defined(__ANDROID__)
-inline constexpr size_t StagingBufferCount = FrameSlotCount + 1; // 3 staging buffers on mobile
-#else
-inline constexpr size_t StagingBufferCount = FrameSlotCount + 3; // 5 staging buffers on desktop
-#endif
-inline constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize +
-                                              StorageBufferSize + (UseTextureBuffer ? TextureUploadSize : 0);
+inline constexpr size_t FrameSlotCount = AURORA_FRAME_SLOT_COUNT;
+static_assert(FrameSlotCount >= 1, "AURORA_FRAME_SLOT_COUNT must be at least 1");
 
-const wgpu::Buffer& staging_buffer(size_t slot);
+AuroraStats& stats() noexcept;
 
-struct RegisteredDrawType {
-  DrawCallback draw = nullptr;
-  void* userdata = nullptr;
-};
-
-struct RegisteredEncoderTaskType {
-  EncoderTaskCallback callback = nullptr;
-  void* userdata = nullptr;
-  EncoderTaskCompletionCallback afterSubmit = nullptr;
-};
-
-std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id);
-std::optional<RegisteredEncoderTaskType> find_runtime_encoder_task_type(EncoderTaskId id);
+// FIFO processor, at the frame's start in the command stream: the frame's recording begins.
+void begin_frame_recording(size_t slot) noexcept;
+// FIFO processor: it has processed the frame's commands (the frame path's FifoDone).
+void note_fifo_done(size_t slot) noexcept;
+// FIFO processor, at the frame's end in the command stream: seals the frame's last pass, and closes the frame if
+// `close`.
+void end_frame_recording(size_t slot, bool close) noexcept;
+// Ends the frame's recording and hands it to the render worker to submit and present. On the FIFO processor, or on the
+// game thread with the stream drained.
+void close_frame(size_t slot) noexcept;
 
 } // namespace aurora::gfx::detail
 
 namespace aurora::gfx {
 void initialize();
 void shutdown();
-bool begin_frame();
-void end_frame(EndFrameCallback callback);
+// Game thread: takes a frame slot, which the backend readies. The frame's recording begins where its start is written
+// into the command stream (gx::begin_frame). The slot, or none when the backend has none.
+std::optional<size_t> begin_frame();
+struct FrameEnding {
+  size_t slot;
+  // Whether the FIFO processor closes the frame at its end. If not, the game thread drains the command stream and
+  // calls finish_frame.
+  bool close;
+};
+// Game thread: the backend presents the frame begun last with the overlay, and writes it to capturePath when that isn't
+// empty, once the frame is closed.
+FrameEnding end_frame(imgui::DrawData overlay, std::string capturePath);
+// Game thread, with the command stream drained: what the backend records after the frame's GX passes, then the close.
+void finish_frame(size_t slot);
+// Game thread, once the frame ended before the last one is closed: publishes its stats (aurora_get_stats).
+void publish_frame_stats() noexcept;
 uint32_t current_frame() noexcept;
-void after_submit() noexcept;
+// The id of the frame begun last.
+uint64_t current_frame_id() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;
 float calculate_fps() noexcept;

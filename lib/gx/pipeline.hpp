@@ -9,7 +9,7 @@ struct DrawData {
   GXBindGroups bindGroups;
   gfx::Range vertRange;
   gfx::Range idxRange;
-  gfx::Range uniformRange;
+  std::array<uint32_t, UniformPieceCount> uniformOffsets; // In the frame's pool, by UniformPiece
   DrawImmediateData immediateData;
 #ifdef __EMSCRIPTEN__
   gfx::Range immediateRange;
@@ -22,12 +22,18 @@ struct DrawData {
   // because the FIFO is processed on a worker thread, so reading a global at
   // render time attributes draws to whatever the game thread did last.
   uint32_t tag;
+  // idxRange is in the index patterns (fifo::index_patterns), which the backend keeps apart, not in the frame's pool.
+  bool patternIndices = false;
+  // With backend::Limits::contentHashes, XXH3-64 of vertRange's bytes as the frame's pool holds them; zero when not
+  // hashed (draws merged into one, or the limit off).
+  uint64_t vertHash = 0;
 };
 
+// 14 for ColorChannelConfig's lightMask; a cached 13 would read as a lit channel with no lights.
 #ifdef __EMSCRIPTEN__
-constexpr uint32_t GXPipelineConfigVersion = 10013;
+constexpr uint32_t GXPipelineConfigVersion = 10014;
 #else
-constexpr uint32_t GXPipelineConfigVersion = 13;
+constexpr uint32_t GXPipelineConfigVersion = 14;
 #endif
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
@@ -52,9 +58,6 @@ struct PipelineOptions {
   bool alphaUpdate = false;
   bool depthUpdate = false;
 };
-
-gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout);
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;
 } // namespace aurora::gx

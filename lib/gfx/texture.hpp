@@ -3,24 +3,28 @@
 
 #include <utility>
 
+#include "backend.hpp"
 #include "types.hpp"
 
 namespace aurora::gfx {
+// One level's copy into a backend texture, from the frame's upload pool or from overflow.
 struct TextureUpload {
-  wgpu::TexelCopyBufferLayout layout;
-  wgpu::TexelCopyTextureInfo tex;
-  wgpu::Extent3D size;
-  wgpu::Buffer buffer;
-
-  TextureUpload(wgpu::TexelCopyBufferLayout layout, wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) noexcept
-  : layout(layout), tex(std::move(tex)), size(size) {}
-  TextureUpload(wgpu::TexelCopyBufferLayout layout, wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size,
-                wgpu::Buffer buffer) noexcept
-  : layout(layout), tex(std::move(tex)), size(size), buffer(std::move(buffer)) {}
+  std::shared_ptr<backend::Texture> texture;
+  uint32_t mipLevel = 0;
+  uint32_t offset = 0;
+  uint32_t bytesPerRow = 0;
+  uint32_t rowsPerImage = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // Array layers, each rowsPerImage rows; only the WebGPU extension's uploads have more than one.
+  uint32_t layers = 1;
+  // The rows, staged by the backend, when the pool had no room.
+  std::shared_ptr<backend::UploadBuffer> overflow;
 };
 void queue_texture_upload(TextureUpload upload);
-void queue_texture_upload_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
-                               wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size);
+// False when the backend had no memory to stage it; nothing is queued then. The rows go at an offset that is a multiple
+// of blockSize, the format's bytes a block, as Vulkan's buffer-to-image copies ask.
+bool queue_texture_upload_data(const uint8_t* data, TextureUpload upload, uint32_t blockSize);
 
 struct TextureFormatInfo {
   uint8_t blockWidth;
@@ -28,40 +32,44 @@ struct TextureFormatInfo {
   uint8_t blockSize;
   bool compressed;
 };
-TextureFormatInfo format_info(wgpu::TextureFormat format) noexcept;
-uint64_t calc_texture_size(wgpu::TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept;
-bool is_block_aligned(wgpu::TextureFormat format, uint32_t width, uint32_t height) noexcept;
+TextureFormatInfo format_info(TextureFormat format) noexcept;
+uint64_t calc_texture_size(TextureFormat format, uint32_t width, uint32_t height, uint32_t mips) noexcept;
 
 constexpr u32 InvalidTextureFormat = -1;
+struct TextureExtent {
+  uint32_t width;
+  uint32_t height;
+};
 struct TextureRef {
-  wgpu::Texture texture;
-  wgpu::TextureView sampleTextureView;
-  wgpu::TextureView attachmentTextureView;
-  wgpu::Extent3D size;
-  wgpu::TextureFormat format;
+  std::shared_ptr<backend::Texture> gpu;
+  TextureExtent size;
+  // Undefined for a texture pack's format, which only the backend knows.
+  TextureFormat format;
   uint32_t mipCount;
   u32 gxFormat;
   bool hasArbitraryMips = false;
   bool isReplacement = false;
 
-  TextureRef(wgpu::Texture texture, wgpu::TextureView sampleTextureView, wgpu::TextureView attachmentTextureView,
-             wgpu::Extent3D size, wgpu::TextureFormat format, uint32_t mipCount, u32 gxFormat)
-  : texture(std::move(texture))
-  , sampleTextureView(std::move(sampleTextureView))
-  , attachmentTextureView(std::move(attachmentTextureView))
-  , size(size)
-  , format(format)
-  , mipCount(mipCount)
-  , gxFormat(gxFormat) {}
+  TextureRef(std::shared_ptr<backend::Texture> gpu, TextureExtent size, TextureFormat format, uint32_t mipCount,
+             u32 gxFormat)
+  : gpu(std::move(gpu)), size(size), format(format), mipCount(mipCount), gxFormat(gxFormat) {}
 };
 
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
+// new_static_texture_2d for data convert_texture already produced from this texture.
+TextureHandle new_static_texture_2d_converted(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                              TextureFormat format, ArrayRef<uint8_t> converted, bool hasArbitraryMips,
+                                              const char* label) noexcept;
 TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
                                      const char* label) noexcept;
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
-void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
+// A texture created as the backend is asked, with nothing uploaded.
+TextureHandle new_texture(uint32_t width, uint32_t height, uint32_t mips, TextureFormat format, u32 gxFormat,
+                          backend::TextureUsage usage, const char* label) noexcept;
+// Uploads data already in the texture's format; false when a level could not be staged.
+bool write_texture_levels(TextureRef& ref, TextureFormatInfo info, ArrayRef<uint8_t> data) noexcept;
 }; // namespace aurora::gfx
 
 struct GXTexObj_ {
@@ -131,6 +139,27 @@ struct GXTlutObj_ {
 static_assert(sizeof(GXTlutObj_) <= sizeof(GXTlutObj), "GXTlutObj too small!");
 
 namespace aurora::gfx {
+// A GX texture's sampler after Aurora's LOD and anisotropy rules, for the backend to create.
+enum class SamplerFilter : uint8_t {
+  Nearest,
+  Linear,
+};
+enum class SamplerMipFilter : uint8_t {
+  None,
+  Nearest,
+  Linear,
+};
+struct SamplerConfig {
+  GXTexWrapMode wrapS = GX_CLAMP;
+  GXTexWrapMode wrapT = GX_CLAMP;
+  SamplerFilter magFilter = SamplerFilter::Nearest;
+  SamplerFilter minFilter = SamplerFilter::Nearest;
+  SamplerMipFilter mipFilter = SamplerMipFilter::None;
+  float minLod = 0.f;
+  float maxLod = 0.f;
+  uint16_t maxAnisotropy = 1;
+};
+
 struct TextureBind {
   TextureHandle ref;
   GXTexObj_ texObj;
@@ -140,7 +169,17 @@ struct TextureBind {
   TextureBind(const GXTexObj_& obj, TextureHandle handle, uint64_t bindGeneration = 0) noexcept
   : ref(std::move(handle)), texObj(obj), generation(bindGeneration) {}
   void reset() noexcept { ref.reset(); }
-  [[nodiscard]] wgpu::SamplerDescriptor get_descriptor() const noexcept;
+  [[nodiscard]] SamplerConfig sampler_config() const noexcept;
   operator bool() const noexcept { return ref.operator bool(); }
+};
+
+// What a draw samples; slots it doesn't sample are empty.
+struct TextureSet {
+  std::array<TextureHandle, GX_MAX_TEXMAP> textures;
+  std::array<SamplerConfig, GX_MAX_TEXMAP> samplers;
+
+  // Equal for equal sets, so the backend can cache what it makes of one. It hashes texture addresses, so a backend
+  // that caches by it keeps the set's textures alive while cached.
+  [[nodiscard]] BindGroupRef hash() const noexcept;
 };
 } // namespace aurora::gfx

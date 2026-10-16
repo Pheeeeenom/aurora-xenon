@@ -8,16 +8,19 @@ EM_JS(void, browser_graphics_progress, (unsigned done, unsigned total), {
 #include "pipeline_cache.hpp"
 
 #include "clear.hpp"
+#include "frame.hpp"
 #include "frame_packet.hpp"
 #include "resources.hpp"
 #include "hash.hpp"
 #include "../gx/pipeline.hpp"
 #include "../io.hpp"
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 #include "../rmlui/pipeline.hpp"
+// RmlUi draws only with Dawn.
+#include "../webgpu/backend.hpp"
 #endif
 #include "../sqlite_utils.hpp"
-#include "../webgpu/gpu.hpp"
+#include "../thread.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -68,7 +71,7 @@ struct PipelineCacheWrite {
 };
 
 using SavedPipelineConfig = std::variant<gx::PipelineConfig, clear::PipelineConfig
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
                                          ,
                                          rmlui::PipelineConfig
 #endif
@@ -390,8 +393,8 @@ static bool register_sdl_vfs() {
 }
 
 #if defined(__cpp_lib_atomic_ref)
-static std::atomic_ref queuedPipelines{detail::resources().stats.queuedPipelines};
-static std::atomic_ref createdPipelines{detail::resources().stats.createdPipelines};
+static std::atomic_ref queuedPipelines{detail::stats().queuedPipelines};
+static std::atomic_ref createdPipelines{detail::stats().createdPipelines};
 #else
 struct AtomicStatRef {
   uint32_t& ref;
@@ -404,9 +407,10 @@ struct AtomicStatRef {
     __atomic_store_n(&ref, val, __ATOMIC_RELAXED);
     return val;
   }
+  uint32_t load() const { return __atomic_load_n(&ref, __ATOMIC_RELAXED); }
 };
-static AtomicStatRef queuedPipelines{detail::resources().stats.queuedPipelines};
-static AtomicStatRef createdPipelines{detail::resources().stats.createdPipelines};
+static AtomicStatRef queuedPipelines{detail::stats().queuedPipelines};
+static AtomicStatRef createdPipelines{detail::stats().createdPipelines};
 #endif
 
 /* melee-pc: what pipeline creation costs, logged by log_pipeline_stats.
@@ -554,7 +558,7 @@ static void notify_pipeline_ready(bool queued, uint32_t pipelineCount) {
   createdPipelines += pipelineCount;
   if (queued && --queuedPipelines == 0 && g_gpuCachePrunePending.exchange(false, std::memory_order_acq_rel)) {
     // Prune GPU cache entries after fully loading the pipeline cache.
-    webgpu::cache_prune();
+    backend::pipelines_loaded();
   }
   g_pipelineReadyCv.notify_all();
 }
@@ -658,7 +662,7 @@ static PipelineRef resolve_pipeline(ShaderType type, const gx::PipelineConfig& c
   return find_pipeline_impl(
       xxh3_hash(layout.key, cacheKey),
       [type, cacheKey, config, layout] {
-        auto pipeline = create_pipeline(config, layout);
+        auto pipeline = backend::create_pipeline(config, layout);
         mark_device_built(type, cacheKey);
         return pipeline;
       },
@@ -671,21 +675,21 @@ static PipelineRef resolve_pipeline(ShaderType type, const clear::PipelineConfig
   return find_pipeline_impl(
       xxh3_hash(layout.key, cacheKey),
       [type, cacheKey, config, layout] {
-        auto pipeline = CompiledPipeline{.main = create_pipeline(config, layout)};
+        auto pipeline = CompiledPipeline{.main = backend::create_pipeline(config, layout)};
         mark_device_built(type, cacheKey);
         return pipeline;
       },
       priority);
 }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 static PipelineRef resolve_pipeline(ShaderType type, const rmlui::PipelineConfig& config, const RenderTargetLayout&,
                                     PipelinePriority priority) {
   const auto cacheKey = xxh3_hash(config, static_cast<HashType>(type));
   return find_pipeline_impl(
       cacheKey,
       [type, cacheKey, config] {
-        auto pipeline = CompiledPipeline{.main = rmlui::create_pipeline(config)};
+        auto pipeline = CompiledPipeline{.main = webgpu::make_pipeline(rmlui::create_pipeline(config))};
         mark_device_built(type, cacheKey);
         return pipeline;
       },
@@ -1055,7 +1059,7 @@ static void prune_old_pipeline_cache_versions() {
     return;
   }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
   const auto rmlDelete = fmt::format("DELETE FROM pipeline_cache WHERE type = {} AND config_version < {}",
                                      underlying(ShaderType::Rml), rmlui::RmlPipelineConfigVersion);
   ret = sqlite::exec(g_pipelineCacheDb, rmlDelete.c_str());
@@ -1151,9 +1155,7 @@ static bool write_device_built_record(const PipelineCacheWrite& write) {
 }
 
 static void pipeline_cache_writer() {
-#ifdef TRACY_ENABLE
-  tracy::SetThreadName("Pipeline cache writer thread");
-#endif
+  aurora::thread::set_current({.name = "Pipeline cache writer thread"});
 
   while (true) {
     std::deque<PipelineCacheWrite> batch;
@@ -1206,12 +1208,12 @@ static void build_pending_pipeline(PendingPipeline& pending) {
 }
 
 static void pipeline_worker() {
-#ifdef TRACY_ENABLE
-  tracy::SetThreadName("Pipeline compilation thread");
-#endif
-  if (g_hasPipelineThread && !g_pipelineSync) {
-    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
-  }
+  // Low when compiling in the background, so the threads only take CPU the game isn't using.
+  aurora::thread::set_current({
+      .name = "Pipeline compilation thread",
+      .priority = g_hasPipelineThread && !g_pipelineSync ? aurora::thread::Priority::Low
+                                                         : aurora::thread::Priority::Normal,
+  });
 
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
@@ -1313,7 +1315,7 @@ static size_t load_pipeline_cache() {
   }
 
   size_t acceptedRows = 0;
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
   acceptedRows += load_pipeline_cache_entries<rmlui::PipelineConfig>(ShaderType::Rml, rmlui::RmlPipelineConfigVersion);
 #endif
   acceptedRows +=
@@ -1365,7 +1367,7 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLa
                           g_pipelineSync ? PipelinePriority::Blocking : PipelinePriority::Normal);
 }
 
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
   remember_pipeline_config(ShaderType::Rml, config, 0, true);
   return resolve_pipeline(ShaderType::Rml, config, {}, PipelinePriority::Blocking);
@@ -1374,7 +1376,7 @@ PipelineRef find_pipeline(const rmlui::PipelineConfig& config) {
 
 void rebuild_pipeline_cache() {
   ZoneScoped;
-  const auto scene = scene_render_target_layout();
+  const auto scene = backend::efb_layout();
   auto offscreen = scene;
   offscreen.colorAttachmentCount = 1;
   offscreen.sampleCount = 1;
@@ -1418,13 +1420,20 @@ void initialize_pipeline_cache() {
 #else
   const bool inlineOnly = false;
 #endif
-  if (webgpu::g_backendType == wgpu::BackendType::WebGPU || inlineOnly) {
+  if (!backend::limits().pipelineThreads || inlineOnly) {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;
-    const unsigned jobs = pipeline_job_count();
+    // A count the game set in AuroraConfig, capped; else MELEE_PIPELINE_JOBS or the platform's default.
+    constexpr uint32_t MaxPipelineJobs = 16;
+    const uint32_t limit = std::min(std::max(std::thread::hardware_concurrency(), 1u), MaxPipelineJobs);
+    uint32_t jobs = g_config.pipelineJobs != 0 ? g_config.pipelineJobs : pipeline_job_count();
+    if (jobs > limit) {
+      Log.warn("Pipeline compilation: {} threads asked for, capped at {}", jobs, limit);
+      jobs = limit;
+    }
     Log.info("Compiling pipelines on {} thread(s){}", jobs, g_pipelineSync ? ", sync mode" : "");
-    for (unsigned i = 0; i < jobs; ++i) {
+    for (uint32_t i = 0; i < jobs; ++i) {
       g_pipelineThreads.emplace_back(pipeline_worker);
     }
   }
@@ -1478,7 +1487,7 @@ void begin_pipeline_frame() {
   if (!g_hasPipelineThread) {
     g_pipelinesPerFrame = 0;
   }
-  if (g_pipelineLayoutKey != scene_render_target_layout().key) {
+  if (g_pipelineLayoutKey != backend::efb_layout().key) {
     rebuild_pipeline_cache();
   }
   /* Every ten seconds at 60 Hz, and only when something was built: a
@@ -1513,6 +1522,11 @@ void end_pipeline_frame() {
   if (!g_hasPipelineThread) {
     pipeline_worker();
   }
+}
+
+void get_pipeline_counts(uint32_t& queued, uint32_t& created) {
+  queued = queuedPipelines.load();
+  created = createdPipelines.load();
 }
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {

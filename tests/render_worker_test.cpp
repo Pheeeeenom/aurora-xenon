@@ -104,4 +104,20 @@ TEST(RenderWorkerFrameSlots, RecyclesReleasedSlots) {
   slots.release(second);
   EXPECT_EQ(slots.free_count(), 1u);
 }
+
+// A frame's slot is released once the frame is submitted, which with three slots is often before the frame two on
+// begins. That frame must get the slot of the frame three back, whose fence comes first.
+TEST(RenderWorkerFrameSlots, HandsOutTheSlotReleasedFirst) {
+  FrameSlotPool slots{3};
+  std::vector<size_t> frameSlots;
+  for (size_t frame = 0; frame < 9; ++frame) {
+    if (frame >= 2) {
+      slots.release(frameSlots[frame - 2]);
+    }
+    frameSlots.push_back(slots.acquire());
+  }
+  for (size_t frame = 3; frame < frameSlots.size(); ++frame) {
+    EXPECT_EQ(frameSlots[frame], frameSlots[frame - 3]) << "frame " << frame;
+  }
+}
 } // namespace

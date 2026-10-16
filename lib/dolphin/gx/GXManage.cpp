@@ -262,9 +262,8 @@ GXFifoObj* GXInit(void* base, u32 size) {
 }
 
 void GXDrawDone() {
-  GXFlush();
-  GX_WRITE_RAS_REG(kDrawDoneCommand);
-  aurora::gx::fifo::drain();
+  GXSetDrawDone();
+  GXWaitDrawDone();
 }
 
 // Waits for a previously posted GXSetDrawDone token without posting another
@@ -278,14 +277,35 @@ void GXSetDrawDone() {
   GXFlush();
   GX_WRITE_RAS_REG(kDrawDoneCommand);
   aurora::gx::fifo::publish();
+  aurora::gx::fifo::set_draw_done();
 }
+
+// Until the FIFO processor has passed the last GXSetDrawDone's token, as the SDK waits for its interrupt, not for
+// what was sent after it.
+void GXWaitDrawDone() { aurora::gx::fifo::wait_draw_done(); }
 
 GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) { return aurora::gx::fifo::set_draw_done_callback(cb); }
 
+// As the SDK writes them: PE_TOKEN_INT, which calls the draw sync callback, then PE_TOKEN, which GXReadDrawSync reads.
+// Given to the processor at once, as a game may poll for the token.
+void GXSetDrawSync(u16 token) {
+  GX_WRITE_RAS_REG(static_cast<u32>(GX_BP_REG_PETOKENINT) << 24 | token);
+  GX_WRITE_RAS_REG(static_cast<u32>(GX_BP_REG_PETOKEN) << 24 | token);
+  GXFlush();
+  aurora::gx::fifo::publish_now();
+}
+
+// The token the FIFO processor passed last, which a game may poll for.
+u16 GXReadDrawSync() { return aurora::gx::fifo::draw_sync_token(); }
+
+GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback cb) { return aurora::gx::fifo::set_draw_sync_callback(cb); }
+
+// Gives the FIFO processor what's written, as the GameCube's flush gives the write-gather pipe to the GPU.
 void GXFlush() {
   if (__gx->dirtyState) {
     __GXSetDirtyState();
   }
+  aurora::gx::fifo::publish();
 }
 
 void GXPixModeSync() {

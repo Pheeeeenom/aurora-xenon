@@ -1,6 +1,7 @@
 #pragma once
 
 #include <aurora/aurora.h>
+#include <aurora/gfx.hpp>
 #include <aurora/math.hpp>
 
 #include "wgpu.hpp"
@@ -18,7 +19,6 @@ struct GraphicsConfig {
   wgpu::SurfaceConfiguration surfaceConfiguration;
   wgpu::TextureFormat depthFormat;
   uint32_t msaaSamples;
-  uint16_t textureAnisotropy;
   bool normalBuffer = false;
 };
 struct TextureWithSampler {
@@ -28,20 +28,7 @@ struct TextureWithSampler {
   wgpu::TextureFormat format;
   wgpu::Sampler sampler;
 };
-struct Viewport {
-  float left;
-  float top;
-  float width;
-  float height;
-  float znear;
-  float zfar;
-
-  bool operator==(const Viewport& rhs) const {
-    return left == rhs.left && top == rhs.top && width == rhs.width && height == rhs.height && znear == rhs.znear &&
-           zfar == rhs.zfar;
-  }
-  bool operator!=(const Viewport& rhs) const { return !(*this == rhs); }
-};
+using gfx::Viewport;
 
 extern wgpu::Device g_device;
 extern wgpu::Queue g_queue;
@@ -61,6 +48,9 @@ extern std::string g_adapterName;
 extern std::string g_adapterDriver;
 extern bool g_hasCoreFeatures;
 extern bool g_bcTexturesSupported;
+// Uploads opaque CMPR textures as BC1 instead of RGBA8: 4 bits a texel to 32, but BC1 blends in thirds where GX uses
+// eighths. Off unless a backend that wants it sets it.
+extern bool g_cmprAsBc1;
 extern bool g_astcTexturesSupported;
 extern bool g_textureComponentSwizzleSupported;
 extern bool g_dualSourceBlendingSupported;

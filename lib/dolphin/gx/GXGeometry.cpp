@@ -225,10 +225,10 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
   assert((cpIdx & ~0xF) == 0);
 
   // Write array base
-  GX_WRITE_AURORA(GX_AURORA_LOAD_ARRAYBASE | cpIdx);
-  GX_WRITE_U64(reinterpret_cast<u64>(data));
-  GX_WRITE_U32(size);
-  GX_WRITE_U8(le ? 1 : 0);
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(GX_AURORA),
+                                  static_cast<uint16_t>(GX_AURORA_LOAD_ARRAYBASE | cpIdx),
+                                  static_cast<uint64_t>(reinterpret_cast<u64>(data)), static_cast<uint32_t>(size),
+                                  static_cast<uint8_t>(le ? 1 : 0));
 
   // Write array stride
   GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);

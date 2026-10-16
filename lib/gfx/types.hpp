@@ -2,13 +2,11 @@
 
 #include "hash.hpp"
 #include "../internal.hpp"
-#include "../webgpu/gpu.hpp"
 
 #include <aurora/gfx.h>
 #include <aurora/gfx.hpp>
 #include <aurora/math.hpp>
 #include <dolphin/gx/GXEnum.h>
-#include <webgpu/webgpu_cpp.h>
 
 #include <cstdint>
 #include <cstring>
@@ -32,10 +30,6 @@ struct ClipRect {
   bool operator!=(const ClipRect& rhs) const { return !(*this == rhs); }
 };
 
-using webgpu::Viewport;
-
 struct TextureRef;
 using TextureHandle = std::shared_ptr<TextureRef>;
-using AfterSubmitCallback = std::function<void()>;
-using EndFrameCallback = std::function<void(wgpu::CommandEncoder&, std::vector<AfterSubmitCallback>)>;
 } // namespace aurora::gfx

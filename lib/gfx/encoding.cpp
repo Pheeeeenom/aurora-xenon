@@ -9,9 +9,10 @@
 #include "tex_palette_conv.hpp"
 #include "../gx/gx.hpp"
 #include "../gx/pipeline.hpp"
-#ifdef AURORA_ENABLE_RMLUI
+#ifdef AURORA_RMLUI_DRAWS
 #include "../rmlui/pipeline.hpp"
 #endif
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../webgpu/gpu_prof.hpp"
 
@@ -40,7 +41,7 @@ void apply_viewport(const wgpu::RenderPassEncoder& pass, const Viewport& vp) {
   pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
 }
 
-void apply_scissor(const wgpu::RenderPassEncoder& pass, const ClipRect& sc, const wgpu::Extent3D& size) {
+void apply_scissor(const wgpu::RenderPassEncoder& pass, const ClipRect& sc, const TextureExtent& size) {
   const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
   const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
   const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
@@ -73,7 +74,7 @@ void render_custom_draw(const CustomDrawCommand& draw, const wgpu::RenderPassEnc
   drawType->draw(context, pass, draw.payload.data(), draw.payloadSize, drawType->userdata);
 }
 
-void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const EncoderTask& task) {
+void execute_encoder_task(wgpu::CommandEncoder& cmd, webgpu::FrameState& frame, const EncoderTask& task) {
   const auto taskType = find_runtime_encoder_task_type(task.type);
   if (!taskType) {
     // Unregistered between record and encode; the task is a no-op.
@@ -154,8 +155,19 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
     } break;
     case CommandType::Draw: {
       auto& draw = cmd.data.draw;
-      if (draw.encoder != nullptr) {
-        draw.encoder(draw.payload.data(), pass, passInfo);
+      switch (draw.kind) {
+      case DrawKind::Gx:
+        gx::render(inline_payload<gx::DrawData>(draw.payload.data()), pass);
+        break;
+      case DrawKind::Clear:
+        clear::render(inline_payload<clear::DrawData>(draw.payload.data()), pass,
+                      passInfo.colorAttachments[SceneColorAttachmentIndex].size);
+        break;
+      case DrawKind::RmlUi:
+#ifdef AURORA_RMLUI_DRAWS
+        rmlui::render(inline_payload<rmlui::DrawData>(draw.payload.data()), pass);
+#endif
+        break;
       }
     } break;
     case CommandType::CustomDraw: {
@@ -200,15 +212,55 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     return;
   }
 
+  // A target left null is the EFB's; the EFB resolves to its single-sample copy when multisampled, and copies read
+  // that. A pass begin_color_pass opened draws to RmlUi's views instead, and has nothing to copy from.
+  const auto* external = passInfo.backendTargets.get();
+  const auto& sceneColor = passInfo.colorAttachments[SceneColorAttachmentIndex];
+  const bool efb = external == nullptr && !sceneColor.target;
+  const bool resolveEfb = efb && passInfo.msaaSamples > 1;
+  wgpu::Texture copySourceTexture;
+  wgpu::TextureView copySourceView;
+  if (efb) {
+    const auto& source = resolveEfb ? webgpu::g_frameBufferResolved : webgpu::g_frameBuffer;
+    copySourceTexture = source.texture;
+    copySourceView = source.view;
+  } else if (external == nullptr) {
+    copySourceTexture = sceneColor.target->gpu->texture;
+    copySourceView = sceneColor.target->gpu->attachmentTextureView;
+  }
+  wgpu::TextureView depthStencilView;
+  wgpu::TextureView copySourceDepthView;
+  if (external != nullptr) {
+    depthStencilView = external->depthStencilView;
+  } else {
+    depthStencilView =
+        passInfo.depthTarget ? passInfo.depthTarget->gpu->attachmentTextureView : webgpu::g_depthBuffer.view;
+    copySourceDepthView = depthStencilView;
+  }
+
   std::array<wgpu::RenderPassColorAttachment, MaxColorAttachments> attachments{};
   for (uint32_t i = 0; i < passInfo.colorAttachmentCount; ++i) {
     const auto& source = passInfo.colorAttachments[i];
+    wgpu::TextureView view;
+    wgpu::TextureView resolveView;
+    if (external != nullptr) {
+      view = external->colorView;
+      resolveView = external->resolveView;
+    } else if (source.target) {
+      view = source.target->gpu->attachmentTextureView;
+    } else if (source.semantic == ColorAttachmentSemantic::Normal) {
+      view = webgpu::g_normalBuffer.view;
+    } else {
+      view = webgpu::g_frameBuffer.view;
+      resolveView = resolveEfb ? webgpu::g_frameBufferResolved.view : nullptr;
+    }
+    const auto loadOp = external != nullptr ? external->colorLoadOp : wgpu::LoadOp::Undefined;
     attachments[i] = {
-        .view = source.view,
-        .resolveTarget = source.resolveView,
-        .loadOp = source.loadOp != wgpu::LoadOp::Undefined ? source.loadOp
-                                                           : (source.clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load),
-        .storeOp = source.storeOp,
+        .view = view,
+        .resolveTarget = resolveView,
+        .loadOp =
+            loadOp != wgpu::LoadOp::Undefined ? loadOp : (source.clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load),
+        .storeOp = external != nullptr ? external->colorStoreOp : wgpu::StoreOp::Store,
         .clearValue =
             {
                 .r = source.clearValue.x(),
@@ -220,18 +272,22 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   }
   wgpu::RenderPassDepthStencilAttachment depthStencilAttachment{};
   const wgpu::RenderPassDepthStencilAttachment* depthStencilAttachmentPtr = nullptr;
-  if (passInfo.depthStencilView) {
+  if (depthStencilView) {
+    // Only begin_color_pass gives load and store operations, and only its passes have a stencil.
+    const auto depthLoadOp = external != nullptr ? external->depthLoadOp : wgpu::LoadOp::Undefined;
+    const bool hasStencil = passInfo.hasStencil && external != nullptr;
     depthStencilAttachment = {
-        .view = passInfo.depthStencilView,
-        .depthLoadOp = passInfo.hasDepth ? (passInfo.depthLoadOp != wgpu::LoadOp::Undefined
-                                                ? passInfo.depthLoadOp
+        .view = depthStencilView,
+        .depthLoadOp = passInfo.hasDepth ? (depthLoadOp != wgpu::LoadOp::Undefined
+                                                ? depthLoadOp
                                                 : (passInfo.clearDepth ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load))
                                          : wgpu::LoadOp::Undefined,
-        .depthStoreOp = passInfo.hasDepth ? passInfo.depthStoreOp : wgpu::StoreOp::Undefined,
+        .depthStoreOp = passInfo.hasDepth ? (external != nullptr ? external->depthStoreOp : wgpu::StoreOp::Store)
+                                          : wgpu::StoreOp::Undefined,
         .depthClearValue = passInfo.clearDepthValue,
-        .stencilLoadOp = passInfo.hasStencil ? passInfo.stencilLoadOp : wgpu::LoadOp::Undefined,
-        .stencilStoreOp = passInfo.hasStencil ? passInfo.stencilStoreOp : wgpu::StoreOp::Undefined,
-        .stencilClearValue = passInfo.stencilClearValue,
+        .stencilLoadOp = hasStencil ? external->stencilLoadOp : wgpu::LoadOp::Undefined,
+        .stencilStoreOp = hasStencil ? external->stencilStoreOp : wgpu::StoreOp::Undefined,
+        .stencilClearValue = external != nullptr ? external->stencilClearValue : 0,
     };
     depthStencilAttachmentPtr = &depthStencilAttachment;
   }
@@ -250,8 +306,8 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   pass.End();
 
   if (passInfo.captureDepthSnapshot) {
-    depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView,
-                                      passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.msaaSamples);
+    depth_peek::encode_frame_snapshot(cmd, copySourceDepthView, {sceneColor.size.width, sceneColor.size.height, 1},
+                                      passInfo.msaaSamples);
   }
 
   if (passInfo.resolveTarget) {
@@ -263,7 +319,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     const tex_copy_conv::ConvRequest convReq{
         .fmt = passInfo.resolveFormat,
         .srcFmt = passInfo.resolveSourceFormat,
-        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
+        .srcView = isDepth ? copySourceDepthView : copySourceView,
         .uniformRange = passInfo.resolveUniformRange,
         .dst = passInfo.resolveTarget,
         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
@@ -281,7 +337,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     } else {
       const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
       const wgpu::TexelCopyTextureInfo src{
-          .texture = passInfo.copySourceTexture,
+          .texture = copySourceTexture,
           .origin =
               wgpu::Origin3D{
                   .x = static_cast<uint32_t>(passInfo.resolveRect.x),
@@ -289,7 +345,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
               },
       };
       const wgpu::TexelCopyTextureInfo dst{
-          .texture = passInfo.resolveTarget->texture,
+          .texture = passInfo.resolveTarget->gpu->texture,
       };
       const wgpu::Extent3D size{
           .width = static_cast<uint32_t>(passInfo.resolveRect.width),
@@ -300,13 +356,13 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     }
   }
 
-  if (passInfo.snapshotColorDst) {
+  if (passInfo.snapshotColor) {
     const webgpu::gpu_prof::Zone zone{cmd, "Pass snapshot"};
     const wgpu::TexelCopyTextureInfo src{
-        .texture = passInfo.copySourceTexture,
+        .texture = copySourceTexture,
     };
     const wgpu::TexelCopyTextureInfo dst{
-        .texture = passInfo.snapshotColorDst,
+        .texture = passInfo.snapshotColor->gpu->texture,
     };
     const wgpu::Extent3D size{
         .width = passInfo.colorAttachments[SceneColorAttachmentIndex].size.width,
@@ -315,16 +371,18 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     };
     cmd.CopyTextureToTexture(&src, &dst, &size);
   }
-  if (passInfo.snapshotDepthDst) {
-    tex_copy_conv::snapshot_depth(cmd, passInfo.copySourceDepthView, passInfo.msaaSamples, passInfo.snapshotDepthDst);
+  if (passInfo.snapshotDepth) {
+    tex_copy_conv::snapshot_depth(cmd, copySourceDepthView, passInfo.msaaSamples,
+                                  passInfo.snapshotDepth->gpu->attachmentTextureView);
   }
-  if (passInfo.snapshotNormalDst) {
+  if (passInfo.snapshotNormal) {
+    // Only the EFB has a normal attachment.
     const webgpu::gpu_prof::Zone zone{cmd, "Normal snapshot"};
     const wgpu::TexelCopyTextureInfo src{
-        .texture = passInfo.copySourceNormalTexture,
+        .texture = webgpu::g_normalBuffer.texture,
     };
     const wgpu::TexelCopyTextureInfo dst{
-        .texture = passInfo.snapshotNormalDst,
+        .texture = passInfo.snapshotNormal->gpu->texture,
     };
     const wgpu::Extent3D size{
         .width = passInfo.colorAttachments[SceneColorAttachmentIndex].size.width,
@@ -348,23 +406,28 @@ constexpr uint64_t StorageStagingOffset = IndexStagingOffset + IndexBufferSize;
 constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
 #endif
 
-constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
+// Staging copies start and end on 64 KiB boundaries, clamped to the pool. Mesa's hasvk runs vkCmdCopyBuffer as a
+// blorp blit, and on that hardware copies off those boundaries corrupted vertex data and cost CPU in its extent search.
+constexpr uint32_t StagingCopyAlign = 64 * 1024;
+
+constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~(StagingCopyAlign - 1); }
 
 #ifndef __EMSCRIPTEN__
-void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
-                               uint32_t highWater, uint64_t stagingOffset, const wgpu::Buffer& dst) {
+void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const webgpu::FrameState& frame, uint32_t& copied,
+                               uint32_t highWater, uint64_t stagingOffset, uint64_t poolSize, const wgpu::Buffer& dst) {
   if (highWater <= copied) {
     return;
   }
   const uint32_t copyStart = align_down_copy_offset(copied);
-  const uint32_t copyEnd = AURORA_ALIGN(highWater, 4);
+  const uint32_t copyEnd =
+      static_cast<uint32_t>(std::min<uint64_t>(AURORA_ALIGN(uint64_t{highWater}, StagingCopyAlign), poolSize));
   cmd.CopyBufferToBuffer(staging_buffer(frame.stagingBuffer), stagingOffset + copyStart, dst, copyStart,
                          copyEnd - copyStart);
   copied = highWater;
 }
 #endif
 
-bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
+bool needs_staging_copy(const webgpu::FrameState& frame, const FrameOp& op) {
   const auto& highWater = op.highWater;
   if (highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
       highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage) {
@@ -376,7 +439,7 @@ bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
   return false;
 }
 
-void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
+void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, webgpu::FrameState& frame, const FrameOp& op) {
   if (!needs_staging_copy(frame, op)) {
     return;
   }
@@ -389,12 +452,14 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   frame.copied.indices = highWater.indices;
   frame.copied.storage = highWater.storage;
 #else
-  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer);
+  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, VertexBufferSize,
+                            res.vertexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
-                            res.uniformBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, res.indexBuffer);
+                            UniformBufferSize, res.uniformBuffer);
+  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, IndexBufferSize,
+                            res.indexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
-                            res.storageBuffer);
+                            StorageBufferSize, res.storageBuffer);
 #endif
 
   if constexpr (UseTextureBuffer) {
@@ -403,13 +468,18 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
       const wgpu::TexelCopyBufferInfo buf{
           .layout =
               wgpu::TexelCopyBufferLayout{
-                  .offset = item.buffer ? item.layout.offset : item.layout.offset + TextureUploadStagingOffset,
-                  .bytesPerRow = AURORA_ALIGN(item.layout.bytesPerRow, 256),
-                  .rowsPerImage = item.layout.rowsPerImage,
+                  .offset = item.overflow ? 0 : item.offset + TextureUploadStagingOffset,
+                  .bytesPerRow = AURORA_ALIGN(item.bytesPerRow, backend::limits().textureRowAlignment),
+                  .rowsPerImage = item.rowsPerImage,
               },
-          .buffer = item.buffer ? item.buffer : staging_buffer(frame.stagingBuffer),
+          .buffer = item.overflow ? item.overflow->buffer : staging_buffer(frame.stagingBuffer),
       };
-      cmd.CopyBufferToTexture(&buf, &item.tex, &item.size);
+      const wgpu::TexelCopyTextureInfo tex{
+          .texture = item.texture->texture,
+          .mipLevel = item.mipLevel,
+      };
+      const wgpu::Extent3D size{item.width, item.height, item.layers};
+      cmd.CopyBufferToTexture(&buf, &tex, &size);
     }
     frame.copied.textureUpload = highWater.textureUpload;
     frame.copied.textureUploadCount = op.textureUploads.size();
@@ -417,9 +487,11 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
 }
 } // namespace
 
-namespace detail {
-void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
-  copy_staging_to_high_water(cmd, frame, op);
+namespace backend {
+void encode(FramePacket& frame, const FrameOp& op) noexcept {
+  auto& state = webgpu::frame_state(frame.slot);
+  auto& cmd = state.encoder;
+  copy_staging_to_high_water(cmd, state, op);
   switch (op.type) {
   case FrameOpType::RenderPass:
     if (op.renderPass != nullptr) {
@@ -434,12 +506,12 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
     break;
   case FrameOpType::EncoderTask:
     if (op.encoderTask != nullptr) {
-      execute_encoder_task(cmd, frame, *op.encoderTask);
+      execute_encoder_task(cmd, state, *op.encoderTask);
     }
     break;
   }
 }
-} // namespace detail
+} // namespace backend
 
 void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassEncoder& pass) {
   if (pipeline.Get() == g_currentPipeline) {
@@ -455,7 +527,7 @@ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
     return false;
   }
   AURORA_ASSERT(!pipeline.prepass, "Prepass pipelines require individual binding");
-  bind_pipeline(pipeline.main, pass);
+  bind_pipeline(pipeline.main->pipeline, pass);
   return true;
 }
 } // namespace aurora::gfx

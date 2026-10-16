@@ -4,6 +4,8 @@
 
 #include <vector>
 
+#include <webgpu/webgpu_cpp.h>
+
 namespace aurora::gfx::depth_peek {
 
 void initialize();

@@ -2,11 +2,26 @@
 #include "__gx.h"
 #include "dolphin/mtx/GeoTypes.h"
 
+namespace fifo = aurora::gx::fifo;
+
 static inline void CacheProjectionVector(const f32* ptr, GXProjectionType type) {
   __gx->projType = type;
   for (int i = 0; i < 6; ++i) {
     __gx->projMtx[i] = ptr[i + 1];
   }
+}
+
+// XF bulk write: 6 params + projection type at 0x1020-0x1026
+static inline void write_projection() {
+  uint8_t* p = fifo::reserve(1 + 4 + 6 * 4 + 4);
+  p = fifo::put_u8(p, 0x10);
+  p = fifo::put_u32(p, 0x00061020);
+  for (int i = 0; i < 6; ++i) {
+    p = fifo::put_f32(p, __gx->projMtx[i]);
+  }
+  p = fifo::put_u32(p, __gx->projType);
+  fifo::commit(p);
+  __gx->bpSent = 0;
 }
 
 extern "C" {
@@ -23,18 +38,7 @@ void GXSetProjection(const void* mtx_, GXProjectionType type) {
       mtx[2][3],
   };
   CacheProjectionVector(projVec, type);
-
-  // XF bulk write: 6 params + projection type at 0x1020-0x1026
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(0x00061020);
-  GX_WRITE_XF_REG_F(32, __gx->projMtx[0]);
-  GX_WRITE_XF_REG_F(33, __gx->projMtx[1]);
-  GX_WRITE_XF_REG_F(34, __gx->projMtx[2]);
-  GX_WRITE_XF_REG_F(35, __gx->projMtx[3]);
-  GX_WRITE_XF_REG_F(36, __gx->projMtx[4]);
-  GX_WRITE_XF_REG_F(37, __gx->projMtx[5]);
-  GX_WRITE_XF_REG_2(38, __gx->projType);
-  __gx->bpSent = 0;
+  write_projection();
 }
 
 void GXSetProjectionv(const f32* ptr) {
@@ -42,52 +46,45 @@ void GXSetProjectionv(const f32* ptr) {
 
   const GXProjectionType type = ptr[0] == 0.0f ? GX_PERSPECTIVE : GX_ORTHOGRAPHIC;
   CacheProjectionVector(ptr, type);
-
-  // XF bulk write: 6 params + projection type at 0x1020-0x1026
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(0x00061020);
-  for (int i = 0; i < 6; ++i) {
-    GX_WRITE_F32(__gx->projMtx[i]);
-  }
-  GX_WRITE_U32(__gx->projType);
-  __gx->bpSent = 0;
+  write_projection();
 }
 
 void GXLoadPosMtxImm(const void* mtx_, u32 id) {
-  CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
+  // Any row of matrix memory up to the last slot, not only the ten named ones; see MaxPnMtx.
+  CHECK(id <= (aurora::gx::MaxPnMtx - 1) * 3, "invalid pn mtx {}", static_cast<int>(id));
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
 
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32((id * 4) | 0xB0000);
+  uint8_t* p = fifo::reserve(1 + 4 + 12 * 4);
+  p = fifo::put_u8(p, 0x10);
+  p = fifo::put_u32(p, (id * 4) | 0xB0000);
   for (int i = 0; i < 12; i++) {
-    GX_WRITE_F32(mtx[i]);
+    p = fifo::put_f32(p, mtx[i]);
   }
+  fifo::commit(p);
 }
 
 void GXLoadPosMtxIndx(u16 mtxIndx, u32 id) {
   CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
 
-  GX_WRITE_U8(GX_LOAD_INDX_A);
-  GX_WRITE_U16(mtxIndx);
-  GX_WRITE_U16((11u << 12) | id * 4);
+  fifo::write_command(static_cast<uint8_t>(GX_LOAD_INDX_A), static_cast<uint16_t>(mtxIndx),
+                      static_cast<uint16_t>((11u << 12) | id * 4));
 }
 
 void GXLoadNrmMtxImm(const void* mtx_, u32 id) {
-  CHECK(id >= GX_PNMTX0 && id <= GX_PNMTX9, "invalid pn mtx {}", static_cast<int>(id));
+  // As GXLoadPosMtxImm.
+  CHECK(id <= (aurora::gx::MaxPnMtx - 1) * 3, "invalid pn mtx {}", static_cast<int>(id));
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
 
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32((id * 3 + 0x400) | 0x80000);
+  uint8_t* p = fifo::reserve(1 + 4 + 9 * 4);
+  p = fifo::put_u8(p, 0x10);
+  p = fifo::put_u32(p, (id * 3 + 0x400) | 0x80000);
   // Write 3x3 from 3x4 matrix (skip translation column)
-  GX_WRITE_F32(mtx[0]);
-  GX_WRITE_F32(mtx[1]);
-  GX_WRITE_F32(mtx[2]);
-  GX_WRITE_F32(mtx[4]);
-  GX_WRITE_F32(mtx[5]);
-  GX_WRITE_F32(mtx[6]);
-  GX_WRITE_F32(mtx[8]);
-  GX_WRITE_F32(mtx[9]);
-  GX_WRITE_F32(mtx[10]);
+  for (int row = 0; row < 3; row++) {
+    p = fifo::put_f32(p, mtx[row * 4]);
+    p = fifo::put_f32(p, mtx[row * 4 + 1]);
+    p = fifo::put_f32(p, mtx[row * 4 + 2]);
+  }
+  fifo::commit(p);
 }
 
 void GXSetCurrentMtx(u32 id) {
@@ -111,13 +108,14 @@ void GXLoadTexMtxImm(const void* mtx_, u32 id, GXTexMtxType type) {
   u32 count = (type == GX_MTX2x4) ? 8 : 12;
   u32 reg = addr | ((count - 1) << 16);
 
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(reg);
-
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
+  uint8_t* p = fifo::reserve(1 + 4 + count * 4);
+  p = fifo::put_u8(p, 0x10);
+  p = fifo::put_u32(p, reg);
   for (u32 i = 0; i < count; i++) {
-    GX_WRITE_F32(mtx[i]);
+    p = fifo::put_f32(p, mtx[i]);
   }
+  fifo::commit(p);
 }
 
 void GXSetViewport(float left, float top, float width, float height, float nearZ, float farZ) {
@@ -154,14 +152,8 @@ void GXSetViewportJitter(float left, float top, float width, float height, float
   __gx->vpNearz = nearZ;
   __gx->vpFarz = farZ;
 
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(0x0005101A);
-  GX_WRITE_XF_REG_F(26, sx);
-  GX_WRITE_XF_REG_F(27, sy);
-  GX_WRITE_XF_REG_F(28, sz);
-  GX_WRITE_XF_REG_F(29, ox);
-  GX_WRITE_XF_REG_F(30, oy);
-  GX_WRITE_XF_REG_F(31, oz);
+  // XF bulk write: the six viewport registers at 0x101A-0x101F
+  fifo::write_command(static_cast<uint8_t>(0x10), static_cast<uint32_t>(0x0005101A), sx, sy, sz, ox, oy, oz);
   __gx->bpSent = 0;
 }
 

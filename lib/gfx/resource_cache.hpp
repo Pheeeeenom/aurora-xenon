@@ -2,6 +2,8 @@
 
 #include "types.hpp"
 
+#include <webgpu/webgpu_cpp.h>
+
 namespace aurora::gfx {
 
 BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor);

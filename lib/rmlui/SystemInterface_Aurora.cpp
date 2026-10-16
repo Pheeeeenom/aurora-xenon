@@ -6,7 +6,11 @@
 
 #include "../logging.hpp"
 #include "../window.hpp"
+#ifdef AURORA_RMLUI_DRAWS
 #include "../webgpu/gpu.hpp"
+#else
+#include <aurora/gfx.hpp>
+#endif
 
 namespace aurora::rmlui {
 namespace {
@@ -65,9 +69,19 @@ void SystemInterface_Aurora::ActivateKeyboard(Rml::Vector2f caret_position, floa
     return;
   }
 
+#ifdef AURORA_RMLUI_DRAWS
   const auto viewport = webgpu::calculate_present_viewport(size.native_fb_width, size.native_fb_height,
                                                            static_cast<uint32_t>(contentSize.x),
                                                            static_cast<uint32_t>(contentSize.y));
+#else
+  // Nothing is presented, so the content fills the window.
+  const gfx::Viewport viewport{.left = 0.f,
+                               .top = 0.f,
+                               .width = static_cast<float>(size.native_fb_width),
+                               .height = static_cast<float>(size.native_fb_height),
+                               .znear = 0.f,
+                               .zfar = 1.f};
+#endif
   if (viewport.width <= 0.f || viewport.height <= 0.f) {
     return;
   }

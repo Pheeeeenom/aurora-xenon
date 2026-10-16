@@ -21,6 +21,7 @@
 #include "../gfx/recording.hpp"
 #include "../gfx/texture.hpp"
 #include "../logging.hpp"
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 
 namespace aurora::rmlui {

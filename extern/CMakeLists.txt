@@ -15,7 +15,7 @@ function(aurora_find_package_global)
   find_package(${ARGV} GLOBAL)
 endfunction()
 
-if (AURORA_ENABLE_GX)
+if (AURORA_USE_DAWN)
   include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
   set(AURORA_DAWN_IS_SHARED "${AURORA_DAWN_IS_SHARED}" PARENT_SCOPE)
 endif ()
@@ -36,8 +36,13 @@ else ()
     set(ABSL_MSVC_STATIC_RUNTIME ON CACHE INTERNAL "Link static runtime libraries")
   endif()
   set(ABSL_PROPAGATE_CXX_STD ON)
+  set(_aurora_abseil_patch)
+  if (XSDK)
+    set(_aurora_abseil_patch PATCH_COMMAND ${CMAKE_COMMAND} -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/PatchAbseil.cmake")
+  endif ()
   FetchContent_Declare(abseil-cpp
     URL https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz
+    ${_aurora_abseil_patch}
     DOWNLOAD_EXTRACT_TIMESTAMP FALSE
     EXCLUDE_FROM_ALL
   )
@@ -242,22 +247,29 @@ if (AURORA_ENABLE_GX)
       ${imgui_SOURCE_DIR}/misc/cpp/imgui_stdlib.cpp
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
+    if (XSDK)
+      # ImGui opens links by forking a shell, which xsdk has none of.
+      target_compile_definitions(imgui PRIVATE IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+    endif ()
 
-    add_library(imgui_backends STATIC
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
-    )
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-    if(EMSCRIPTEN)
-      # Emdawnwebgpu uses modern Dawn headers, unlike the legacy Emscripten API.
-      set(_imgui_wgpu "${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp")
-      file(READ "${_imgui_wgpu}" _imgui_code)
-      string(REPLACE "#ifndef __EMSCRIPTEN__" "#if !defined(__EMSCRIPTEN__) || defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN)" _imgui_code "${_imgui_code}")
-      file(WRITE "${_imgui_wgpu}" "${_imgui_code}")
-    endif()
-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
-    target_link_libraries(imgui PUBLIC imgui_backends)
+    # Only the Dawn backend draws ImGui, through these.
+    if (AURORA_USE_DAWN)
+      add_library(imgui_backends STATIC
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+      )
+      target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+      if(EMSCRIPTEN)
+        # Emdawnwebgpu uses modern Dawn headers, unlike the legacy Emscripten API.
+        set(_imgui_wgpu "${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp")
+        file(READ "${_imgui_wgpu}" _imgui_code)
+        string(REPLACE "#ifndef __EMSCRIPTEN__" "#if !defined(__EMSCRIPTEN__) || defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN)" _imgui_code "${_imgui_code}")
+        file(WRITE "${_imgui_wgpu}" "${_imgui_code}")
+      endif()
+      target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
+      target_link_libraries(imgui PUBLIC imgui_backends)
+    endif ()
 
     if (TARGET Freetype::Freetype)
       target_sources(imgui PRIVATE ${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp)
@@ -304,8 +316,14 @@ if (AURORA_ENABLE_GX)
 
     add_library(sqlite3 STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
     target_include_directories(sqlite3 PUBLIC ${sqlite3_SOURCE_DIR})
+    if (XSDK)
+      # sqlite's Unix VFS needs more POSIX than xsdk has; databases open only through a VFS Aurora registers.
+      target_compile_definitions(sqlite3 PRIVATE SQLITE_OS_OTHER=1)
+      target_sources(sqlite3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../lib/sqlite_os_xsdk.c)
+    endif ()
   endif ()
 
+  # Dawn's shader cache compresses with it, and games link it too, whatever the backend.
   if (AURORA_CACHE_USE_ZSTD)
     aurora_find_package_global(zstd CONFIG QUIET)
     if (NOT TARGET zstd::libzstd)
@@ -378,5 +396,9 @@ if (NOT TARGET Tracy::TracyClient)
 
   if (NOT TARGET TracyClient)
     message(FATAL_ERROR "Failed to make TracyClient available")
+  endif ()
+  if (XSDK)
+    # Tracy's platform layer doesn't build for xsdk, so with profiling off a stand-in defines what's called directly.
+    set_property(TARGET TracyClient PROPERTY SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../lib/tracy_xsdk.cpp")
   endif ()
 endif ()

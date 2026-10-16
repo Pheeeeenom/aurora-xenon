@@ -2,6 +2,8 @@
 #include <fmt/format.h>
 #include "__gx.h"
 
+#include <bit>
+
 extern "C" {
 void GXInitLightAttn(GXLightObj* light_, float a0, float a1, float a2, float k0, float k1, float k2) {
   auto* light = reinterpret_cast<GXLightObj_*>(light_);
@@ -132,7 +134,9 @@ void GXInitLightColor(GXLightObj* light_, GXColor col) {
 }
 
 void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
-  u32 idx = std::log2<u32>(id);
+  // The highest set bit, as std::log2 gave it truncated (0 for no light), without a double-precision log2 for every
+  // light a game loads.
+  const u32 idx = id != 0 ? 31 - std::countl_zero(static_cast<u32>(id)) : 0;
   auto* light = reinterpret_cast<const GXLightObj_*>(light_);
 
   // XF bulk write: 16 values at light base address
@@ -144,30 +148,19 @@ void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
   u32 colorPacked = (static_cast<u32>(light->color.r) << 24) | (static_cast<u32>(light->color.g) << 16) |
                     (static_cast<u32>(light->color.b) << 8) | static_cast<u32>(light->color.a);
 
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(reg);
-  // Padding (3 u32s)
-  GX_WRITE_U32(0);
-  GX_WRITE_U32(0);
-  GX_WRITE_U32(0);
-  // Color
-  GX_WRITE_U32(colorPacked);
-  // Cosine attenuation (a0, a1, a2)
-  GX_WRITE_F32(light->a0);
-  GX_WRITE_F32(light->a1);
-  GX_WRITE_F32(light->a2);
-  // Distance attenuation (k0, k1, k2)
-  GX_WRITE_F32(light->k0);
-  GX_WRITE_F32(light->k1);
-  GX_WRITE_F32(light->k2);
-  // Position (px, py, pz)
-  GX_WRITE_F32(light->px);
-  GX_WRITE_F32(light->py);
-  GX_WRITE_F32(light->pz);
-  // Direction (nx, ny, nz)
-  GX_WRITE_F32(light->nx);
-  GX_WRITE_F32(light->ny);
-  GX_WRITE_F32(light->nz);
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(0x10), static_cast<uint32_t>(reg),
+                                  // Padding (3 u32s)
+                                  uint32_t{0}, uint32_t{0}, uint32_t{0},
+                                  // Color
+                                  static_cast<uint32_t>(colorPacked),
+                                  // Cosine attenuation (a0, a1, a2)
+                                  light->a0, light->a1, light->a2,
+                                  // Distance attenuation (k0, k1, k2)
+                                  light->k0, light->k1, light->k2,
+                                  // Position (px, py, pz)
+                                  light->px, light->py, light->pz,
+                                  // Direction (nx, ny, nz)
+                                  light->nx, light->ny, light->nz);
 }
 
 void GXSetChanAmbColor(GXChannelID id, GXColor color) {

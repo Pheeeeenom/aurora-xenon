@@ -88,9 +88,13 @@ typedef struct {
   const char* resourcesPath;
   AuroraBackend desiredBackend;
   uint32_t msaa;
+  /* Pipeline compilation threads; 0 picks a number from the core count. */
+  uint32_t pipelineJobs;
   uint16_t maxTextureAnisotropy;
   bool vsync;
   bool startFullscreen;
+  /* Opens the window maximized; windowWidth and windowHeight are the size it restores to. */
+  bool startMaximized;
   bool allowJoystickBackgroundEvents;
   bool pauseOnFocusLost;
   bool allowTextureDumps;
@@ -136,6 +140,17 @@ typedef struct {
 
 AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config);
 void aurora_shutdown();
+/* The window as it is now, read each call. A move between displays of different backing scale may arrive as a scale
+ * change, a resize, both or neither (macOS), so a game that follows the window polls it. */
+AuroraWindowSize aurora_window_size();
+/* Rebuilds the framebuffer from the window and the locked aspect now, not at the next event pump, whose deferred
+ * rebuild shows one frame of bars. Call it between frames; it does nothing when nothing changed. */
+void aurora_apply_frame_buffer_resize();
+/* Writes the frame being recorded to `path` as a binary PPM once it is presented. */
+void aurora_capture_frame(const char* path);
+/* GPU time per frame, from queue submit to OnSubmittedWorkDone: an upper bound, which includes any wait behind work
+ * queued earlier, and on Metal not GPU execution time. Timestamp queries read back zero on tile-based renderers. */
+void aurora_gpu_frame_time(uint64_t* lastNs, uint64_t* meanNs, uint64_t* maxNs, uint64_t* count);
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();
@@ -149,6 +164,11 @@ void aurora_set_resampler(AuroraSampler sampler);
 void aurora_preserve_frame_buffer(bool preserve);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
+#ifdef __XSDK__
+/* The Xbox 360 hardware thread each of Aurora's named threads runs on, as "name=thread,...", in place of
+ * lib/thread.cpp's list; a thread not named stays on its creator's. Call it before aurora_initialize. */
+void aurora_set_hardware_threads(const char* list);
+#endif
 
 SDL_Window* aurora_get_window();
 AuroraWindowSize aurora_get_window_size();

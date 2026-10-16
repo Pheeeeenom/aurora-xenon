@@ -6,6 +6,8 @@
 #include <xxhash.h>
 
 #include <array>
+#include <chrono>
+#include <thread>
 #include <cstdint>
 #include <vector>
 
@@ -13,10 +15,15 @@ namespace aurora::gx::testing {
 void reset_texture_stubs();
 uint64_t texture_allocations();
 uint64_t palette_conversions();
+uint64_t texture_conversions();
+uint64_t converted_allocations();
 uint64_t copy_allocations();
 gfx::TextureHandle make_texture_handle(uint32_t width, uint32_t height, u32 format = GX_TF_RGBA8_PC);
 void set_replacement(gfx::TextureHandle handle, uint64_t id = 1);
 void set_source_replacement(aurora::texture::TextureSourceKey key, gfx::TextureHandle handle);
+// While held, a conversion waits until released; wait_for_held_conversion is true once one is waiting.
+void hold_conversions(bool hold);
+bool wait_for_held_conversion();
 } // namespace aurora::gx::testing
 
 namespace aurora::gx {
@@ -55,7 +62,11 @@ protected:
     texture::end_frame();
   }
 
-  void TearDown() override { texture::shutdown(); }
+  void TearDown() override {
+    // A held conversion would keep the worker from stopping.
+    testing::hold_conversions(false);
+    texture::shutdown();
+  }
 };
 
 TEST_F(GxTextureCacheTest, CalculatesTiledAndLinearMipSourceSizes) {
@@ -620,6 +631,108 @@ TEST_F(GxTextureCacheTest, ShutdownRestoresContentCacheBudgetAndAccounting) {
   texture::resolve_static_texture(obj);
   EXPECT_EQ(texture_stats().contentCacheBytes, 64);
   EXPECT_EQ(texture_stats().contentCacheEntries, 1);
+}
+
+bool wait_for_preconversion() {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  while (!texture::preconversion_idle_for_testing()) {
+    if (std::chrono::steady_clock::now() > deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
+
+TEST_F(GxTextureCacheTest, PreconvertedContentIsUsedAtFirstBind) {
+  std::array<uint8_t, 64> pixels{};
+  pixels[5] = 7;
+  const auto obj = make_texture(pixels.data(), 1, GX_TF_RGBA8, 4, 4);
+  texture::preconvert_texture(obj);
+  ASSERT_TRUE(wait_for_preconversion());
+  EXPECT_EQ(testing::texture_conversions(), 1);
+
+  const auto handle = texture::resolve_static_texture(obj);
+
+  EXPECT_TRUE(handle);
+  EXPECT_EQ(testing::converted_allocations(), 1);
+  EXPECT_EQ(testing::texture_allocations(), 0);
+}
+
+TEST_F(GxTextureCacheTest, ContentRewrittenAfterPreconversionConvertsInline) {
+  std::array<uint8_t, 64> pixels{};
+  const auto obj = make_texture(pixels.data(), 1, GX_TF_RGBA8, 4, 4);
+  texture::preconvert_texture(obj);
+  ASSERT_TRUE(wait_for_preconversion());
+
+  pixels[0] = 1; // the game rewrote the texture after completing the object
+  texture::resolve_static_texture(obj);
+
+  EXPECT_EQ(testing::converted_allocations(), 0);
+  EXPECT_EQ(testing::texture_allocations(), 1);
+}
+
+TEST_F(GxTextureCacheTest, SourceIsCopiedWhenQueued) {
+  std::vector<uint8_t> pixels(64, 3);
+  auto obj = make_texture(pixels.data(), 1, GX_TF_RGBA8, 4, 4);
+  texture::preconvert_texture(obj);
+  // The game may free or reuse the memory as soon as GXInitTexObjLOD returns.
+  std::vector<uint8_t>(64, 9).swap(pixels);
+  ASSERT_TRUE(wait_for_preconversion());
+
+  std::array<uint8_t, 64> original{};
+  original.fill(3);
+  obj.data = original.data();
+  texture::resolve_static_texture(obj);
+
+  EXPECT_EQ(testing::converted_allocations(), 1);
+}
+
+TEST_F(GxTextureCacheTest, UploadedContentIsNotConvertedAgain) {
+  std::array<uint8_t, 64> pixels{};
+  texture::resolve_static_texture(make_texture(pixels.data(), 1, GX_TF_RGBA8, 4, 4));
+  const uint64_t conversions = testing::texture_conversions();
+
+  texture::preconvert_texture(make_texture(pixels.data(), 2, GX_TF_RGBA8, 4, 4));
+  ASSERT_TRUE(wait_for_preconversion());
+
+  EXPECT_EQ(testing::texture_conversions(), conversions);
+}
+
+// A video frame's planes: the draw comes before the worker has converted them, so it converts inline, and the worker's
+// late result must not be kept, as no draw would take it.
+TEST_F(GxTextureCacheTest, ContentUploadedWhileConvertingIsNotParked) {
+  std::array<uint8_t, 64> pixels{};
+  const auto obj = make_texture(pixels.data(), 1, GX_TF_RGBA8, 4, 4);
+  testing::hold_conversions(true);
+  texture::preconvert_texture(obj);
+  ASSERT_TRUE(testing::wait_for_held_conversion());
+
+  texture::resolve_static_texture(obj);
+  testing::hold_conversions(false);
+  ASSERT_TRUE(wait_for_preconversion());
+
+  EXPECT_EQ(testing::texture_allocations(), 1);
+  EXPECT_EQ(texture::preconversion_parked_bytes_for_testing(), 0);
+}
+
+TEST_F(GxTextureCacheTest, SameObjectIsQueuedOnce) {
+  std::array<uint8_t, 64> pixels{};
+  const auto obj = make_texture(pixels.data(), 1, GX_TF_RGBA8, 4, 4);
+  texture::preconvert_texture(obj);
+  texture::preconvert_texture(obj); // LOD set twice on one object
+  ASSERT_TRUE(wait_for_preconversion());
+
+  EXPECT_EQ(testing::texture_conversions(), 1);
+}
+
+TEST_F(GxTextureCacheTest, PaletteAndPcFormatsAreNotPreconverted) {
+  std::array<uint8_t, 64> pixels{};
+  texture::preconvert_texture(make_texture(pixels.data(), 1, GX_TF_C8, 4, 4));
+  texture::preconvert_texture(make_texture(pixels.data(), 2, GX_TF_RGBA8_PC, 4, 4));
+  ASSERT_TRUE(wait_for_preconversion());
+
+  EXPECT_EQ(testing::texture_conversions(), 0);
 }
 } // namespace
 } // namespace aurora::gx

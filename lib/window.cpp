@@ -1,8 +1,9 @@
 #include "window.hpp"
 
 #ifdef AURORA_ENABLE_GX
+#include "gfx/backend.hpp"
+#include "gx/fifo.hpp"
 #include "imgui.hpp"
-#include "webgpu/gpu.hpp"
 #endif
 #include "gamepad.hpp"
 #include "input/router.hpp"
@@ -100,6 +101,23 @@ Vec2<int> scale_frame_buffer_to_aspect(int w, int h, float scale, float aspect) 
   return {baseW, std::max(1, static_cast<int>(std::lround(static_cast<float>(baseW) / aspect)))};
 }
 
+// The size create_window makes the window, and the size a backend without a window draws at.
+Vec2<int> requested_window_size() noexcept {
+  auto width = static_cast<Sint32>(g_config.windowWidth);
+  auto height = static_cast<Sint32>(g_config.windowHeight);
+  if (width == 0 || height == 0) {
+    width = 1280;
+    height = 960;
+  }
+  if (width < 640) {
+    width = 640;
+  }
+  if (height < 480) {
+    height = 480;
+  }
+  return {width, height};
+}
+
 Vec2<int> fit_frame_buffer_to_aspect(int width, int height, float aspect) {
   if (width <= 0 || height <= 0 || aspect <= 0.f) {
     return {std::max(width, 1), std::max(height, 1)};
@@ -124,6 +142,10 @@ void resize_swapchain() noexcept {
       Log.info("Display scale changed to {}", size.scale);
     }
   }
+  // The FIFO processor finishes the frames written before the swapchain changes under them.
+#ifdef AURORA_ENABLE_GX
+  gx::fifo::finish_published();
+#endif
   g_windowSize = size;
   if (g_renderer != nullptr) {
     SDL_SetRenderLogicalPresentation(g_renderer, static_cast<int>(size.native_fb_width),
@@ -131,7 +153,7 @@ void resize_swapchain() noexcept {
     SDL_SetRenderScale(g_renderer, size.scale, size.scale);
   }
 #ifdef AURORA_ENABLE_GX
-  webgpu::resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height);
+  gfx::backend::resize(size);
 #endif
 }
 
@@ -286,7 +308,7 @@ void process_event(SDL_Event& event) {
     } else if (event.type == g_sdlCustomEventsStart + CustomEvent::RefreshSurface) {
       // Refresh surface (vsync changed)
 #ifdef AURORA_ENABLE_GX
-      webgpu::refresh_surface(false);
+      gfx::backend::refresh_surface();
 #endif
     }
     break;
@@ -356,19 +378,12 @@ bool create_window(AuroraBackend backend) {
   if (g_config.startFullscreen) {
     flags |= SDL_WINDOW_FULLSCREEN;
   }
+  // SDL applies it when the window is shown, so fullscreen still wins.
+  if (g_config.startMaximized) {
+    flags |= SDL_WINDOW_MAXIMIZED;
+  }
 #endif
-  auto width = static_cast<Sint32>(g_config.windowWidth);
-  auto height = static_cast<Sint32>(g_config.windowHeight);
-  if (width == 0 || height == 0) {
-    width = 1280;
-    height = 960;
-  }
-  if (width < 640) {
-    width = 640;
-  }
-  if (height < 480) {
-    height = 480;
-  }
+  const auto [width, height] = requested_window_size();
 
   Sint32 posX = g_config.windowPosX;
   Sint32 posY = g_config.windowPosY;
@@ -440,7 +455,14 @@ bool initialize() {
   /* We don't want to initialize anything input related here, otherwise the add events will get lost to the void */
   TRY(SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight"), "Error setting {}: {}", SDL_HINT_ORIENTATIONS,
       SDL_GetError());
-  TRY(SDL_InitSubSystem(SDL_INIT_EVENTS | SDL_INIT_VIDEO), "Error initializing SDL: {}", SDL_GetError());
+#ifdef AURORA_ENABLE_GX
+  // Video only for a backend that draws to an SDL window; a port's SDL may be built without it.
+  const bool video = gfx::backend::uses_sdl_window();
+#else
+  const bool video = true;
+#endif
+  TRY(SDL_InitSubSystem(video ? SDL_INIT_EVENTS | SDL_INIT_VIDEO : SDL_INIT_EVENTS), "Error initializing SDL: {}",
+      SDL_GetError());
   time::internal::set_pause_reason(time::internal::PauseReason::Surface,
                                    !g_surfaceReady.load(std::memory_order_acquire));
 
@@ -458,7 +480,9 @@ bool initialize() {
   TRY(SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0"), "Error setting {}: {}", SDL_HINT_MOUSE_TOUCH_EVENTS,
       SDL_GetError());
 
-  TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
+  if (video) {
+    TRY(SDL_DisableScreenSaver(), "Error disabling screensaver: {}", SDL_GetError());
+  }
   if (g_config.allowJoystickBackgroundEvents) {
     TRY(SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"), "Error setting {}: {}",
         SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, SDL_GetError());
@@ -475,7 +499,10 @@ bool initialize_event_watch() {
 void shutdown() {
   SDL_RemoveEventWatch(lifecycle_event_watch, nullptr);
   destroy_window();
-  TRY_WARN(SDL_EnableScreenSaver(), "Error enabling screensaver: {}", SDL_GetError());
+  // The screensaver belongs to SDL's video.
+  if (SDL_WasInit(SDL_INIT_VIDEO) != 0) {
+    TRY_WARN(SDL_EnableScreenSaver(), "Error enabling screensaver: {}", SDL_GetError());
+  }
   SDL_Quit();
 }
 
@@ -484,13 +511,20 @@ AuroraWindowSize get_window_size() {
   int height = 0;
   int native_fb_w = 0;
   int native_fb_h = 0;
-  if (g_window != nullptr) {
+  float scale = 1.f;
+  if (g_window == nullptr) {
+    // A backend without a window, at scale 1.
+    const auto [requestedW, requestedH] = requested_window_size();
+    width = native_fb_w = requestedW;
+    height = native_fb_h = requestedH;
+  } else {
     if (!SDL_GetWindowSize(g_window, &width, &height)) {
       Log.warn("Failed to get window size: {}", SDL_GetError());
     }
     if (!SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h)) {
       Log.warn("Failed to get window size in pixels: {}", SDL_GetError());
     }
+    scale = SDL_GetWindowDisplayScale(g_window);
   }
   width = std::max(0, width);
   height = std::max(0, height);
@@ -528,7 +562,6 @@ AuroraWindowSize get_window_size() {
     }
   }
 
-  const float scale = (g_window != nullptr) ? SDL_GetWindowDisplayScale(g_window) : 1.0f;
   return {
       .width = static_cast<uint32_t>(width),
       .height = static_cast<uint32_t>(height),
@@ -545,6 +578,10 @@ SDL_Window* get_sdl_window() { return g_window; }
 SDL_Renderer* get_sdl_renderer() { return g_renderer; }
 
 bool is_paused() noexcept {
+  // Without a window there is nothing to wait for.
+  if (g_window == nullptr) {
+    return false;
+  }
   if (!is_presentable()) {
     return true;
   }
@@ -631,6 +668,12 @@ void request_frame_buffer_resize() {
   if (g_window != nullptr) {
     // Defer so that we don't try to reconfigure the surface in the middle of game logic.
     push_future_resize_event();
+  }
+}
+
+void resize_frame_buffer_now() {
+  if (g_window != nullptr) {
+    resize_swapchain();
   }
 }
 

@@ -1,5 +1,6 @@
 #include "dolphin/card.h"
 
+#include <array>
 #include <cstring>
 #include <filesystem>
 
@@ -52,18 +53,56 @@ static void (*CallbackDispatch)(CARDCallback, s32, s32) = nullptr;
 extern "C" void aurora_card_set_callback_dispatch(void (*dispatch)(CARDCallback, s32, s32)) {
   CallbackDispatch = dispatch;
 }
-static void complete(CARDCallback callback, s32 chan, s32 result) {
-  if (callback == nullptr) {
-    return;
-  }
-  if (CallbackDispatch != nullptr) {
-    CallbackDispatch(callback, chan, result);
-  } else {
-    callback(chan, result);
-  }
-}
 CARDFileType SelectedFileType = CARD_GCIFOLDER;
 bool UseFastMode = false;
+
+// The SDK calls a CARD*Async completion after the call returns, and games chain card calls from completions. Running a
+// completion inside the card call that another completion made would nest them, so completions are queued, and the
+// outermost call runs them in order before it returns.
+constexpr size_t MaxPendingCallbacks = 32;
+
+struct PendingCallback {
+  CARDCallback fn;
+  s32 chan;
+  s32 result;
+};
+
+std::array<PendingCallback, MaxPendingCallbacks> PendingCallbacks{};
+size_t PendingHead = 0; // monotonic; index with % MaxPendingCallbacks
+size_t PendingTail = 0;
+bool RunningCallbacks = false;
+
+void FinishAsync(const CARDCallback fn, const s32 chan, const s32 result) {
+  if (fn != nullptr) {
+    if (PendingTail - PendingHead >= MaxPendingCallbacks) {
+      // A full queue runs the completion inline: nested, as before, but not lost.
+      Log.error("card completion queue full ({}); running one inline", MaxPendingCallbacks);
+      fn(chan, result);
+    } else {
+      PendingCallbacks[PendingTail % MaxPendingCallbacks] = {fn, chan, result};
+      ++PendingTail;
+    }
+  }
+  if (RunningCallbacks) {
+    return;
+  }
+  RunningCallbacks = true;
+  while (PendingHead != PendingTail) {
+    const PendingCallback next = PendingCallbacks[PendingHead % MaxPendingCallbacks];
+    ++PendingHead;
+    next.fn(next.chan, next.result);
+  }
+  RunningCallbacks = false;
+}
+
+// melee-pc's dispatcher defers a completion as the game asks; without one, the queue above runs it.
+static void complete(CARDCallback callback, s32 chan, s32 result) {
+  if (callback != nullptr && CallbackDispatch != nullptr) {
+    CallbackDispatch(callback, chan, result);
+    return;
+  }
+  FinishAsync(callback, chan, result);
+}
 
 void CopyKabuFileHandleToDolphin(const s32 chan, const aurora::card::FileHandle& handle, CARDFileInfo* fileInfo) {
   fileInfo->chan = chan;

@@ -30,7 +30,8 @@ target_compile_definitions(aurora_core PUBLIC AURORA TARGET_PC=1)
 target_include_directories(aurora_core PUBLIC include)
 target_link_libraries(aurora_core PUBLIC fmt::fmt ${AURORA_SDL3_TARGET} xxHash::xxhash)
 target_link_libraries(aurora_core PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient)
-if (AURORA_ENABLE_GX AND AURORA_CACHE_USE_ZSTD)
+# Only Dawn's shader cache is compressed.
+if (AURORA_USE_DAWN AND AURORA_CACHE_USE_ZSTD)
     target_compile_definitions(aurora_core PRIVATE AURORA_CACHE_USE_ZSTD)
     target_link_libraries(aurora_core PRIVATE zstd::libzstd)
 endif ()
@@ -71,19 +72,29 @@ if (AURORA_ENABLE_RMLUI)
             lib/rmlui.cpp
             lib/rmlui/RuntimeTextureProvider.cpp
             lib/rmlui/RmlUi_Backend_Aurora.cpp
-            lib/rmlui/WebGPURenderInterface.cpp
             lib/rmlui/SystemInterface_Aurora.cpp
             lib/rmlui/FileInterface_SDL.cpp
-            lib/rmlui/GlassFilter.cpp
-            lib/rmlui/ImageEffects.cpp
     )
+    if (AURORA_RMLUI_DRAWS)
+        target_compile_definitions(aurora_core PUBLIC AURORA_RMLUI_DRAWS)
+        target_sources(aurora_core PRIVATE
+                lib/rmlui/WebGPURenderInterface.cpp
+                lib/rmlui/GlassFilter.cpp
+                lib/rmlui/ImageEffects.cpp
+        )
+    endif ()
     target_link_libraries(aurora_core PUBLIC rmlui)
 
     target_link_libraries(aurora_core PUBLIC rmlui_backends)
 endif ()
 
 if (AURORA_ENABLE_GX)
-    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:WEBGPU_DAWN>)
+    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX)
+endif ()
+
+# The Dawn backend's device, surface and cache, and <aurora/gfx.hpp>'s WebGPU extension API.
+if (AURORA_USE_DAWN)
+    target_compile_definitions(aurora_core PUBLIC AURORA_GFX_BACKEND_DAWN $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:WEBGPU_DAWN>)
     if (EMSCRIPTEN)
         target_link_options(aurora_core PUBLIC --js-library=${CMAKE_CURRENT_SOURCE_DIR}/lib/gfx/browser_upload.js)
     endif ()

@@ -2,6 +2,7 @@
 
 #include "../gfx/encoding.hpp"
 #include "../gfx/resources.hpp"
+#include "../webgpu/backend.hpp"
 #include "../gfx/pipeline_cache.hpp"
 #include "../gfx/resource_cache.hpp"
 
@@ -20,7 +21,7 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
   const auto create = [&](const PipelineOptions& options, const char* passName) {
     const auto shader = build_shader(config.shaderConfig, layout, options.dstAlphaMode);
     const auto label = fmt::format("GX Pipeline {:x} {}", hash, passName);
-    return build_pipeline(config, layout, options, {}, shader, label.c_str());
+    return webgpu::make_pipeline(build_pipeline(config, layout, options, {}, shader, label.c_str()));
   };
 
   PipelineOptions options{
@@ -138,12 +139,13 @@ gfx::CompiledPipeline pipeline;
 #else
   pass.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
 #endif
-  const std::array offsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, resources.uniformBindGroup, offsets.size(), offsets.data());
+  // One dynamic offset per uniform piece.
+  pass.SetBindGroup(1, resources.uniformBindGroup, data.uniformOffsets.size(), data.uniformOffsets.data());
   if (data.bindGroups.textureBindGroup) {
     pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
   }
-  pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);
+  pass.SetIndexBuffer(data.patternIndices ? g_indexPatternBuffer : resources.indexBuffer, wgpu::IndexFormat::Uint16,
+                      data.idxRange.offset, data.idxRange.size);
   if (data.dstAlpha != UINT32_MAX) {
     const wgpu::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
@@ -156,10 +158,10 @@ gfx::CompiledPipeline pipeline;
     }
   };
   if (pipeline.prepass) {
-    gfx::bind_pipeline(pipeline.prepass, pass);
+    gfx::bind_pipeline(pipeline.prepass->pipeline, pass);
     draw();
   }
-  gfx::bind_pipeline(pipeline.main, pass);
+  gfx::bind_pipeline(pipeline.main->pipeline, pass);
   draw();
 }
 

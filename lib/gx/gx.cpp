@@ -5,232 +5,42 @@
 #include "../gfx/pipeline_cache.hpp"
 #endif
 
+#include "fifo.hpp"
 #include "pipeline.hpp"
 #include "texture.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
-#include "../webgpu/gpu.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
+#include "../gfx/backend.hpp"
 #include "../gfx/resources.hpp"
 #include "../gfx/recording.hpp"
-#include "../gfx/resource_cache.hpp"
 #include "../gfx/texture.hpp"
 #include "gx_fmt.hpp"
 
-#include <absl/container/flat_hash_map.h>
 #include <tracy/Tracy.hpp>
 
 #include <atomic>
 #include <bit>
 #include <cfloat>
 #include <cmath>
-#include <mutex>
 #include <utility>
 
 static aurora::Module Log("aurora::gx");
 
 namespace aurora::gx {
-using webgpu::g_device;
-using webgpu::g_graphicsConfig;
-
 GXState g_gxState{};
-wgpu::BindGroup g_emptyTextureBindGroup;
 
 namespace {
-wgpu::Sampler sEmptySampler;
-wgpu::Texture sEmptyTexture;
-wgpu::TextureView sEmptyTextureView;
-std::mutex sBindGroupLayoutMutex;
-absl::flat_hash_map<u32, wgpu::BindGroupLayout> sUniformBindGroupLayouts;
-absl::flat_hash_map<u32, std::pair<wgpu::BindGroupLayout, wgpu::BindGroupLayout>> sTextureBindGroupLayouts;
-wgpu::BindGroupLayout sTextureBindGroupLayout;
-wgpu::BindGroupLayout sSamplerBindGroupLayout;
-wgpu::PipelineLayout sPipelineLayout;
-#ifdef __EMSCRIPTEN__
-// Browser rendering and these callbacks share one realm. Keep pending results
-// separate until the pipeline cache can bind a fully compiled pipeline.
-absl::flat_hash_map<gfx::PipelineRef, std::shared_ptr<wgpu::RenderPipeline>> sBrowserPipelines;
-#endif
-
 std::atomic<int> sPendingViewportPolicy{-1};
+// Game thread: the policy the next frame records under.
+AuroraViewportPolicy sViewportPolicy = AURORA_VIEWPORT_FIT;
 std::atomic<float> sPendingPresentationAspect{-1.f};
-
-template <typename T>
-T round_away_from_zero(float value) noexcept {
-  return static_cast<T>(value < 0.0f ? std::floor(value) : std::ceil(value));
-}
 
 std::pair<f32, f32> polygon_offset_for_cull_mode(GXCullMode cullMode) noexcept {
   if (cullMode == GX_CULL_FRONT) {
     return {g_gxState.backOffset, g_gxState.backScale};
   }
   return {g_gxState.frontOffset, g_gxState.frontScale};
-}
-
-wgpu::BlendFactor to_blend_factor(GXBlendFactor fac, bool isDst) {
-  switch (fac) {
-    DEFAULT_FATAL("invalid blend factor {}", underlying(fac));
-  case GX_BL_ZERO:
-    return wgpu::BlendFactor::Zero;
-  case GX_BL_ONE:
-    return wgpu::BlendFactor::One;
-  case GX_BL_SRCCLR: // + GX_BL_DSTCLR
-    if (isDst) {
-      return wgpu::BlendFactor::Src;
-    } else {
-      return wgpu::BlendFactor::Dst;
-    }
-  case GX_BL_INVSRCCLR: // + GX_BL_INVDSTCLR
-    if (isDst) {
-      return wgpu::BlendFactor::OneMinusSrc;
-    } else {
-      return wgpu::BlendFactor::OneMinusDst;
-    }
-  case GX_BL_SRCALPHA:
-    return wgpu::BlendFactor::SrcAlpha;
-  case GX_BL_INVSRCALPHA:
-    return wgpu::BlendFactor::OneMinusSrcAlpha;
-  case GX_BL_DSTALPHA:
-    return wgpu::BlendFactor::DstAlpha;
-  case GX_BL_INVDSTALPHA:
-    return wgpu::BlendFactor::OneMinusDstAlpha;
-  }
-}
-
-wgpu::CompareFunction to_compare_function(GXCompare func) {
-  switch (func) {
-    DEFAULT_FATAL("invalid depth fn {}", underlying(func));
-  case GX_NEVER:
-    return wgpu::CompareFunction::Never;
-  case GX_LESS:
-    return UseReversedZ ? wgpu::CompareFunction::Greater : wgpu::CompareFunction::Less;
-  case GX_EQUAL:
-    return wgpu::CompareFunction::Equal;
-  case GX_LEQUAL:
-    return UseReversedZ ? wgpu::CompareFunction::GreaterEqual : wgpu::CompareFunction::LessEqual;
-  case GX_GREATER:
-    return UseReversedZ ? wgpu::CompareFunction::Less : wgpu::CompareFunction::Greater;
-  case GX_NEQUAL:
-    return wgpu::CompareFunction::NotEqual;
-  case GX_GEQUAL:
-    return UseReversedZ ? wgpu::CompareFunction::LessEqual : wgpu::CompareFunction::GreaterEqual;
-  case GX_ALWAYS:
-    return wgpu::CompareFunction::Always;
-  }
-}
-
-wgpu::BlendState to_blend_state(GXBlendMode mode, GXBlendFactor srcFac, GXBlendFactor dstFac, GXLogicOp op,
-                                u32 dstAlpha, bool dualSource) {
-  wgpu::BlendComponent colorBlendComponent;
-  switch (mode) {
-    DEFAULT_FATAL("unsupported blend mode {}", underlying(mode));
-  case GX_BM_NONE:
-    colorBlendComponent = {
-        .operation = wgpu::BlendOperation::Add,
-        .srcFactor = wgpu::BlendFactor::One,
-        .dstFactor = wgpu::BlendFactor::Zero,
-    };
-    break;
-  case GX_BM_BLEND:
-    colorBlendComponent = {
-        .operation = wgpu::BlendOperation::Add,
-        .srcFactor = to_blend_factor(srcFac, false),
-        .dstFactor = to_blend_factor(dstFac, true),
-    };
-    break;
-  case GX_BM_SUBTRACT:
-    colorBlendComponent = {
-        .operation = wgpu::BlendOperation::ReverseSubtract,
-        .srcFactor = wgpu::BlendFactor::One,
-        .dstFactor = wgpu::BlendFactor::One,
-    };
-    break;
-  case GX_BM_LOGIC:
-    switch (op) {
-      DEFAULT_FATAL("unsupported logic op {}", underlying(op));
-    case GX_LO_CLEAR:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::Zero,
-          .dstFactor = wgpu::BlendFactor::Zero,
-      };
-      break;
-    case GX_LO_COPY:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::One,
-          .dstFactor = wgpu::BlendFactor::Zero,
-      };
-      break;
-    case GX_LO_NOOP:
-      colorBlendComponent = {
-          .operation = wgpu::BlendOperation::Add,
-          .srcFactor = wgpu::BlendFactor::Zero,
-          .dstFactor = wgpu::BlendFactor::One,
-      };
-      break;
-    }
-    break;
-  }
-  if (dualSource) {
-    const auto remap = [](wgpu::BlendFactor factor) {
-      if (factor == wgpu::BlendFactor::SrcAlpha) {
-        return wgpu::BlendFactor::Src1Alpha;
-      }
-      if (factor == wgpu::BlendFactor::OneMinusSrcAlpha) {
-        return wgpu::BlendFactor::OneMinusSrc1Alpha;
-      }
-      return factor;
-    };
-    colorBlendComponent.srcFactor = remap(colorBlendComponent.srcFactor);
-    colorBlendComponent.dstFactor = remap(colorBlendComponent.dstFactor);
-  }
-  wgpu::BlendComponent alphaBlendComponent;
-  if (dstAlpha != UINT32_MAX) {
-    alphaBlendComponent = wgpu::BlendComponent{
-        .operation = wgpu::BlendOperation::Add,
-        .srcFactor = wgpu::BlendFactor::Constant,
-        .dstFactor = wgpu::BlendFactor::Zero,
-    };
-  } else {
-    alphaBlendComponent = colorBlendComponent;
-  }
-  return {
-      .color = colorBlendComponent,
-      .alpha = alphaBlendComponent,
-  };
-}
-
-wgpu::ColorWriteMask to_write_mask(bool colorUpdate, bool alphaUpdate) {
-  wgpu::ColorWriteMask writeMask = wgpu::ColorWriteMask::None;
-  if (colorUpdate) {
-    writeMask |= wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
-  }
-  if (alphaUpdate) {
-    writeMask |= wgpu::ColorWriteMask::Alpha;
-  }
-  return writeMask;
-}
-
-wgpu::PrimitiveState to_primitive_state(GXCullMode gx_cullMode) {
-  auto cullMode = wgpu::CullMode::None;
-  switch (gx_cullMode) {
-    DEFAULT_FATAL("unsupported cull mode {}", underlying(gx_cullMode));
-  case GX_CULL_FRONT:
-    cullMode = wgpu::CullMode::Front;
-    break;
-  case GX_CULL_BACK:
-    cullMode = wgpu::CullMode::Back;
-    break;
-  case GX_CULL_NONE:
-    break;
-  }
-  return {
-      .topology = wgpu::PrimitiveTopology::TriangleList,
-      .stripIndexFormat = wgpu::IndexFormat::Undefined,
-      .frontFace = wgpu::FrontFace::CW,
-      .cullMode = cullMode,
-  };
 }
 } // namespace
 
@@ -241,7 +51,7 @@ void set_viewport_policy(AuroraViewportPolicy policy) noexcept {
 void update() noexcept {
   if (const int pending = sPendingViewportPolicy.exchange(-1, std::memory_order_acq_rel); pending != -1) {
     const auto policy = static_cast<AuroraViewportPolicy>(pending);
-    g_gxState.viewportPolicy = policy;
+    sViewportPolicy = policy;
     if (policy == AURORA_VIEWPORT_FIT) {
       const auto [baseW, baseH] = vi::configured_fb_size();
       window::set_frame_buffer_aspect(baseH > 0 ? static_cast<float>(baseW) / static_cast<float>(baseH) : 0.f);
@@ -258,8 +68,18 @@ void set_presentation_aspect(float aspect) noexcept {
   sPendingPresentationAspect.store(aspect < 0.f ? 0.f : aspect, std::memory_order_release);
 }
 
+void begin_frame(size_t slot) noexcept {
+  const auto viSize = vi::configured_fb_size();
+  fifo::begin_frame({
+      .slot = static_cast<uint8_t>(slot),
+      .viewportPolicy = sViewportPolicy,
+      .viWidth = viSize.x,
+      .viHeight = viSize.y,
+  });
+}
+
 Vec2<uint32_t> logical_fb_size() noexcept {
-  return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
+  return gfx::is_offscreen() ? gfx::get_render_target_size() : g_gxState.viSize;
 }
 
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {
@@ -322,7 +142,7 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept 
 void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
   if (viewport.left != g_gxState.logicalViewport.left || viewport.width != g_gxState.logicalViewport.width ||
       viewport.height != g_gxState.logicalViewport.height) {
-    g_gxState.dirty |= DirtyUniform;
+    g_gxState.dirty |= DirtyView | DirtyMaterial; // The material's texture LOD bias reads it
   }
   g_gxState.logicalViewport = viewport;
   set_render_viewport(map_logical_viewport(viewport));
@@ -331,7 +151,10 @@ void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
 void set_render_viewport(const gfx::Viewport& viewport) noexcept {
   if (viewport.left != g_gxState.renderViewport.left || viewport.width != g_gxState.renderViewport.width ||
       viewport.height != g_gxState.renderViewport.height) {
-    g_gxState.dirty |= DirtyUniform;
+    g_gxState.dirty |= DirtyView | DirtyMaterial; // The material's texture LOD bias reads it
+  }
+  if (viewport.znear != g_gxState.renderViewport.znear || viewport.zfar != g_gxState.renderViewport.zfar) {
+    g_gxState.dirty |= DirtyView; // The view's depth range
   }
   g_gxState.renderViewport = viewport;
   gfx::set_viewport(viewport);
@@ -349,83 +172,28 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
 
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
-wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
-                                    const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
-                                    wgpu::ShaderModule shader, const char* label) noexcept {
+GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
   ZoneScoped;
-  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
-  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
-  const float depthBiasClamp = webgpu::g_hasCoreFeatures ? std::bit_cast<float>(config.polygonOffsetClampBits) : 0.0f;
-  const bool writesDepth = config.depthCompare && options.depthUpdate;
-  const wgpu::DepthStencilState depthStencil{
-      .format = layout.depthStencilFormat,
-      .depthWriteEnabled = writesDepth,
-      .depthCompare = config.depthCompare ? to_compare_function(config.depthFunc) : wgpu::CompareFunction::Always,
-      .depthBias = round_away_from_zero<int32_t>(depthBias),
-      .depthBiasSlopeScale = depthBiasSlopeScale,
-      .depthBiasClamp = depthBiasClamp,
-  };
-  const auto blendState = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
-                                         config.dstAlpha, options.dstAlphaMode == DstAlphaMode::DualSource);
-  std::array<wgpu::ColorTargetState, gfx::MaxColorAttachments> colorTargets{};
-  for (uint32_t i = 0; i < layout.colorAttachmentCount; ++i) {
-    colorTargets[i] = {
-        .format = layout.colorAttachments[i].format,
-        .writeMask = layout.colorAttachments[i].semantic == gfx::ColorAttachmentSemantic::Normal && writesDepth
-                         ? wgpu::ColorWriteMask::All
-                         : wgpu::ColorWriteMask::None,
-    };
-  }
-  colorTargets[gfx::SceneColorAttachmentIndex].blend = &blendState;
-  colorTargets[gfx::SceneColorAttachmentIndex].writeMask = to_write_mask(options.colorUpdate, options.alphaUpdate);
-  const wgpu::FragmentState fragmentState{
-      .module = shader,
-      .entryPoint = "fs_main",
-      .targetCount = layout.colorAttachmentCount,
-      .targets = colorTargets.data(),
-  };
-  const wgpu::RenderPipelineDescriptor descriptor{
-      .label = label,
-      .layout = sPipelineLayout,
-      .vertex =
-          {
-              .module = shader,
-              .entryPoint = "vs_main",
-              .bufferCount = static_cast<uint32_t>(vtxBuffers.size()),
-              .buffers = vtxBuffers.data(),
-          },
-      .primitive = to_primitive_state(config.cullMode),
-      .depthStencil = layout.depthStencilFormat != wgpu::TextureFormat::Undefined ? &depthStencil : nullptr,
-      .multisample = wgpu::MultisampleState{.count = layout.sampleCount},
-      .fragment = &fragmentState,
-  };
-#ifdef __EMSCRIPTEN__
-  // Same key as the pipeline cache's runtime ref (resolve_pipeline).
-  const auto ref = xxh3_hash(layout.key, xxh3_hash(config, static_cast<HashType>(gfx::ShaderType::GX)));
-  auto pending = std::make_shared<wgpu::RenderPipeline>();
-  sBrowserPipelines[ref] = pending;
-  g_device.CreateRenderPipelineAsync(&descriptor, wgpu::CallbackMode::AllowSpontaneous,
-      [pending](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline pipeline, wgpu::StringView) {
-        if (status == wgpu::CreatePipelineAsyncStatus::Success) {
-          *pending = std::move(pipeline);
-        } else {
-          Log.error("Browser GPU pipeline compilation failed");
-          EM_ASM({ Module.onAbort?.('GPU pipeline compilation failed'); });
-        }
-      });
-  return {};
-#else
-  return g_device.CreateRenderPipeline(&descriptor);
-#endif
-}
 
-#ifdef __EMSCRIPTEN__
-bool take_browser_pipeline(gfx::PipelineRef ref, wgpu::RenderPipeline& pipeline) {
-  const auto it = sBrowserPipelines.find(ref);
-  if (it == sBrowserPipelines.end() || !*it->second) return false;
-  pipeline = std::move(*it->second);
-  sBrowserPipelines.erase(it);
-  return true;
+  if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
+    // Don't bother re-binding anything
+    return {};
+  }
+
+  // The backend makes what the set describes.
+  gfx::TextureSet set{};
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    const auto& tex = g_gxState.textures[i];
+    if (tex && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
+      set.textures[i] = tex.ref;
+      set.samplers[i] = tex.sampler_config();
+    }
+  }
+  const auto ref = set.hash();
+  gfx::backend::prepare_textures(ref, set);
+  return {
+      .textureBindGroup = ref,
+  };
 }
 #endif
 
@@ -504,6 +272,14 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     const auto& cc = g_gxState.colorChannelConfig[i];
     if (cc.lightingEnabled) {
       config.shaderConfig.colorChannels[i] = cc;
+      if (cc.attnFn == GX_AF_SPOT && gfx::backend::limits().unitLightTerms) {
+        auto& key = config.shaderConfig.colorChannels[i];
+        for (u32 l = 0; l < GX::MaxLights; ++l) {
+          const u8 bit = (cc.lightMask & (1u << l)) != 0 ? static_cast<u8>(1u << l) : 0;
+          key.unitSpotLights |= (g_gxState.unitLightTerms[l] & 1) != 0 ? bit : 0;
+          key.unitDistanceLights |= (g_gxState.unitLightTerms[l] & 2) != 0 ? bit : 0;
+        }
+      }
     } else {
       // Only matSrc matters when lighting disabled
       config.shaderConfig.colorChannels[i] = {
@@ -520,7 +296,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
   const bool hasAlpha = efb_has_alpha(g_gxState.pixelFmt);
-  const bool alphaUpdate = hasAlpha && g_gxState.alphaUpdate;
+  // GX_CULL_ALL discards every triangle, which a WebGPU pipeline can't say; the draw writes nothing instead.
+  const bool cullAll = cullMode == GX_CULL_ALL;
+  const bool alphaUpdate = hasAlpha && g_gxState.alphaUpdate && !cullAll;
   const auto blendFactor = [hasAlpha](GXBlendFactor factor) {
     if (!hasAlpha) {
       if (factor == GX_BL_DSTALPHA) {
@@ -545,140 +323,13 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
       .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
       .depthCompare = g_gxState.depthCompare,
-      .depthUpdate = g_gxState.depthUpdate,
+      .depthUpdate = g_gxState.depthUpdate && !cullAll,
       .alphaUpdate = alphaUpdate,
-      .colorUpdate = g_gxState.colorUpdate,
+      .colorUpdate = g_gxState.colorUpdate && !cullAll,
   };
-}
-
-GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
-  ZoneScoped;
-
-  if (!info.sampledTextures.any() && !info.sampledIndTextures.any()) {
-    // Don't bother re-binding anything
-    return {};
-  }
-
-  // Using C WGPU types instead of C++ wrappers to avoid destructor overhead
-  std::array<WGPUBindGroupEntry, MaxTextures * 2> textureEntries{};
-  for (u32 i = 0; i < MaxTextures; ++i) {
-    const auto& tex = g_gxState.textures[i];
-    WGPUBindGroupEntry& textureEntry = textureEntries[i * 2];
-    WGPUBindGroupEntry& samplerEntry = textureEntries[i * 2 + 1];
-    textureEntry.binding = i * 2;
-    samplerEntry.binding = i * 2 + 1;
-    if (tex && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
-      textureEntry.textureView = tex.ref->sampleTextureView.Get();
-      samplerEntry.sampler = gfx::sampler_ref(tex.get_descriptor()).Get();
-    } else {
-      textureEntry.textureView = sEmptyTextureView.Get();
-      samplerEntry.sampler = sEmptySampler.Get();
-    }
-  }
-  const WGPUBindGroupDescriptor textureBindGroupDescriptor{
-      .label = {"GX Texture Bind Group", WGPU_STRLEN},
-      .layout = sTextureBindGroupLayout.Get(),
-      .entryCount = textureEntries.size(),
-      .entries = textureEntries.data(),
-  };
-  return {
-      .textureBindGroup = gfx::bind_group_ref(textureBindGroupDescriptor),
-  };
-}
-
-void initialize() noexcept {
-  {
-    std::array<wgpu::BindGroupLayoutEntry, MaxTextures * 2> textureEntries;
-    for (u32 i = 0; i < MaxTextures; ++i) {
-      textureEntries[i * 2] = {
-          .binding = i * 2,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              {
-                  .sampleType = wgpu::TextureSampleType::Float,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      };
-      textureEntries[i * 2 + 1] = {
-          .binding = i * 2 + 1,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .sampler = {.type = wgpu::SamplerBindingType::Filtering},
-      };
-    }
-    const wgpu::BindGroupLayoutDescriptor descriptor{
-        .label = "GX Texture Bind Group Layout",
-        .entryCount = textureEntries.size(),
-        .entries = textureEntries.data(),
-    };
-    sTextureBindGroupLayout = g_device.CreateBindGroupLayout(&descriptor);
-  }
-  {
-    constexpr wgpu::SamplerDescriptor descriptor{.label = "Empty sampler"};
-    sEmptySampler = gfx::sampler_ref(descriptor);
-  }
-  {
-    constexpr wgpu::TextureDescriptor descriptor{
-        .label = "Empty texture",
-        .usage = wgpu::TextureUsage::TextureBinding,
-        .size = {1, 1},
-        .format = wgpu::TextureFormat::RGBA8Unorm,
-    };
-    sEmptyTexture = g_device.CreateTexture(&descriptor);
-    sEmptyTextureView = sEmptyTexture.CreateView();
-  }
-  {
-    std::array<wgpu::BindGroupEntry, MaxTextures * 2> entries;
-    for (u32 i = 0; i < MaxTextures; ++i) {
-      entries[i * 2] = {
-          .binding = i * 2,
-          .textureView = sEmptyTextureView,
-      };
-      entries[i * 2 + 1] = {
-          .binding = i * 2 + 1,
-          .sampler = sEmptySampler,
-      };
-    }
-    const wgpu::BindGroupDescriptor desc{
-        .label = "GX Empty Texture Bind Group",
-        .layout = sTextureBindGroupLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    g_emptyTextureBindGroup = g_device.CreateBindGroup(&desc);
-  }
-  {
-    const std::array layouts{
-        gfx::detail::resources().staticBindGroupLayout,
-        gfx::detail::resources().uniformBindGroupLayout,
-        sTextureBindGroupLayout,
-#ifdef __EMSCRIPTEN__
-        gfx::detail::resources().uniformBindGroupLayout,
-#endif
-    };
-    const wgpu::PipelineLayoutDescriptor desc{
-        .label = "GX Pipeline Layout",
-        .bindGroupLayoutCount = layouts.size(),
-        .bindGroupLayouts = layouts.data(),
-#ifndef __EMSCRIPTEN__
-        .immediateSize = sizeof(DrawImmediateData),
-#endif
-    };
-    sPipelineLayout = g_device.CreatePipelineLayout(&desc);
-  }
 }
 
 void shutdown() noexcept {
-#ifdef __EMSCRIPTEN__
-  sBrowserPipelines.clear();
-#endif
-  // TODO we should probably store this all in g_state.gx instead
-  sSamplerBindGroupLayout = {};
-  sTextureBindGroupLayout = {};
-  {
-    std::lock_guard lock{sBindGroupLayoutMutex};
-    sUniformBindGroupLayouts.clear();
-    sTextureBindGroupLayouts.clear();
-  }
   for (auto& item : g_gxState.textures) {
     item.ref.reset();
   }

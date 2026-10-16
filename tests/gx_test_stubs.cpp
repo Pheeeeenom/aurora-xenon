@@ -3,19 +3,23 @@
 // These allow the test binary to link without pulling in WebGPU runtime.
 
 #include "gx/gx.hpp"
+#include "dolphin/vi/vi_internal.hpp"
 #include "gfx/clear.hpp"
 #include "gfx/frame_packet.hpp"
 #include "gfx/resources.hpp"
 #include "gfx/depth_peek.hpp"
+#include "gfx/backend.hpp"
+#include "gfx/frame.hpp"
 #include "gfx/recording.hpp"
-#include "gfx/tex_copy_conv.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/texture.hpp"
 #include "gfx/texture_replacement.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
+#include "gx/texture.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
+#include "gx_test_common.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -39,13 +43,8 @@ auto fmt::formatter<AuroraLogLevel>::format(AuroraLogLevel level, format_context
   return fmt::format_to(ctx.out(), "{}", static_cast<int>(level));
 }
 
-// --- GPU resources (default-constructed, not used in tests) ---
+// --- Merged draw counter ---
 namespace aurora::gfx::detail {
-Resources& resources() noexcept {
-  static Resources resources;
-  return resources;
-}
-
 void increment_merged_draw_count() noexcept {}
 } // namespace aurora::gfx::detail
 
@@ -64,6 +63,9 @@ void set_presentation_aspect(float) noexcept {}
 namespace aurora::vi {
 Vec2<uint32_t> configured_fb_size() noexcept { return {640, 480}; }
 void configure(const GXRenderModeObj*) noexcept {}
+// What the FIFO registers, for the VI size test.
+ConfigureHook g_testConfigureHook = nullptr;
+void set_configure_hook(ConfigureHook hook) noexcept { g_testConfigureHook = hook; }
 } // namespace aurora::vi
 
 // --- get_texture ---
@@ -72,6 +74,7 @@ const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.t
 namespace texture {
 void invalidate_bindings() noexcept {}
 uint64_t current_bind_generation() noexcept { return 1; }
+void end_frame() noexcept {}
 GXState::CopyTextureRef resolve_copy_texture(const GXState::CopyTextureKey& key) noexcept {
   auto& ref = g_gxState.copyTextures[key.dest];
   ++ref.revision;
@@ -92,9 +95,7 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
     }
   }
 }
-void evict_copy_texture(const void* dest) noexcept {
-  g_gxState.copyTextures.erase(dest);
-}
+void evict_copy_texture(const void* dest) noexcept { g_gxState.copyTextures.erase(dest); }
 void shutdown() noexcept {}
 Vec2<uint32_t> logical_fb_size() noexcept { return {640, 480}; }
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept { return logicalViewport; }
@@ -116,35 +117,65 @@ namespace aurora::gx {
 uint32_t g_testPipelineBuildCount = 0;
 void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept {
   ++g_testPipelineBuildCount;
+  // Whether the draw has normals, which decides whether a shader writes the normal attachment.
+  config.shaderConfig.attrs[GX_VA_NRM].attrType = static_cast<u8>(g_gxState.vtxDesc[GX_VA_NRM]);
 }
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept { return {}; }
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept { return {}; }
-gfx::Range build_uniform(const ShaderInfo& info) noexcept { return {.size = 1}; }
+// The pieces pushed, as UniformPiece bits, for the normal target test.
+u8 g_testPushedPieces = 0;
+void push_uniforms(const ShaderInfo& info, u8 pieces, std::array<u32, UniformPieceCount>& offsets) noexcept {
+  g_testPushedPieces |= pieces;
+}
 void resolve_sampled_textures(const ShaderInfo& info) noexcept {}
 } // namespace aurora::gx
 
 // --- Buffer push stubs ---
 namespace aurora::gfx {
-Range push_verts(const uint8_t* data, size_t length, size_t alignment) { return {}; }
-Range push_indices(const uint8_t* data, size_t length, size_t alignment) { return {}; }
+// The last draw's vertex bytes, for the display list tests.
+std::vector<uint8_t> g_testLastVerts;
+Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+  g_testLastVerts.assign(data, data + length);
+  return {};
+}
+Range push_verts_hashed(const uint8_t* data, size_t length, size_t alignment, uint64_t& hash) {
+  hash = 0;
+  return push_verts(data, length, alignment);
+}
+// The frame's index pool, for the index pattern tests.
+std::vector<uint8_t> g_testIndices;
+Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+  if (alignment != 0) {
+    g_testIndices.resize((g_testIndices.size() + alignment - 1) / alignment * alignment);
+  }
+  const Range range{static_cast<uint32_t>(g_testIndices.size()), static_cast<uint32_t>(length)};
+  g_testIndices.insert(g_testIndices.end(), data, data + length);
+  return range;
+}
 Range push_uniform(const uint8_t* data, size_t length) { return {}; }
-Range push_storage(const uint8_t* data, size_t length) { return {}; }
+// Counted, each at its own offset, for the array copy test.
+uint32_t g_testStoragePushes = 0;
+Range push_storage(const uint8_t* data, size_t length) {
+  return {.offset = 256 * g_testStoragePushes++, .size = static_cast<uint32_t>(length)};
+}
+Range push_array(const uint8_t* data, size_t length) { return push_storage(data, length); }
 
 Vec2<uint32_t> get_render_target_size() noexcept { return {640, 480}; }
 void set_viewport(const Viewport& viewport) noexcept {}
 void set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h) noexcept {}
 bool g_testNormalAttachment = false;
 bool has_normal_attachment() noexcept { return g_testNormalAttachment; }
+uint64_t get_render_target_layout_key() noexcept { return get_render_target_layout().key; }
 RenderTargetLayout get_render_target_layout() noexcept {
   RenderTargetLayout layout{
       .colorAttachmentCount = 1,
-      .colorAttachments = {{{ColorAttachmentSemantic::SceneColor, wgpu::TextureFormat::RGBA8Unorm}}},
-      .depthStencilFormat = wgpu::TextureFormat::Depth24Plus,
+      .colorAttachments = {{{ColorAttachmentSemantic::SceneColor, TextureFormat::RGBA8Unorm}}},
+      .depthStencilFormat = TextureFormat::Depth32Float,
       .sampleCount = 1,
   };
   if (g_testNormalAttachment) {
     layout.colorAttachmentCount = 2;
-    layout.colorAttachments[1] = {ColorAttachmentSemantic::Normal, wgpu::TextureFormat::RGB10A2Unorm};
+    layout.colorAttachments[1] = {ColorAttachmentSemantic::Normal, TextureFormat::RGB10A2Unorm};
   }
   detail::finalize_render_target_layout(layout);
   return layout;
@@ -175,15 +206,33 @@ void push_draw_command<gx::DrawData>(gx::DrawData data) {
   ++g_testDrawCount;
   g_testProcessedDrawCount.fetch_add(1, std::memory_order_release);
 }
+// Whether a draw may merge into the last one, for the index pattern tests.
+bool g_testMergeDraws = false;
 template <>
 gx::DrawData* get_last_draw_command() {
-  return nullptr;
+  return g_testMergeDraws ? &g_testLastDraw : nullptr;
 }
+
+std::vector<TestFrameEvent> g_testFrameEvents;
+namespace {
+void record_frame_event(TestFrameEvent::Kind kind, size_t slot) {
+  const auto& state = gx::g_gxState;
+  g_testFrameEvents.push_back(
+      {kind, slot, g_testDrawCount, state.viewportPolicy, state.viSize, state.bpRegCache[0x41]});
+}
+} // namespace
+namespace detail {
+void begin_frame_recording(size_t slot) noexcept { record_frame_event(TestFrameEvent::Begin, slot); }
+void note_fifo_done(size_t slot) noexcept {}
+void end_frame_recording(size_t slot, bool close) noexcept {
+  record_frame_event(close ? TestFrameEvent::Close : TestFrameEvent::End, slot);
+}
+} // namespace detail
 } // namespace aurora::gfx
 
-// --- TextureBind::get_descriptor ---
+// --- TextureBind::sampler_config ---
 namespace aurora::gfx {
-wgpu::SamplerDescriptor TextureBind::get_descriptor() const noexcept { return wgpu::SamplerDescriptor{}; }
+SamplerConfig TextureBind::sampler_config() const noexcept { return {}; }
 } // namespace aurora::gfx
 
 // --- Texture creation/write/replacement stubs ---
@@ -200,15 +249,14 @@ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, 
   return {};
 }
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept { return {}; }
-void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {}
 void queue_texture_upload(TextureUpload upload) {}
-void queue_texture_upload_data(const uint8_t* data, size_t length, uint32_t bytesPerRow, uint32_t rowsPerImage,
-                               wgpu::TexelCopyTextureInfo tex, wgpu::Extent3D size) {}
+bool queue_texture_upload_data(const uint8_t* data, TextureUpload upload, uint32_t blockSize) { return true; }
 void queue_palette_conv(tex_palette_conv::ConvRequest req) {}
 namespace testing {
 std::atomic<uint32_t> beginOffscreenCount{0};
 std::atomic<uint32_t> endOffscreenCount{0};
 std::atomic<uint32_t> resolvePassCount{0};
+ResolveCall lastResolve;
 std::atomic<uint32_t> offscreenWidth{0};
 std::atomic<uint32_t> offscreenHeight{0};
 } // namespace testing
@@ -216,6 +264,15 @@ std::atomic<uint32_t> offscreenHeight{0};
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
                        GXPixelFmt sourceFormat) {
+  testing::lastResolve = {
+      .target = static_cast<bool>(texture),
+      .rect = rect,
+      .clearColor = clearColor,
+      .clearAlpha = clearAlpha,
+      .clearDepth = clearDepth,
+      .clearColorValue = clearColorValue,
+      .clearDepthValue = clearDepthValue,
+  };
   testing::resolvePassCount.fetch_add(1, std::memory_order_release);
 }
 void begin_offscreen(uint32_t width, uint32_t height) {
@@ -269,9 +326,14 @@ void set_latest(uint32_t width, uint32_t height, const std::vector<uint32_t>& da
 } // namespace testing
 } // namespace aurora::gfx::depth_peek
 
-namespace aurora::gfx::tex_copy_conv {
-bool needs_conversion(GXTexFmt fmt) { return false; }
-} // namespace aurora::gfx::tex_copy_conv
+namespace aurora::gfx::backend {
+// No backend's fog range table, so Aurora's, as under Dawn and the null backend; a test may set what it needs.
+Limits g_testLimits{};
+const Limits& limits() noexcept { return g_testLimits; }
+void request_depth_snapshot() noexcept { depth_peek::request_snapshot(); }
+bool read_depth(uint16_t x, uint16_t y, uint32_t& z) noexcept { return depth_peek::read_latest(x, y, z); }
+bool converts_copy(GXTexFmt format) noexcept { return false; }
+} // namespace aurora::gfx::backend
 
 namespace aurora::gfx::tex_palette_conv {
 void queue(ConvRequest req) {}
@@ -318,3 +380,8 @@ void aurora::gfx::push_debug_group(std::string) {}
 void push_debug_group(const char*) {}
 void pop_debug_group() {}
 void aurora::gfx::insert_debug_marker(std::string) {}
+
+// GXInitTexObjLOD calls this, and the FIFO tests don't link the texture cache.
+namespace aurora::gx::texture {
+void preconvert_texture(const GXTexObj_&) noexcept {}
+} // namespace aurora::gx::texture

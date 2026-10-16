@@ -11,13 +11,11 @@
 #define GX_WRITE_U64(ui) aurora::gx::fifo::write_u64(static_cast<uint64_t>(ui))
 #define GX_WRITE_F32(f) aurora::gx::fifo::write_f32(static_cast<float>(f))
 
+// Register writes are each one command, with one room check (fifo::write_command).
 // XF register write: opcode 0x10, address in XF space (0x1000+addr), then value
 #define GX_WRITE_XF_REG(addr, value)                                                                                   \
-  do {                                                                                                                 \
-    GX_WRITE_U8(0x10);                                                                                                 \
-    GX_WRITE_U32(0x1000 + (addr));                                                                                     \
-    GX_WRITE_U32(value);                                                                                               \
-  } while (0)
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(0x10), static_cast<uint32_t>(0x1000 + (addr)),                  \
+                                  static_cast<uint32_t>(value))
 
 // XF register write for u32 data (no address header - used in bulk writes)
 #define GX_WRITE_XF_REG_2(addr, value)                                                                                 \
@@ -33,41 +31,27 @@
 
 // BP (RAS) register write: opcode 0x61, then 32-bit value (upper 8 bits = reg ID)
 #define GX_WRITE_RAS_REG(value)                                                                                        \
-  do {                                                                                                                 \
-    GX_WRITE_U8(0x61);                                                                                                 \
-    GX_WRITE_U32(value);                                                                                               \
-  } while (0)
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(0x61), static_cast<uint32_t>(value))
 
 // CP register write with base/stride tracking for indexed arrays
 // GX_WRITE_SOME_REG2: CP array base address
 #define GX_WRITE_SOME_REG2(a, b, c, addr)                                                                              \
-  do {                                                                                                                 \
-    GX_WRITE_U8(a);                                                                                                    \
-    GX_WRITE_U8(b);                                                                                                    \
-    GX_WRITE_U32(c);                                                                                                   \
-  } while (0)
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint32_t>(c))
 
 // GX_WRITE_SOME_REG3: CP array stride
 #define GX_WRITE_SOME_REG3(a, b, c, addr)                                                                              \
-  do {                                                                                                                 \
-    GX_WRITE_U8(a);                                                                                                    \
-    GX_WRITE_U8(b);                                                                                                    \
-    GX_WRITE_U32(c);                                                                                                   \
-  } while (0)
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint32_t>(c))
 
 // GX_WRITE_SOME_REG4: generic CP register write (VCD, VAT, matrix index)
 #define GX_WRITE_SOME_REG4(a, b, c, addr)                                                                              \
-  do {                                                                                                                 \
-    GX_WRITE_U8(a);                                                                                                    \
-    GX_WRITE_U8(b);                                                                                                    \
-    GX_WRITE_U32(c);                                                                                                   \
-  } while (0)
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(a), static_cast<uint8_t>(b), static_cast<uint32_t>(c))
 
 #define GET_REG_FIELD(reg, size, shift) (static_cast<int>(((reg) >> (shift)) & ((1 << (size)) - 1)))
 
 #define SET_REG_FIELD(line, reg, size, shift, val)                                                                     \
   do {                                                                                                                 \
-    (reg) = ((u32)(reg) & ~(((1u << (size)) - 1) << (shift))) | ((u32)(val) << (shift));                               \
+    constexpr int kMask = ((1u << (size)) - 1) << (shift);                                                             \
+    (reg) = (u32(reg) & ~kMask) | ((u32(val) << (shift)) & kMask);                                                     \
   } while (0)
 
 #define GX_WRITE_AURORA(cmd)     \
@@ -76,12 +60,9 @@
     GX_WRITE_U16(cmd);           \
   } while (0)
 
-#define GX_WRITE_CP_REG(addr, value)  \
-  do {                                \
-  GX_WRITE_U8(GX_LOAD_CP_REG);        \
-  GX_WRITE_U8(addr);                  \
-  GX_WRITE_U32(value);                \
-  } while (0)
+#define GX_WRITE_CP_REG(addr, value)                                                                                   \
+  aurora::gx::fifo::write_command(static_cast<uint8_t>(GX_LOAD_CP_REG), static_cast<uint8_t>(addr),                    \
+                                  static_cast<uint32_t>(value))
 
 // Shadow register struct
 struct __GXData_struct {

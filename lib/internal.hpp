@@ -83,6 +83,23 @@ ALWAYS_INLINE constexpr T bswap(T val) noexcept {
   return std::bit_cast<T>(bits);
 }
 
+// A value in the GameCube's byte order, big-endian, which the command stream keeps; read_bits below reads it back.
+template <typename T>
+ALWAYS_INLINE constexpr T to_big_endian(T val) noexcept {
+  if constexpr (std::endian::native == std::endian::little) {
+    return bswap(val);
+  } else {
+    return val;
+  }
+}
+
+// A big-endian value, as the GameCube's textures and palettes hold them, in the host's byte order: swapped on a
+// little-endian host, and kept as it is on a big-endian one such as the Xbox 360.
+template <typename T>
+ALWAYS_INLINE constexpr T from_big_endian(T val) noexcept {
+  return to_big_endian(val);
+}
+
 template <typename T>
   requires(std::is_trivially_copyable_v<T>)
 ALWAYS_INLINE T unaligned_load(const void* ptr) noexcept {
@@ -129,7 +146,14 @@ template <typename T>
   requires(std::is_floating_point_v<T> && requires { typename uint_of_size_t<sizeof(T)>; })
 ALWAYS_INLINE T read_bits(const void* ptr, const std::endian e = std::endian::big) noexcept {
   using U = uint_of_size_t<sizeof(T)>;
-  return std::bit_cast<T>(read_bits<U>(ptr, e));
+  U bits = read_bits<U>(ptr, e);
+#ifdef __XSDK__
+  // With no swap between them, GCC merges the integer load and the cast into one float load, and the Xbox 360 raises
+  // an alignment exception on a float load from the command stream, whose floats sit at any byte (an lfsx in
+  // handle_aurora); its integer loads there are fine. Holding the bits in an integer register keeps the load one.
+  asm("" : "+r"(bits));
+#endif
+  return std::bit_cast<T>(bits);
 }
 
 template <typename T>
@@ -317,6 +341,14 @@ public:
 
   void clear() { m_length = 0; }
   void reserve_extra(size_t size) { resize(m_length + size, true); }
+
+  // Grows by `size` bytes and returns where they start, for writing in place.
+  [[nodiscard]] uint8_t* append_uninitialized(size_t size) {
+    resize(m_length + size, false);
+    uint8_t* out = m_data + m_length;
+    m_length += size;
+    return out;
+  }
 
   ByteBuffer clone() const {
     ByteBuffer clone{m_length};

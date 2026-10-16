@@ -87,7 +87,8 @@ target_compile_definitions(os_time_tests PRIVATE AURORA TARGET_PC=1)
 target_link_libraries(os_time_tests PRIVATE fmt::fmt gtest gtest_main)
 gtest_discover_tests(os_time_tests)
 
-if (AURORA_ENABLE_GX)
+# The GX tests build against Dawn.
+if (AURORA_USE_DAWN)
   # GX FIFO round-trip tests
   # Compile GX sources directly to avoid pulling in the full renderer/WebGPU runtime
   add_executable(gx_fifo_tests
@@ -122,6 +123,8 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/attr_fmt.cpp
     ../lib/gx/dl.cpp
     gx_dl_test.cpp
+    gx_overscan_test.cpp
+    gx_fifo_bytes_test.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE
@@ -130,7 +133,10 @@ if (AURORA_ENABLE_GX)
     ../lib/dolphin/gx
   )
 
-  target_compile_definitions(gx_fifo_tests PRIVATE AURORA TARGET_PC=1)
+  # Draws of up to 64 vertices take their indices from the index patterns, so the tests have draws either side; and
+  # the command stream has four chunks, so the tests go round it.
+  target_compile_definitions(gx_fifo_tests PRIVATE AURORA TARGET_PC=1 AURORA_INDEX_PATTERN_VERTICES=64
+                                                   AURORA_FIFO_RING_BYTES=262144)
 
   target_link_libraries(gx_fifo_tests PRIVATE
     gtest
@@ -150,6 +156,7 @@ if (AURORA_ENABLE_GX)
     gx_texture_cache_test.cpp
     gx_texture_cache_test_stubs.cpp
     ../lib/gx/texture.cpp
+    ../lib/thread.cpp
   )
   target_include_directories(gx_texture_cache_tests PRIVATE
     ../include
@@ -195,6 +202,7 @@ if (AURORA_ENABLE_GX)
     render_worker_test.cpp
     thread_test.cpp
     ../lib/gfx/render_worker.cpp
+    ../lib/gfx/frame_path.cpp
     ../lib/thread.cpp
   )
   target_include_directories(render_worker_tests PRIVATE
@@ -228,7 +236,15 @@ if (AURORA_ENABLE_GX)
   )
   aurora_copy_runtime_dlls(gfx_recording_tests)
   gtest_discover_tests(gfx_recording_tests)
-endif () # AURORA_ENABLE_GX
+endif () # AURORA_USE_DAWN
+
+# The LRU the texture, copy and offscreen caches share, which needs no GPU
+if (AURORA_ENABLE_GX)
+  add_executable(lru_cache_tests lru_cache_test.cpp)
+  target_include_directories(lru_cache_tests PRIVATE ../lib)
+  target_link_libraries(lru_cache_tests PRIVATE gtest gtest_main absl::flat_hash_map)
+  gtest_discover_tests(lru_cache_tests)
+endif ()
 
 # DVD API tests
 if (TARGET aurora::dvd)
@@ -247,6 +263,30 @@ if (TARGET aurora::dvd)
 
   gtest_discover_tests(dvd_tests)
 endif ()
+
+# The vulkan4xenon backend's GLSL generator, which needs no GPU
+add_executable(vulkan4xenon_glsl_tests
+  vulkan4xenon_glsl_test.cpp
+  ../lib/vulkan4xenon/glsl.cpp
+  ../lib/vulkan4xenon/record.cpp
+  ../lib/gx/attr_fmt.cpp
+  ../lib/gx/shader_info.cpp
+  ../lib/logging.cpp
+)
+target_include_directories(vulkan4xenon_glsl_tests PRIVATE
+  ../include
+  ../lib
+)
+target_compile_definitions(vulkan4xenon_glsl_tests PRIVATE AURORA TARGET_PC)
+target_link_libraries(vulkan4xenon_glsl_tests PRIVATE
+  gtest
+  gtest_main
+  fmt::fmt
+  xxHash::xxhash
+  absl::flat_hash_map
+  Tracy::TracyClient
+)
+gtest_discover_tests(vulkan4xenon_glsl_tests)
 
 add_executable(os_alloc_tests
   os_alloc_test.cpp

@@ -4,7 +4,6 @@
 #include "../../gfx/texture.hpp"
 #include "../../gfx/recording.hpp"
 #include "../../window.hpp"
-#include "../../webgpu/gpu.hpp"
 #include "../../gx/texture.hpp"
 #include "../vi/vi_internal.hpp"
 
@@ -69,6 +68,18 @@ aurora::gfx::ClipRect map_copy_src(const aurora::gfx::ClipRect& logicalRect) {
 } // namespace
 
 namespace aurora::gx {
+namespace {
+// Ends the pass with a copy of the copy source into texture, or none for a null one, and clears the source if asked.
+void resolve_copy_src(gfx::TextureHandle texture, GXBool clear) noexcept {
+  const auto rect = map_copy_src(g_gxState.texCopySrc);
+  const auto clearColor = clear && g_gxState.colorUpdate;
+  const auto clearAlpha = clear && g_gxState.alphaUpdate && efb_has_alpha(g_gxState.pixelFmt);
+  const auto clearDepth = clear && g_gxState.depthUpdate;
+  gfx::resolve_pass_into(std::move(texture), rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
+                         clear_depth_value(), g_gxState.texCopyFmt, g_gxState.pixelFmt);
+}
+} // namespace
+
 void copy_tex(const void* dest, GXBool clear) noexcept {
   const auto rect = map_copy_src(g_gxState.texCopySrc);
   auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight);
@@ -85,12 +96,10 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
       .format = texCopyFmt,
   });
 
-  const auto clearColor = clear && g_gxState.colorUpdate;
-  const auto clearAlpha = clear && g_gxState.alphaUpdate && efb_has_alpha(g_gxState.pixelFmt);
-  const auto clearDepth = clear && g_gxState.depthUpdate;
-  gfx::resolve_pass_into(copy.handle, rect, clearColor, clearAlpha, clearDepth, g_gxState.clearColor,
-                         clear_depth_value(), texCopyFmt, g_gxState.pixelFmt);
+  resolve_copy_src(copy.handle, clear);
 }
+
+void clear_copy_src() noexcept { resolve_copy_src({}, GX_TRUE); }
 } // namespace aurora::gx
 
 extern "C" {
@@ -160,19 +169,25 @@ void GXAdjustForOverscan(GXRenderModeObj* rmin, GXRenderModeObj* rmout, u16 hor,
   const u16 hor2 = hor * 2;
   const u16 ver2 = ver * 2;
   const u32 efbHeight = in.efbHeight;
+  const u32 mode = in.viTVmode & 3;
 
   *rmout = in;
   rmout->fbWidth = in.fbWidth - hor2;
-  rmout->efbHeight = efbHeight - (ver2 * efbHeight) / in.xfbHeight;
+  // A mode without an XFB height keeps its EFB height rather than dividing by zero.
+  if (in.xfbHeight != 0) {
+    rmout->efbHeight = efbHeight - (ver2 * efbHeight) / in.xfbHeight;
+  }
 
-  if (in.xFBmode == VI_XFBMODE_SF && (in.viTVmode & 2) != 2) {
+  // As the SDK does: only an interlaced single-strike XFB is trimmed by half, and a non-interlaced mode's VI height
+  // by twice the amount.
+  if (in.xFBmode == VI_XFBMODE_SF && mode == VI_INTERLACE) {
     rmout->xfbHeight = in.xfbHeight - ver;
   } else {
     rmout->xfbHeight = in.xfbHeight - ver2;
   }
 
   rmout->viWidth = in.viWidth - hor2;
-  rmout->viHeight = in.viHeight - ver2;
+  rmout->viHeight = in.viHeight - (mode == VI_NON_INTERLACE ? ver2 * 2 : ver2);
   rmout->viXOrigin = in.viXOrigin + hor;
   rmout->viYOrigin = in.viYOrigin + ver;
 }
@@ -239,6 +254,11 @@ void GXCopyTex(void* dest, GXBool clear) {
   SET_REG_FIELD(0, __gx->cpTex, 1, 14, 0);
   SET_REG_FIELD(0, __gx->cpTex, 8, 24, 0x52);
   GX_WRITE_RAS_REG(__gx->cpTex);
+  aurora::gx::fifo::publish();
+}
+
+void GXClearTexCopySrc(void) {
+  GX_WRITE_AURORA(GX_AURORA_CLEAR_COPY_SRC);
   aurora::gx::fifo::publish();
 }
 

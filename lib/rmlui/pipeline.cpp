@@ -4,6 +4,7 @@
 #include "../gfx/resources.hpp"
 #include "../gfx/resource_cache.hpp"
 #include "../internal.hpp"
+#include "../webgpu/backend.hpp"
 #include "../webgpu/gpu.hpp"
 
 #include <algorithm>

@@ -13,11 +13,11 @@ RenderTargetLayout base_layout() {
       .colorAttachmentCount = 1,
       .colorAttachments = {{{
           .semantic = ColorAttachmentSemantic::SceneColor,
-          .format = wgpu::TextureFormat::RGBA8Unorm,
+          .format = TextureFormat::RGBA8Unorm,
           .width = 128,
           .height = 128,
       }}},
-      .depthStencilFormat = wgpu::TextureFormat::Depth24Plus,
+      .depthStencilFormat = TextureFormat::Depth32Float,
       .sampleCount = 4,
   };
   detail::finalize_render_target_layout(layout);
@@ -28,18 +28,18 @@ TEST(RenderTargetLayoutTest, KeyChangesWithPipelineCompatibility) {
   const auto base = base_layout();
 
   auto colorFormat = base;
-  colorFormat.colorAttachments[SceneColorAttachmentIndex].format = wgpu::TextureFormat::BGRA8Unorm;
+  colorFormat.colorAttachments[SceneColorAttachmentIndex].format = TextureFormat::BGRA8Unorm;
   detail::finalize_render_target_layout(colorFormat);
   EXPECT_NE(colorFormat.key, base.key);
 
   auto colorCount = base;
   colorCount.colorAttachmentCount = 2;
-  colorCount.colorAttachments[1] = {ColorAttachmentSemantic::Normal, wgpu::TextureFormat::RGBA16Float};
+  colorCount.colorAttachments[1] = {ColorAttachmentSemantic::Normal, TextureFormat::RGB10A2Unorm};
   detail::finalize_render_target_layout(colorCount);
   EXPECT_NE(colorCount.key, base.key);
 
   auto depthFormat = base;
-  depthFormat.depthStencilFormat = wgpu::TextureFormat::Depth32Float;
+  depthFormat.depthStencilFormat = TextureFormat::Undefined;
   detail::finalize_render_target_layout(depthFormat);
   EXPECT_NE(depthFormat.key, base.key);
 
@@ -52,22 +52,22 @@ TEST(RenderTargetLayoutTest, KeyChangesWithPipelineCompatibility) {
 TEST(RenderTargetLayoutTest, RenderPassDerivesLayoutFromAttachmentState) {
   detail::RenderPass pass{
       .colorAttachmentCount = 2,
-      .depthStencilFormat = wgpu::TextureFormat::Depth24Plus,
+      .depthStencilFormat = TextureFormat::Depth32Float,
       .msaaSamples = 4,
   };
   pass.colorAttachments[SceneColorAttachmentIndex].semantic = ColorAttachmentSemantic::SceneColor;
-  pass.colorAttachments[SceneColorAttachmentIndex].format = wgpu::TextureFormat::RGBA8Unorm;
+  pass.colorAttachments[SceneColorAttachmentIndex].format = TextureFormat::RGBA8Unorm;
   pass.colorAttachments[1].semantic = ColorAttachmentSemantic::Normal;
-  pass.colorAttachments[1].format = wgpu::TextureFormat::RGBA16Float;
+  pass.colorAttachments[1].format = TextureFormat::RGB10A2Unorm;
 
   const auto initial = pass.target_layout();
   EXPECT_EQ(initial.colorAttachmentCount, 2u);
   EXPECT_EQ(initial.colorAttachments[SceneColorAttachmentIndex].semantic, ColorAttachmentSemantic::SceneColor);
-  EXPECT_EQ(initial.colorAttachments[1].format, wgpu::TextureFormat::RGBA16Float);
-  EXPECT_EQ(initial.depthStencilFormat, wgpu::TextureFormat::Depth24Plus);
+  EXPECT_EQ(initial.colorAttachments[1].format, TextureFormat::RGB10A2Unorm);
+  EXPECT_EQ(initial.depthStencilFormat, TextureFormat::Depth32Float);
   EXPECT_EQ(initial.sampleCount, 4u);
 
-  pass.colorAttachments[1].format = wgpu::TextureFormat::RG16Float;
+  pass.colorAttachments[1].format = TextureFormat::RGBA8Unorm;
   EXPECT_NE(pass.target_layout().key, initial.key);
 }
 
