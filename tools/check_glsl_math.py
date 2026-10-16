@@ -396,6 +396,7 @@ class Programs:
             return textures[key](coordinates[0], coordinates[1])
 
         result = simulate.run(blob, registers=registers, constants=self.constants("frag", values), texture_fetch=fetch)
+        self.exports = result.exports
         return result.exports.get(0), result.killed
 
 
@@ -603,8 +604,8 @@ def check_texgen(programs, name, failures):
         failures.append(f"{name}: colour {color}, want {clamp4(want)}")
 
 
-# A TEV register set past [0, 1], as GXSetTevColorS10 sets one, read by a stage before any stage writes it (milestone 18,
-# step 2): as a, b or c the stage takes its low 8 bits, as tev_overflow wraps it. TEVREG0's s10 values.
+# A TEV register set past [0, 1], as GXSetTevColorS10 sets one, read by a stage before any stage writes it
+# (milestone 18, step 2): as a, b or c the stage takes its low 8 bits, as tev_overflow wraps it. TEVREG0's s10 values.
 TEVREG0_S10 = [300, -64, 128, 1000]
 
 
@@ -616,6 +617,44 @@ def check_tev_wrap(programs, name, failures):
     want = [(c % 256) / 255.0 for c in TEVREG0_S10]
     if not close(color, want):
         failures.append(f"{name}: colour {color}, want {want}")
+
+
+# Z textures (milestone 18, step 3): TEV stage 0's texel, map 0 at texture coordinate 1, as GX's 24-bit z, replacing the
+# polygon's depth or added to it, with the bias, wrapped to 24 bits, as the WGSL does it in u32 (gx/shader.cpp). The
+# texel is whole bytes, so rounding it can't hide a byte taken wrong; ztex_add_u24's sum wraps.
+ZTEX_TEXEL = [0x12 / 255.0, 0x34 / 255.0, 0x56 / 255.0, 1.0]
+ZTEX = {"ztex_replace_u24": ("replace", 2, 0x000123), "ztex_replace_u8": ("replace", 0, 0x0000FF),
+        "ztex_add_u24": ("add", 2, 0xFF0000), "ztex_add_u8": ("add", 0, 0x000010)}
+# Four of z24's steps: the program's floats hold the sum's integers exactly only up to 2^24 (glsl.cpp, z_texture).
+ZTEX_EPS = 4.0 / 0xFFFFFF
+EXPORT_DEPTH = 61
+
+
+def ref_ztex(op, fmt, bias, clip, texel=ZTEX_TEXEL):
+    """The WGSL's frag_depth, reversed (UseReversedZ)."""
+    t = [round(c * 255.0) for c in texel[:3]]
+    z = (t[0] << 16 | t[1] << 8 | t[2] if fmt == 2 else t[0] << 16) + bias
+    if op == "add":
+        ndc = clip[2] / clip[3]
+        min_depth, max_depth = 1.0 - DEPTH_RANGE[1], 1.0 - DEPTH_RANGE[0]
+        z += int(clamp(1.0 - (min_depth + ndc * (max_depth - min_depth))) * 0xFFFFFF + 0.5)
+    return 1.0 - (z & 0xFFFFFF) / 0xFFFFFF
+
+
+def check_ztex(programs, name, failures):
+    op, fmt, bias = ZTEX[name]
+    outputs, position = programs.vertex(uniforms(), {"in_pos": POSITION, "in_tex0_uv": TEX0})
+    _, clip = ref_position(CURRENT_PNMTX)
+    check_position(position, clip, failures, name)
+    color, _ = programs.fragment(uniforms(), outputs, {(1, 0): lambda u, v: ZTEX_TEXEL}, {})
+    rasterized = CHANNEL_COLORS[1][:3] + [CHANNEL_COLORS[3][3]]
+    want = mul(ZTEX_TEXEL[:3], rasterized[:3]) + [rasterized[3]]
+    if not close(color, clamp4(want)):
+        failures.append(f"{name}: colour {color}, want {clamp4(want)}")
+    depth = programs.exports.get(EXPORT_DEPTH)
+    want_depth = ref_ztex(op, fmt, bias, clip)
+    if depth is None or abs(depth[0] - want_depth) > ZTEX_EPS:
+        failures.append(f"{name}: depth {depth[0] if depth else None}, want {want_depth}")
 
 
 # Lines and points (milestone 14): GX's line width 54, in sixths of a pixel, and a texture offset; the render viewport
@@ -658,7 +697,7 @@ def ref_corner(points, vidx, picked, mask):
             uv = [uv[0] + (LINE_TEX_OFFSET if vidx & 1 else 0.0), uv[1] + (LINE_TEX_OFFSET if vidx >= 2 else 0.0)]
     else:
         clip_a, clip_b = clip_at(0), clip_at(1)
-        delta = [(b[k] / b[3] - a[k] / a[3]) / 2.0 * render[k] for a, b, k in ((clip_a, clip_b, 0), (clip_a, clip_b, 1))]
+        delta = [(clip_b[k] / clip_b[3] - clip_a[k] / clip_a[3]) / 2.0 * render[k] for k in (0, 1)]
         direction = normalize(delta) if dot(delta, delta) > 1e-10 else [1.0, 0.0]
         perp = [-direction[1], direction[0]]
         side = 1.0 if vidx & 1 else -1.0
@@ -748,7 +787,7 @@ CHECKS = {**{name: check_lit for name in LIT}, **{name: check_fog for name in FO
           "depth_z8": check_depth, "depth_z16": check_depth, "depth_peek": check_depth,
           **{name: check_texgen for name in ("emboss", "texgen_binormal", "texgen_tangent", "texgen_prior",
                                              "texgen_prior_inline", "texgen_zero", "texgen_q_zero", "attr_defaults")},
-          "tev_reg_wrap": check_tev_wrap}
+          "tev_reg_wrap": check_tev_wrap, **{name: check_ztex for name in ZTEX}}
 
 
 def main():

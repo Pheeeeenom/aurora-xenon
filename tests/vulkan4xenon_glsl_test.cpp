@@ -272,7 +272,7 @@ TEST_P(Fog, IsWritten) {
     config.fogRangeEnabled = GetParam().range;
     const auto programs = built(config);
     ASSERT_FALSE(programs.fragment.empty());
-    EXPECT_TRUE(has(programs.vertex, "out_fog_zw = clip_pos.zw;"));
+    EXPECT_TRUE(has(programs.vertex, "out_clip_zw = clip_pos.zw;"));
     EXPECT_TRUE(has(programs.fragment, "vec4 depth_range;"));
     EXPECT_TRUE(has(programs.fragment, ortho ? "fog_base = uview.fog[1].x * fog_depth;"
                                              : "fog_base = uview.fog[1].x / (uview.fog[1].y - fog_depth);"));
@@ -452,6 +452,38 @@ gx::ShaderConfig fogged(u8 type, bool range) {
   config.fogType = type;
   config.fogRangeEnabled = range;
   return config;
+}
+
+// Milestone 18, step 3: textured(false)'s texel as a Z texture, its format the raw ztex2 encoding (gx.hpp).
+gx::ShaderConfig z_textured(GXZTexOp op, u8 format, u32 bias, bool beforeTexture = false) {
+  auto config = textured(false);
+  config.zTexOp = op;
+  config.zTexFmt = format;
+  config.zTexBias = bias;
+  config.zCompLocBeforeTex = beforeTexture;
+  return config;
+}
+
+// The depth the WGSL writes, after the colour, in floats; none where gx/shader_info.cpp's ztex_source_stage leaves the
+// Z texture alone: compared before texturing, U16, or off. The stage's texel is sampled when its colour reads none.
+TEST(ZTextures, WriteTheWgslsDepth) {
+  const auto replace = built(z_textured(GX_ZT_REPLACE, 2, 0x10));
+  EXPECT_TRUE(has(replace.fragment, "vec3 zt_t = floor(sampled0.rgb * 255.0 + 0.5);"));
+  EXPECT_TRUE(has(replace.fragment, "float zt_tex = zt_t.r * 65536.0 + zt_t.g * 256.0 + zt_t.b;"));
+  EXPECT_TRUE(has(replace.fragment, "float zt_sum = 0.0 + zt_tex + 16.0;"));
+  EXPECT_TRUE(has(replace.fragment, "gl_FragDepth = 1.0 - zt_z * (1.0 / 16777215.0);"));
+  EXPECT_FALSE(has(replace.vertex, "out_clip_zw"));
+  const auto add = built(z_textured(GX_ZT_ADD, 0, 0));
+  EXPECT_TRUE(has(add.fragment, "float zt_tex = zt_t.r * 65536.0;"));
+  EXPECT_TRUE(has(add.fragment, "float zt_sum = zt_poly + zt_tex + 0.0;"));
+  EXPECT_TRUE(has(add.vertex, "out_clip_zw = clip_pos.zw;"));
+  for (const auto& config :
+       {z_textured(GX_ZT_REPLACE, 2, 0, true), z_textured(GX_ZT_REPLACE, 1, 0), z_textured(GX_ZT_DISABLE, 2, 0)}) {
+    EXPECT_FALSE(has(built(config).fragment, "gl_FragDepth"));
+  }
+  auto unread = z_textured(GX_ZT_REPLACE, 2, 0);
+  unread.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_RASC};
+  EXPECT_TRUE(has(built(unread).fragment, "vec4 sampled0 = texture(tex0, tex1_uv);"));
 }
 
 // GX lines, a line strip or points (lineMode 1 to 3), TEV stage 0 sampling map 0 at texture coordinate 0, TEX0 as it
@@ -677,7 +709,7 @@ TEST(Texgens, FitElevenInterpolants) {
   }
   const auto programs = built(config);
   EXPECT_FALSE(programs.vertex.empty());
-  EXPECT_TRUE(has(programs.vertex, "out vec2 out_fog_zw;"));
+  EXPECT_TRUE(has(programs.vertex, "out vec2 out_clip_zw;"));
   EXPECT_TRUE(has(programs.vertex, "out vec3 out_tex7_uvw;"));
   EXPECT_TRUE(has(programs.vertex, "out vec4 out_cc1;"));
 }
@@ -739,13 +771,17 @@ TEST(MathCases, AreWritten) {
     config.tevStages[0].alphaPass = {GX_CA_A0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO};
     named("tev_reg_wrap", config);
   }
+  named("ztex_replace_u24", z_textured(GX_ZT_REPLACE, 2, 0x000123));
+  named("ztex_replace_u8", z_textured(GX_ZT_REPLACE, 0, 0x0000FF));
+  named("ztex_add_u24", z_textured(GX_ZT_ADD, 2, 0xFF0000));
+  named("ztex_add_u8", z_textured(GX_ZT_ADD, 0, 0x000010));
   named_programs("depth_z8", glsl::copy_vertex(), glsl::copy_fragment(GX_TF_Z8, false));
   named_programs("depth_z16", glsl::copy_vertex(), glsl::copy_fragment(GX_TF_Z16, false));
   named_programs("depth_peek", glsl::copy_vertex(), glsl::depth_peek_fragment());
 }
 
-// Milestone 18's console check (vulkan4xenon's tests/test_aurora_points.c, from tools/gen_aurora_points.py): step 1's
-// math cases as GX points, so each interpolant holds the one vertex's value over the point, written as
+// Milestone 18's console check (vulkan4xenon's tests/test_aurora_points.c, from tools/gen_aurora_points.py): steps 1
+// and 3's math cases as GX points, so each interpolant holds the one vertex's value over the point, written as
 // point_<name>.vert and .frag when AURORA_GLSL_CONSOLE_DIR is set.
 TEST(ConsoleCases, AreWritten) {
   const char* dir = std::getenv("AURORA_GLSL_CONSOLE_DIR");
@@ -777,6 +813,17 @@ TEST(ConsoleCases, AreWritten) {
   auto defaults = texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_TEX1, .mtx = GX_TEXMTX3}}}, 0);
   defaults.attrs[GX_VA_POS] = {};
   point("attr_defaults", defaults);
+  // Step 3's Z textures, map 0 sampled at TEX0 as it is, which gen_aurora_points.py puts at a texel's middle so the
+  // texel's bytes are whole.
+  const auto ztex = [&](std::string_view name, GXZTexOp op, u8 format, u32 bias) {
+    auto config = z_textured(op, format, bias);
+    config.tcgs[1] = {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0, .mtx = GX_IDENTITY};
+    point(name, config);
+  };
+  ztex("ztex_replace_u24", GX_ZT_REPLACE, 2, 0x000123);
+  ztex("ztex_replace_u8", GX_ZT_REPLACE, 0, 0x0000FF);
+  ztex("ztex_add_u24", GX_ZT_ADD, 2, 0xFF0000);
+  ztex("ztex_add_u8", GX_ZT_ADD, 0, 0x000010);
 }
 
 // Depth copies to Z8 and Z16, and GXPeekZ's snapshot, take GX's z from the sampled depth's red, reversed, as

@@ -44,6 +44,11 @@ using Needs = std::vector<std::string>;
 
 constexpr bool is_emboss(GXTexGenType type) noexcept { return type >= GX_TG_BUMP0 && type <= GX_TG_BUMP7; }
 
+// Fog and a Z texture added to the polygon's depth read the fragment's depth.
+bool reads_polygon_depth(const gx::ShaderConfig& config, const gx::ShaderInfo& info) noexcept {
+  return info.usesFog || (info.zTexStage >= 0 && config.zTexOp == GX_ZT_ADD);
+}
+
 bool uses_texture_sample(const gx::TevStage& stage) noexcept {
   if (stage.texMapId == GX_TEXMAP_NULL) {
     return false;
@@ -136,9 +141,9 @@ bool make_plan(const gx::ShaderConfig& config, Plan& plan, Needs& needs) {
       plan.interpolants.push_back({fmt::format("tex{}_uv", i), "vec2"sv});
     }
   }
-  if (info.usesFog) {
+  if (reads_polygon_depth(config, info)) {
     // Clip z and w, for the fragment's depth: xost gives a fragment program no gl_FragCoord.z.
-    plan.interpolants.push_back({"fog_zw"s, "vec2"sv});
+    plan.interpolants.push_back({"clip_zw"s, "vec2"sv});
   }
   if (plan.interpolants.size() > MaxInterpolants) {
     needs.push_back(fmt::format("{} interpolants", plan.interpolants.size()));
@@ -611,8 +616,8 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, Inputs& input
       projectedOf[i] = projected;
     }
   }
-  if (info.usesFog) {
-    body += "\n    out_fog_zw = clip_pos.zw;";
+  if (reads_polygon_depth(config, info)) {
+    body += "\n    out_clip_zw = clip_pos.zw;";
   }
 }
 
@@ -775,7 +780,8 @@ std::string konst_alpha(GXTevKAlphaSel sel) {
 // The program's fragment body for its TEV stages, and the final colour's locals.
 class Fragment {
 public:
-  Fragment(const gx::ShaderConfig& config, const gx::ShaderInfo& info) : m_config(config), m_fog(info.usesFog) {
+  Fragment(const gx::ShaderConfig& config, const gx::ShaderInfo& info)
+  : m_config(config), m_fog(info.usesFog), m_zTexStage(info.zTexStage) {
     static constexpr std::array zero{"vec3(0.0)"sv, "0.0"sv};
     for (u32 i = 0; i < gx::MaxTevRegs; ++i) {
       if (info.loadsTevReg.test(i)) {
@@ -843,6 +849,9 @@ public:
       return false;
     }
     m_body += fmt::format("\n    o_color = vec4({}, {});", color, alpha);
+    if (m_zTexStage >= 0) {
+      z_texture();
+    }
     return true;
   }
 
@@ -1203,14 +1212,8 @@ private:
   // plus 0.5, so x / width, wrapped by the sampler, is the middle of the column's texel along u, and the middle of its
   // row is worked out from the whole part.
   void fog(std::string_view color) {
-    m_body += gx::UseReversedZ ? "\n    // Fog"
-                                 "\n    float fog_ndc = in_fog_zw.x / in_fog_zw.y;"
-                                 "\n    float fog_depth = uview.depth_range.y - fog_ndc * (uview.depth_range.y -"
-                                 " uview.depth_range.x);"sv
-                               : "\n    // Fog"
-                                 "\n    float fog_ndc = in_fog_zw.x / in_fog_zw.y;"
-                                 "\n    float fog_depth = uview.depth_range.x + fog_ndc * (uview.depth_range.y -"
-                                 " uview.depth_range.x);"sv;
+    m_body += "\n    // Fog"sv;
+    polygon_depth("fog"sv);
     m_body += (m_config.fogType & 0x08) != 0
                   ? "\n    float fog_base = uview.fog[1].x * fog_depth;"sv
                   : "\n    float fog_base = uview.fog[1].x / (uview.fog[1].y - fog_depth);"sv;
@@ -1245,8 +1248,48 @@ private:
     m_body += fmt::format("\n    vec3 fog_color = mix({}, uview.fog[0].rgb, clamp(fog_z, 0.0, 1.0));", color);
   }
 
+  // The fragment's depth from clip z and w, as the GPU's viewport maps it, in GX's direction: prefix_depth.
+  void polygon_depth(std::string_view prefix) {
+    m_body +=
+        fmt::format(gx::UseReversedZ ? "\n    float {0}_ndc = in_clip_zw.x / in_clip_zw.y;"
+                                       "\n    float {0}_depth = uview.depth_range.y - {0}_ndc * (uview.depth_range.y -"
+                                       " uview.depth_range.x);"
+                                     : "\n    float {0}_ndc = in_clip_zw.x / in_clip_zw.y;"
+                                       "\n    float {0}_depth = uview.depth_range.x + {0}_ndc * (uview.depth_range.y -"
+                                       " uview.depth_range.x);",
+                    prefix);
+  }
+
+  // The WGSL's Z texture: the last stage's texel through its swap table as GX's 24-bit z, U24 its three bytes and U8
+  // its first, replacing the polygon's depth or added to it, with the bias, wrapped to 24 bits. In floats, which hold
+  // integers to 2^24 exactly, so a sum past it may lose its lowest bits before it's wrapped.
+  void z_texture() {
+    const auto idx = static_cast<u32>(m_zTexStage);
+    const auto& stage = m_config.tevStages[idx];
+    const auto& swap = m_config.tevSwapTable[stage.tevSwapTex];
+    const bool add = m_config.zTexOp == GX_ZT_ADD;
+    m_body +=
+        fmt::format("\n    // Z texture ({})\n    vec3 zt_t = floor({}.{}{}{} * 255.0 + 0.5);", add ? "add" : "replace",
+                    sampled(idx, stage), chan_comp(swap.red), chan_comp(swap.green), chan_comp(swap.blue));
+    m_body += m_config.zTexFmt == 2 ? "\n    float zt_tex = zt_t.r * 65536.0 + zt_t.g * 256.0 + zt_t.b;"sv
+                                    : "\n    float zt_tex = zt_t.r * 65536.0;"sv;
+    std::string_view poly = "0.0"sv;
+    if (add) {
+      polygon_depth("zt"sv);
+      m_body += "\n    float zt_poly = floor(clamp(zt_depth, 0.0, 1.0) * 16777215.0 + 0.5);"sv;
+      poly = "zt_poly"sv;
+    }
+    m_body += fmt::format(
+        "\n    float zt_sum = {} + zt_tex + {}.0;"
+        "\n    float zt_z = zt_sum - floor(zt_sum * (1.0 / 16777216.0)) * 16777216.0;",
+        poly, m_config.zTexBias);
+    m_body += gx::UseReversedZ ? "\n    gl_FragDepth = 1.0 - zt_z * (1.0 / 16777215.0);"sv
+                               : "\n    gl_FragDepth = zt_z * (1.0 / 16777215.0);"sv;
+  }
+
   const gx::ShaderConfig& m_config;
   bool m_fog;
+  s8 m_zTexStage;
   std::array<Reg, gx::MaxTevRegs> m_regs;
   std::string m_body;
 };
@@ -1461,7 +1504,8 @@ bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::stri
   for (u32 i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
     const auto uv = indirect_coord(config, info, i, texCoord, samples[i]);
-    if (!uses_texture_sample(stage)) {
+    // The Z texture's stage is sampled where its colour reads no texel too, as the WGSL samples it.
+    if (!uses_texture_sample(stage) && static_cast<s8>(i) != info.zTexStage) {
       continue;
     }
     // xost takes only a bias known when it compiles, so the material's LOD bias goes in the sampler.
