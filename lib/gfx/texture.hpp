@@ -158,6 +158,9 @@ struct SamplerConfig {
   float minLod = 0.f;
   float maxLod = 0.f;
   uint16_t maxAnisotropy = 1;
+  // The texture's LOD bias, which a backend may apply in its sampler, as vulkan4xenon's does; WebGPU's programs add it
+  // themselves (gx/shader.cpp).
+  float lodBias = 0.f;
 };
 
 struct TextureBind {

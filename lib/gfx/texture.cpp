@@ -223,9 +223,9 @@ SamplerConfig TextureBind::sampler_config() const noexcept {
     mipFilter = SamplerMipFilter::Linear;
   }
   if (gx::is_depth_format(texObj.format())) {
-    magFilter = wgpu::FilterMode::Nearest;
-    minFilter = wgpu::FilterMode::Nearest;
-    mipFilter = wgpu::MipmapFilterMode::Nearest;
+    magFilter = SamplerFilter::Nearest;
+    minFilter = SamplerFilter::Nearest;
+    mipFilter = SamplerMipFilter::Nearest;
   }
   return {
       .wrapS = texObj.wrap_s(),
@@ -236,6 +236,7 @@ SamplerConfig TextureBind::sampler_config() const noexcept {
       .minLod = minLod,
       .maxLod = maxLod,
       .maxAnisotropy = maxAnisotropy,
+      .lodBias = texObj.lod_bias(),
   };
 }
 
@@ -245,7 +246,7 @@ SamplerConfig TextureBind::sampler_config() const noexcept {
 // are the same), at a fraction of the cost.
 BindGroupRef TextureSet::hash() const noexcept {
   constexpr size_t MapBytes = sizeof(uintptr_t) + 2 * sizeof(uint32_t) + sizeof(SamplerFilter) * 2 +
-                              sizeof(SamplerMipFilter) + 2 * sizeof(uint32_t) + sizeof(uint16_t);
+                              sizeof(SamplerMipFilter) + 3 * sizeof(uint32_t) + sizeof(uint16_t);
   std::array<uint8_t, MapBytes * GX_MAX_TEXMAP> bytes;
   uint8_t* out = bytes.data();
   const auto put = [&out]<typename T>(const T& value) {
@@ -263,6 +264,7 @@ BindGroupRef TextureSet::hash() const noexcept {
     put(std::bit_cast<uint32_t>(sampler.minLod));
     put(std::bit_cast<uint32_t>(sampler.maxLod));
     put(sampler.maxAnisotropy);
+    put(std::bit_cast<uint32_t>(sampler.lodBias));
   }
   return static_cast<BindGroupRef>(XXH3_64bits(bytes.data(), bytes.size()));
 }

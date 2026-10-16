@@ -1,6 +1,6 @@
 // GLSL programs for a GX shader config, after gx/shader.cpp's WGSL in the form xost compiles; glsl.hpp has the
-// bindings they read. Configs needing what these programs don't express yet are refused: emboss, binormal and tangent
-// texgens, and more interpolants than xost gives a program (vulkan4xenon's ROADMAP.md, milestones 11 and 14).
+// bindings they read. Configs needing what these programs don't express yet are refused (vulkan4xenon's ROADMAP.md,
+// milestones 11, 14 and 18).
 #include "glsl.hpp"
 
 #include "../gfx/hash.hpp"
@@ -24,7 +24,9 @@ using namespace std::string_view_literals;
 namespace {
 constexpr Module Log{"aurora::gfx::vulkan4xenon::glsl"};
 
-constexpr size_t MaxInterpolants = 10;
+// xost's 16 interpolators, less the one the pixel parameters take after them (xsdk:src/xsc_program.c,
+// MAX_INTERPOLATORS); GX needs at most 11, two colours, eight texture coordinates and the fog's depth.
+constexpr size_t MaxInterpolants = 15;
 
 struct Interpolant {
   std::string name; // out_<name> in the vertex program, in_<name> in the fragment program
@@ -39,6 +41,8 @@ struct Plan {
 // What a config needs that these programs don't express yet, each with what a generator for it would need to know,
 // in the order make_plan finds them.
 using Needs = std::vector<std::string>;
+
+constexpr bool is_emboss(GXTexGenType type) noexcept { return type >= GX_TG_BUMP0 && type <= GX_TG_BUMP7; }
 
 bool uses_texture_sample(const gx::TevStage& stage) noexcept {
   if (stage.texMapId == GX_TEXMAP_NULL) {
@@ -91,9 +95,6 @@ bool make_plan(const gx::ShaderConfig& config, Plan& plan, Needs& needs) {
     needs.push_back(fmt::format("{} TEV stages", config.tevStageCount));
     return false; // the rest reads the stages
   }
-  if (config.attrs[GX_VA_POS].attrType == GX_NONE) {
-    needs.push_back("no positions"s);
-  }
   for (u32 attr = GX_VA_POS; attr <= GX_VA_TEX7; ++attr) {
     const auto& mapping = config.attrs[attr];
     if (mapping.attrType != GX_NONE &&
@@ -113,17 +114,19 @@ bool make_plan(const gx::ShaderConfig& config, Plan& plan, Needs& needs) {
       continue;
     }
     const auto& tcg = config.tcgs[i];
-    if (tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7) {
-      needs.push_back(fmt::format("an emboss texgen (TEXCOORD{})", i));
+    if (is_emboss(tcg.type)) {
+      // An emboss texgen offsets its source texgen's coordinates, which shader_info samples too.
+      if (tcg.embossSrc >= gx::MaxTexCoord) {
+        needs.push_back(fmt::format("emboss source {} (TEXCOORD{})", tcg.embossSrc, i));
+      }
     } else {
-      // The types and sources vertex_body writes.
+      // GX's other types and sources, all of which vertex_body writes; anything else isn't a GX texgen.
       if (tcg.type != GX_TG_MTX2x4 && tcg.type != GX_TG_MTX3x4 && tcg.type != GX_TG_SRTG) {
         needs.push_back(fmt::format("texgen type {} (TEXCOORD{})", underlying(tcg.type), i));
       }
-      if (tcg.src == GX_TG_BINRM || tcg.src == GX_TG_TANGENT) {
-        needs.push_back(fmt::format("a binormal or tangent texgen (TEXCOORD{})", i));
-      } else if (!(tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) && tcg.src != GX_TG_POS && tcg.src != GX_TG_NRM &&
-                 tcg.src != GX_TG_COLOR0 && tcg.src != GX_TG_COLOR1) {
+      if (!(tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) &&
+          !(tcg.src >= GX_TG_TEXCOORD0 && tcg.src <= GX_TG_TEXCOORD6) && tcg.src != GX_TG_POS && tcg.src != GX_TG_NRM &&
+          tcg.src != GX_TG_BINRM && tcg.src != GX_TG_TANGENT && tcg.src != GX_TG_COLOR0 && tcg.src != GX_TG_COLOR1) {
         needs.push_back(fmt::format("texgen source {} (TEXCOORD{})", underlying(tcg.src), i));
       }
     }
@@ -208,12 +211,19 @@ std::string mul3x4_at(std::string_view rows, std::string_view first, std::string
   return fmt::format("vec3(dot({0}[{1}], {2}), dot({0}[{1} + 1], {2}), dot({0}[{1} + 2], {2}))", rows, first, v);
 }
 
-std::string input_name(GXAttr attr) {
+// The vertex inputs a program reads: GX attributes, and an NBT normal's binormal and tangent after it.
+struct Inputs {
+  std::array<bool, gx::MaxVtxAttr> attrs{};
+  bool binormal = false;
+  bool tangent = false;
+};
+
+std::string input_name(GXAttr attr, NbtSlice slice = NbtSlice::Normal) {
   if (attr == GX_VA_POS) {
     return "in_pos"s;
   }
   if (attr == GX_VA_NRM) {
-    return "in_nrm"s;
+    return slice == NbtSlice::Binormal ? "in_binrm"s : slice == NbtSlice::Tangent ? "in_tangent"s : "in_nrm"s;
   }
   if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
     return fmt::format("in_clr{}", attr - GX_VA_CLR0);
@@ -230,8 +240,9 @@ std::string input_name(GXAttr attr) {
   UNLIKELY FATAL("unhandled vtx attr {}", underlying(attr));
 }
 
-// The vertex program's value of a vertex attribute, noting the inputs it reads.
-std::string vtx_attr(const gx::ShaderConfig& config, GXAttr attr, std::array<bool, gx::MaxVtxAttr>& inputs) {
+// The vertex program's value of a vertex attribute, noting the inputs it reads; for one the vertex lacks, the WGSL's
+// (gx/shader.cpp, vtx_attr): zero, or a normal along x. A texture matrix index of 0 is position matrix 0's first row.
+std::string vtx_attr(const gx::ShaderConfig& config, GXAttr attr, Inputs& inputs) {
   if (config.attrs[attr].attrType == GX_NONE) {
     if (attr == GX_VA_NRM) {
       return "vec3(1.0, 0.0, 0.0)"s;
@@ -239,10 +250,27 @@ std::string vtx_attr(const gx::ShaderConfig& config, GXAttr attr, std::array<boo
     if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
       return "vec4(0.0, 0.0, 0.0, 0.0)"s;
     }
-    UNLIKELY FATAL("unmapped vtx attr {}", underlying(attr));
+    if (attr == GX_VA_POS) {
+      return "vec3(0.0, 0.0, 0.0)"s;
+    }
+    if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
+      return "vec2(0.0, 0.0)"s;
+    }
+    return "0.0"s; // PNMTXIDX, read only when present, and TEX0MTXIDX to TEX7MTXIDX
   }
-  inputs[attr] = true;
+  inputs.attrs[attr] = true;
   return input_name(attr);
+}
+
+// An NBT normal's binormal or tangent, the vectors after the normal (gx/shader.cpp, attr_load_nbt_slice); zero for a
+// normal without them, where the WGSL stops the title.
+std::string nbt_attr(const gx::ShaderConfig& config, NbtSlice slice, Inputs& inputs) {
+  const auto& mapping = config.attrs[GX_VA_NRM];
+  if (mapping.attrType == GX_NONE || mapping.cnt != 9) {
+    return "vec3(0.0, 0.0, 0.0)"s;
+  }
+  (slice == NbtSlice::Binormal ? inputs.binormal : inputs.tangent) = true;
+  return input_name(GX_VA_NRM, slice);
 }
 
 // A light's vec4s in the lights piece: position, direction, colour, angle and distance coefficients.
@@ -351,8 +379,8 @@ std::string corner_position(const gx::ShaderConfig& config, bool perVertex) {
 
 // The texgens' types and sources are ones make_plan lets through. Sets normalMatrix when the program reads the
 // current normal matrix from its push constant.
-void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bool, gx::MaxVtxAttr>& inputs,
-                 std::string& body, bool& normalMatrix) {
+void vertex_body(const gx::ShaderConfig& config, const Plan& plan, Inputs& inputs, std::string& body,
+                 bool& normalMatrix) {
   const auto& info = plan.info;
   // A position matrix picked per vertex is read at its first row (decode.cpp's pnmtx_row); without one, the backend
   // pushes the current one.
@@ -440,86 +468,147 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
     body += fmt::format("\n    vec4 cc{0} = vec4({1}, {2});\n    out_cc{0} = cc{0};", i, color, alpha);
   }
 
-  for (u32 i = 0; i < info.sampledTexCoords.size(); ++i) {
-    if (!info.sampledTexCoords.test(i)) {
-      continue;
-    }
-    const auto& tcg = config.tcgs[i];
+  // A texgen's source as gx/shader.cpp takes it, a vec4: an attribute, a colour channel, an NBT normal's binormal or
+  // tangent, or, for TEXCOORD0 to TEXCOORD6, the source of that texgen, written here as it is there when this program
+  // doesn't generate it before.
+  std::array<bool, gx::MaxTexCoord> declared{};
+  const auto texgen_source = [&](u32 i) {
     std::string source;
-    if (tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) {
-      source = fmt::format("vec4({}, 1.0, 1.0)", vtx_attr(config, GXAttr(GX_VA_TEX0 + (tcg.src - GX_TG_TEX0)), inputs));
-    } else if (tcg.src == GX_TG_POS) {
-      source = fmt::format("vec4({}, 1.0)", vtx_attr(config, GX_VA_POS, inputs));
-    } else if (tcg.src == GX_TG_NRM) {
-      source = fmt::format("vec4({}, 1.0)", vtx_attr(config, GX_VA_NRM, inputs));
-    } else if (tcg.src == GX_TG_COLOR0 || tcg.src == GX_TG_COLOR1) {
-      // A colour-source texgen takes the channel's rasterized output, as gx/shader.cpp does.
-      const u32 ch = tcg.src == GX_TG_COLOR0 ? 0 : 1;
-      source = info.sampledColorChannels.test(ch) ? fmt::format("cc{}", ch)
-                                                  : vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + ch), inputs);
-    } else {
-      UNLIKELY FATAL("unplanned texgen source {}", underlying(tcg.src));
-    }
-    body += fmt::format("\n    vec4 tc{} = {};", i, source);
-    const auto tc = fmt::format("tc{}", i);
-    std::string value;
-    if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
-      if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
-        // A matrix picked per vertex: a position matrix below the slots past MaxPnMtx, a texture matrix from them, as
-        // the WGSL picks it; each index held in its array, as both are read. The attribute is the slot's first row
-        // (decode.cpp), and the pick's factors are 1 and 0, so the sum is the matrix picked.
-        const auto row = vtx_attr(config, static_cast<GXAttr>(GX_VA_TEX0MTXIDX + i), inputs);
-        body += fmt::format(
-            "\n    int tc{0}_pos_row = int(min({1}, {2}.0));"
-            "\n    int tc{0}_tex_row = int(clamp({1} - {3}.0, 0.0, {4}.0));"
-            "\n    float tc{0}_is_tex = step({3}.0, {1});",
-            i, row, (gx::MaxPnMtx - 1) * 3, gx::MaxPnMtx * 3, (gx::MaxTexMtx - 1) * 3);
-        value = fmt::format("{} * (1.0 - tc{}_is_tex) + {} * tc{}_is_tex",
-                            mul3x4_at("upos.mtx"sv, fmt::format("tc{}_pos_row", i), tc), i,
-                            mul3x4_at("uview.tex_mtx"sv, fmt::format("tc{}_tex_row", i), tc), i);
-      } else if (tcg.mtx == GX_IDENTITY) {
-        value = fmt::format("{}.xyz", tc);
-      } else if (tcg.mtx >= GX_TEXMTX0) {
-        value = mul3x4("uview.tex_mtx"sv, (tcg.mtx - GX_TEXMTX0) / 3 * 3, tc);
+    for (u32 depth = 0; source.empty(); ++depth) {
+      const auto src = config.tcgs[i].src;
+      if (src >= GX_TG_TEXCOORD0 && src <= GX_TG_TEXCOORD6) {
+        i = src - GX_TG_TEXCOORD0;
+        if (declared[i]) {
+          source = fmt::format("tc{}", i);
+        } else if (depth == gx::MaxTexCoord) {
+          source = "vec4(0.0, 0.0, 1.0, 1.0)"s; // TEXCOORDs naming each other round, which GX's registers can hold
+        }
+      } else if (src >= GX_TG_TEX0 && src <= GX_TG_TEX7) {
+        source = fmt::format("vec4({}, 1.0, 1.0)", vtx_attr(config, GXAttr(GX_VA_TEX0 + (src - GX_TG_TEX0)), inputs));
+      } else if (src == GX_TG_POS) {
+        source = fmt::format("vec4({}, 1.0)", vtx_attr(config, GX_VA_POS, inputs));
+      } else if (src == GX_TG_NRM) {
+        source = fmt::format("vec4({}, 1.0)", vtx_attr(config, GX_VA_NRM, inputs));
+      } else if (src == GX_TG_BINRM || src == GX_TG_TANGENT) {
+        source = fmt::format("vec4({}, 1.0)",
+                             nbt_attr(config, src == GX_TG_BINRM ? NbtSlice::Binormal : NbtSlice::Tangent, inputs));
+      } else if (src == GX_TG_COLOR0 || src == GX_TG_COLOR1) {
+        // A colour-source texgen takes the channel's rasterized output, as gx/shader.cpp does.
+        const u32 ch = src == GX_TG_COLOR0 ? 0 : 1;
+        source = info.sampledColorChannels.test(ch) ? fmt::format("cc{}", ch)
+                                                    : vtx_attr(config, static_cast<GXAttr>(GX_VA_CLR0 + ch), inputs);
       } else {
-        value = mul3x4("upos.mtx"sv, tcg.mtx / 3 * 3, tc);
+        source = "vec4(0.0, 0.0, 1.0, 1.0)"s; // not a GX source; make_plan refuses a sampled texgen of one
       }
-      if (tcg.type == GX_TG_MTX2x4) {
-        body += fmt::format("\n    vec3 tc{0}_mtx = {1};", i, value);
-        value = fmt::format("vec3(tc{}_mtx.xy, 1.0)", i);
+    }
+    return source;
+  };
+
+  // Each texgen's coordinates, before an emboss texgen that offsets them: the emboss ones come after the others, so
+  // the coordinates they offset are written whatever their order (shader_info samples them).
+  std::array<std::string, gx::MaxTexCoord> projectedOf;
+  for (const bool emboss : {false, true}) {
+    for (u32 i = 0; i < info.sampledTexCoords.size(); ++i) {
+      if (!info.sampledTexCoords.test(i) || is_emboss(config.tcgs[i].type) != emboss) {
+        continue;
       }
-    } else if (tcg.type == GX_TG_SRTG) {
-      value = fmt::format("vec3({}.xy, 1.0)", tc);
-    } else {
-      UNLIKELY FATAL("unplanned texgen type {}", underlying(tcg.type));
-    }
-    body += fmt::format("\n    vec3 tc{}_tmp = {};", i, value);
-    std::string tmp = fmt::format("tc{}_tmp", i);
-    if (tcg.normalize) {
-      body += fmt::format("\n    vec3 tc{0}_norm = normalize({1});", i, tmp);
-      tmp = fmt::format("tc{}_norm", i);
-    }
-    std::string projected = tmp;
-    if (tcg.postMtx != GX_PTIDENTITY) {
-      body += fmt::format("\n    vec4 tc{0}_post = vec4({1}, 1.0);\n    vec3 tc{0}_proj = {2};", i, tmp,
-                          mul3x4("uview.postmtx"sv, (tcg.postMtx - GX_PTTEXMTX0) / 3 * 3, fmt::format("tc{}_post", i)));
-      projected = fmt::format("tc{}_proj", i);
-    }
-    if (config.lineMode != 0) {
-      // The texture offset, where the draw's mask moves this coordinate: on a segment's moved side, or a point's right
-      // and lower corners.
-      const auto moved = fmt::format("(uview.line_params.z * upush.line_mask[{}].{})", i / 4, "xyzw"[i % 4]);
-      body +=
-          config.lineMode == 3
-              ? fmt::format("\n    vec3 tc{0}_line = {1} + vec3(in_corner * 0.5 + 0.5, 0.0) * {2};", i, projected,
-                            moved)
-              : fmt::format("\n    vec3 tc{0}_line = {1} + vec3(0.0, in_corner.y, 0.0) * {2};", i, projected, moved);
-      projected = fmt::format("tc{}_line", i);
-    }
-    if (tcg.type == GX_TG_MTX3x4) {
-      body += fmt::format("\n    out_tex{}_uvw = {};", i, projected);
-    } else {
-      body += fmt::format("\n    out_tex{}_uv = {}.xy;", i, projected);
+      const auto& tcg = config.tcgs[i];
+      if (emboss) {
+        // The source's coordinates moved by the direction to the texgen's light along the tangent and the binormal in
+        // view space (gx/shader.cpp, is_emboss_texgen), the normal matrix turning them as it does the normal.
+        const auto nrmMtx = [&](std::string_view v) {
+          return perVertex ? mul3x4_at("unrm.mtx"sv, "pnmtx"sv, v) : mul3x4("upush.nrm_mtx"sv, 0, v);
+        };
+        normalMatrix = normalMatrix || !perVertex;
+        const auto& source = projectedOf[tcg.embossSrc];
+        body += fmt::format(
+            "\n    vec3 bump{0}_ldir = normalize(ulights.lights[{1}].xyz - mv_pos4.xyz);"
+            "\n    vec4 bump{0}_tan4 = vec4({2}, 0.0);"
+            "\n    vec4 bump{0}_bin4 = vec4({3}, 0.0);"
+            "\n    vec2 bump{0}_uv = {4}.xy + vec2(dot(bump{0}_ldir, {5}), dot(bump{0}_ldir, {6}));"
+            "\n    out_tex{0}_uv = bump{0}_uv;",
+            i, (tcg.type - GX_TG_BUMP0) * LightVec4s, nbt_attr(config, NbtSlice::Tangent, inputs),
+            nbt_attr(config, NbtSlice::Binormal, inputs), source.empty() ? "vec3(0.0)"s : source,
+            nrmMtx(fmt::format("bump{}_tan4", i)), nrmMtx(fmt::format("bump{}_bin4", i)));
+        // A local, as xost loads no vertex output back, for an emboss texgen of this one.
+        projectedOf[i] = fmt::format("vec3(bump{}_uv, 1.0)", i);
+        continue;
+      }
+      body += fmt::format("\n    vec4 tc{} = {};", i, texgen_source(i));
+      declared[i] = true;
+      const auto tc = fmt::format("tc{}", i);
+      std::string value;
+      if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+        if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+          // A matrix picked per vertex: a position matrix below the slots past MaxPnMtx, a texture matrix from them, as
+          // the WGSL picks it; each index held in its array, as both are read. The attribute is the slot's first row
+          // (decode.cpp), and the pick's factors are 1 and 0, so the sum is the matrix picked.
+          const auto row = vtx_attr(config, static_cast<GXAttr>(GX_VA_TEX0MTXIDX + i), inputs);
+          body += fmt::format(
+              "\n    int tc{0}_pos_row = int(min({1}, {2}.0));"
+              "\n    int tc{0}_tex_row = int(clamp({1} - {3}.0, 0.0, {4}.0));"
+              "\n    float tc{0}_is_tex = step({3}.0, {1});",
+              i, row, (gx::MaxPnMtx - 1) * 3, gx::MaxPnMtx * 3, (gx::MaxTexMtx - 1) * 3);
+          value = fmt::format("{} * (1.0 - tc{}_is_tex) + {} * tc{}_is_tex",
+                              mul3x4_at("upos.mtx"sv, fmt::format("tc{}_pos_row", i), tc), i,
+                              mul3x4_at("uview.tex_mtx"sv, fmt::format("tc{}_tex_row", i), tc), i);
+        } else if (tcg.mtx == GX_IDENTITY) {
+          value = fmt::format("{}.xyz", tc);
+        } else if (tcg.mtx >= GX_TEXMTX0) {
+          value = mul3x4("uview.tex_mtx"sv, (tcg.mtx - GX_TEXMTX0) / 3 * 3, tc);
+        } else {
+          value = mul3x4("upos.mtx"sv, tcg.mtx / 3 * 3, tc);
+        }
+        if (tcg.type == GX_TG_MTX2x4) {
+          body += fmt::format("\n    vec3 tc{0}_mtx = {1};", i, value);
+          value = fmt::format("vec3(tc{}_mtx.xy, 1.0)", i);
+        }
+      } else {
+        value = fmt::format("vec3({}.xy, 1.0)", tc); // GX_TG_SRTG, the one other type make_plan lets through
+      }
+      body += fmt::format("\n    vec3 tc{}_tmp = {};", i, value);
+      std::string tmp = fmt::format("tc{}_tmp", i);
+      if (tcg.normalize) {
+        // Normalized unless it's nearly zero, as the WGSL keeps it, by a factor of 1 or 0 as the normal is.
+        body += fmt::format(
+            "\n    float tc{0}_len2 = dot({1}, {1});"
+            "\n    vec3 tc{0}_norm = {1} * mix(1.0, inversesqrt(max(tc{0}_len2, 1e-10)), step(1e-10, tc{0}_len2));",
+            i, tmp);
+        tmp = fmt::format("tc{}_norm", i);
+      }
+      std::string projected = tmp;
+      if (tcg.postMtx != GX_PTIDENTITY) {
+        body +=
+            fmt::format("\n    vec4 tc{0}_post = vec4({1}, 1.0);\n    vec3 tc{0}_proj = {2};", i, tmp,
+                        mul3x4("uview.postmtx"sv, (tcg.postMtx - GX_PTTEXMTX0) / 3 * 3, fmt::format("tc{}_post", i)));
+        projected = fmt::format("tc{}_proj", i);
+      }
+      if (tcg.type == GX_TG_MTX3x4) {
+        // A q of exactly 0 takes half the coordinates, held in -1 to 1, at a q of 0, as the WGSL does; the factor is 1
+        // only then.
+        body += fmt::format(
+            "\n    float tc{0}_q0 = step(abs({1}.z), 0.0);"
+            "\n    vec3 tc{0}_q = mix({1}, vec3(clamp({1}.xy * 0.5, -1.0, 1.0), 0.0), tc{0}_q0);",
+            i, projected);
+        projected = fmt::format("tc{}_q", i);
+      }
+      if (config.lineMode != 0) {
+        // The texture offset, where the draw's mask moves this coordinate: on a segment's moved side, or a point's
+        // right and lower corners.
+        const auto moved = fmt::format("(uview.line_params.z * upush.line_mask[{}].{})", i / 4, "xyzw"[i % 4]);
+        body +=
+            config.lineMode == 3
+                ? fmt::format("\n    vec3 tc{0}_line = {1} + vec3(in_corner * 0.5 + 0.5, 0.0) * {2};", i, projected,
+                              moved)
+                : fmt::format("\n    vec3 tc{0}_line = {1} + vec3(0.0, in_corner.y, 0.0) * {2};", i, projected, moved);
+        projected = fmt::format("tc{}_line", i);
+      }
+      if (tcg.type == GX_TG_MTX3x4) {
+        body += fmt::format("\n    out_tex{}_uvw = {};", i, projected);
+      } else {
+        body += fmt::format("\n    out_tex{}_uv = {}.xy;", i, projected);
+      }
+      projectedOf[i] = projected;
     }
   }
   if (info.usesFog) {
@@ -529,30 +618,37 @@ void vertex_body(const gx::ShaderConfig& config, const Plan& plan, std::array<bo
 
 // Attribute locations as xost gives them usages: position 0, colour 0 1, texture coordinates from 2 (resolve.py), and
 // the rest after them, in decode_vertices' order; a line's or point's corners' own values last.
-VertexLayout make_layout(const gx::ShaderConfig& config, const std::array<bool, gx::MaxVtxAttr>& inputs) {
+VertexLayout make_layout(const gx::ShaderConfig& config, const Inputs& inputs) {
   VertexLayout layout;
-  const auto add = [&](GXAttr attr, uint32_t location, AttrFormat format, uint32_t size) {
-    layout.attributes.push_back({location, format, layout.stride, attr});
+  const auto add = [&](GXAttr attr, uint32_t location, AttrFormat format, uint32_t size,
+                       NbtSlice slice = NbtSlice::Normal) {
+    layout.attributes.push_back({location, format, layout.stride, attr, slice});
     layout.stride += size;
   };
   add(GX_VA_POS, 0, AttrFormat::F32x3, 12);
-  if (inputs[GX_VA_CLR0]) {
+  if (inputs.attrs[GX_VA_CLR0]) {
     add(GX_VA_CLR0, 1, AttrFormat::U8x4, 4);
   }
   uint32_t location = 2;
   for (u32 attr = GX_VA_TEX0; attr <= GX_VA_TEX7; ++attr) {
-    if (inputs[attr]) {
+    if (inputs.attrs[attr]) {
       add(static_cast<GXAttr>(attr), location++, AttrFormat::F32x2, 8);
     }
   }
-  if (inputs[GX_VA_NRM]) {
+  if (inputs.attrs[GX_VA_NRM]) {
     add(GX_VA_NRM, location++, AttrFormat::F32x3, 12);
   }
-  if (inputs[GX_VA_CLR1]) {
+  if (inputs.binormal) {
+    add(GX_VA_NRM, location++, AttrFormat::F32x3, 12, NbtSlice::Binormal);
+  }
+  if (inputs.tangent) {
+    add(GX_VA_NRM, location++, AttrFormat::F32x3, 12, NbtSlice::Tangent);
+  }
+  if (inputs.attrs[GX_VA_CLR1]) {
     add(GX_VA_CLR1, location++, AttrFormat::U8x4, 4);
   }
   for (u32 attr = GX_VA_PNMTXIDX; attr <= GX_VA_TEX7MTXIDX; ++attr) {
-    if (inputs[attr]) {
+    if (inputs.attrs[attr]) {
       add(static_cast<GXAttr>(attr), location++, AttrFormat::F32x1, 4);
     }
   }
@@ -565,7 +661,7 @@ VertexLayout make_layout(const gx::ShaderConfig& config, const std::array<bool, 
   }
   if (config.lineMode == 1 || config.lineMode == 2) {
     corner(CornerValue::OtherPos, AttrFormat::F32x3, 12);
-    if (inputs[GX_VA_PNMTXIDX]) {
+    if (inputs.attrs[GX_VA_PNMTXIDX]) {
       corner(CornerValue::OtherPnmtx, AttrFormat::F32x1, 4);
     }
   }
@@ -609,7 +705,7 @@ std::string vertex_source(const Plan& plan, const VertexLayout& layout, const st
                           : "layout(push_constant, std140) uniform Push {\n    vec4 pos_mtx[3];\n} upush;\n"s;
   for (const auto& attribute : layout.attributes) {
     decls += fmt::format("layout(location = {}) in {} {};\n", attribute.location, input_type(attribute.format),
-                         input_name(attribute.attr));
+                         input_name(attribute.attr, attribute.slice));
   }
   for (const auto& corner : layout.corners) {
     decls += fmt::format("layout(location = {}) in {} {};\n", corner.location, input_type(corner.format),
@@ -683,17 +779,22 @@ public:
     static constexpr std::array zero{"vec3(0.0)"sv, "0.0"sv};
     for (u32 i = 0; i < gx::MaxTevRegs; ++i) {
       if (info.loadsTevReg.test(i)) {
-        m_regs[i] = {fmt::format("umat.tevreg[{}].rgb", i), fmt::format("umat.tevreg[{}].a", i), true, true};
+        // As the game set it, which GXSetTevColorS10 may leave past [0, 1], so wrapped where a stage reads it, as the
+        // WGSL wraps a register no stage has written yet (gx/shader.cpp, build_shader_source).
+        m_regs[i] = {fmt::format("umat.tevreg[{}].rgb", i), fmt::format("umat.tevreg[{}].a", i), false, false};
       } else {
         m_regs[i] = {std::string{zero[0]}, std::string{zero[1]}, true, true};
       }
     }
   }
 
-  // Each stage's colour and alpha into a local of their own, as the stage's output register then holds them.
-  void stages() {
+  // Each stage's colour and alpha into a local of their own, as the stage's output register then holds them, each
+  // after its own sampling, samples: a texel then lives only from its stage's sample to its last read, so a program
+  // of many stages fits xost's registers.
+  void stages(const std::vector<std::string>& samples) {
     for (u32 idx = 0; idx < m_config.tevStageCount; ++idx) {
       const auto& stage = m_config.tevStages[idx];
+      m_body += samples[idx];
       const auto& c = stage.colorPass;
       const auto& a = stage.alphaPass;
       // The operands in order, as each may add a local of its own.
@@ -1344,25 +1445,31 @@ bool fragment_source(const gx::ShaderConfig& config, const Plan& plan, std::stri
       continue;
     }
     if (config.tcgs[i].type == GX_TG_MTX3x4) {
-      pre += fmt::format("\n    vec2 tex{0}_uv = in_tex{0}_uvw.xy / in_tex{0}_uvw.z;", i);
+      // Divided by q, unless q is nearly 0, as the WGSL guards it: then the coordinates as they are.
+      pre += fmt::format(
+          "\n    float tex{0}_near = step(abs(in_tex{0}_uvw.z), 1e-6);"
+          "\n    vec2 tex{0}_uv = in_tex{0}_uvw.xy / mix(in_tex{0}_uvw.z, 1.0, tex{0}_near);",
+          i);
     } else {
       pre += fmt::format("\n    vec2 tex{0}_uv = in_tex{0}_uv;", i);
     }
   }
   indirect_textures(config, info, pre);
+  // Each stage's indirect coordinates and sample, written just before the stage (Fragment::stages).
+  std::vector<std::string> samples(config.tevStageCount);
   std::string texCoord = "vec2(0.0)"s;
   for (u32 i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
-    const auto uv = indirect_coord(config, info, i, texCoord, pre);
+    const auto uv = indirect_coord(config, info, i, texCoord, samples[i]);
     if (!uses_texture_sample(stage)) {
       continue;
     }
     // xost takes only a bias known when it compiles, so the material's LOD bias goes in the sampler.
-    pre += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, {2});", i, underlying(stage.texMapId),
-                       uv.empty() ? fmt::format("tex{}_uv", underlying(stage.texCoordId)) : uv);
+    samples[i] += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, {2});", i, underlying(stage.texMapId),
+                              uv.empty() ? fmt::format("tex{}_uv", underlying(stage.texCoordId)) : uv);
   }
   Fragment fragment(config, info);
-  fragment.stages();
+  fragment.stages(samples);
   if (!fragment.finish()) {
     return false;
   }
@@ -1395,7 +1502,7 @@ Programs build_programs(const gx::ShaderConfig& config) {
     return {};
   }
   Programs programs;
-  std::array<bool, gx::MaxVtxAttr> inputs{};
+  Inputs inputs;
   std::string body;
   vertex_body(config, plan, inputs, body, programs.normalMatrix);
   if (!fragment_source(config, plan, programs.fragment)) {

@@ -80,10 +80,15 @@ class PackedAlphaCompare : public testing::TestWithParam<PackedCompare> {};
 // A packed compare in the alpha op compares the colour operands a and b, as gx/shader.cpp does since encounter's
 // 3094e04: the key is from the colours' channels, and the alpha operands a and b aren't read.
 TEST_P(PackedAlphaCompare, ComparesTheColourOperands) {
-  const auto line = alpha_line(compare_config(GetParam().op));
+  const auto config = compare_config(GetParam().op);
+  const auto line = alpha_line(config);
   ASSERT_FALSE(line.empty());
-  EXPECT_NE(line.find(fmt::format("({}){}", C0, GetParam().key)), std::string::npos) << line;
-  EXPECT_NE(line.find(fmt::format("({}){}", C1, GetParam().key)), std::string::npos) << line;
+  // The operands as the stage reads them: TEVREG0 and TEVREG1 wrapped, as no stage has written them (milestone 18).
+  EXPECT_NE(line.find(fmt::format("s0_color_a{}", GetParam().key)), std::string::npos) << line;
+  EXPECT_NE(line.find(fmt::format("s0_color_b{}", GetParam().key)), std::string::npos) << line;
+  const auto fragment = glsl::build_programs(config).fragment;
+  EXPECT_NE(fragment.find(fmt::format("vec3 s0_color_a = (({}) * 255.0 - floor", C0)), std::string::npos) << fragment;
+  EXPECT_NE(fragment.find(fmt::format("vec3 s0_color_b = (({}) * 255.0 - floor", C1)), std::string::npos) << fragment;
   EXPECT_EQ(line.find(A0), std::string::npos) << line;
   EXPECT_EQ(line.find(A1), std::string::npos) << line;
 }
@@ -99,11 +104,17 @@ INSTANTIATE_TEST_SUITE_P(
 // The alpha op's RGB8 compare is A8: it compares the alpha operands.
 TEST(AlphaCompareA8, ComparesTheAlphaOperands) {
   for (const GXTevOp op : {GX_TEV_COMP_A8_GT, GX_TEV_COMP_A8_EQ}) {
-    const auto line = alpha_line(compare_config(op));
+    const auto config = compare_config(op);
+    const auto line = alpha_line(config);
     ASSERT_FALSE(line.empty());
-    EXPECT_NE(line.find(fmt::format("floor(({}) * 255.0 + 0.5)", A0)), std::string::npos) << line;
-    EXPECT_NE(line.find(fmt::format("floor(({}) * 255.0 + 0.5)", A1)), std::string::npos) << line;
+    EXPECT_NE(line.find("floor(s0_alpha_a * 255.0 + 0.5)"), std::string::npos) << line;
+    EXPECT_NE(line.find("floor(s0_alpha_b * 255.0 + 0.5)"), std::string::npos) << line;
     EXPECT_EQ(line.find(".rgb"), std::string::npos) << line;
+    const auto fragment = glsl::build_programs(config).fragment;
+    EXPECT_NE(fragment.find(fmt::format("float s0_alpha_a = (({}) * 255.0 - floor", A0)), std::string::npos)
+        << fragment;
+    EXPECT_NE(fragment.find(fmt::format("float s0_alpha_b = (({}) * 255.0 - floor", A1)), std::string::npos)
+        << fragment;
   }
 }
 
@@ -565,6 +576,112 @@ TEST(Corners, AreEachPointsFourCorners) {
                  {{0, -1, -1, -1}, {0, -1, 1, -1}, {0, -1, 1, 1}, {0, -1, 1, 1}, {0, -1, -1, 1}, {0, -1, -1, -1}});
 }
 
+// Milestone 18, step 1: TEV stage 0 sampling map 0 at texture coordinate `coord`, times the rasterized colour, with
+// TEX0 and, when `nbt`, an NBT normal (normal, binormal, tangent), and the texgens given.
+gx::ShaderConfig texgens(std::initializer_list<std::pair<u32, gx::TcgConfig>> tcgs, u32 coord, bool nbt = false) {
+  auto config = rasterized();
+  config.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32, .offset = 12};
+  config.vtxStride = 20;
+  if (nbt) {
+    config.attrs[GX_VA_NRM] = {.attrType = GX_DIRECT, .cnt = 9, .compType = GX_F32, .offset = 20};
+    config.vtxStride = 56;
+  }
+  for (const auto& [i, tcg] : tcgs) {
+    config.tcgs[i] = tcg;
+  }
+  auto& stage = config.tevStages[0];
+  stage.texCoordId = static_cast<GXTexCoordID>(coord);
+  stage.texMapId = GX_TEXMAP0;
+  stage.colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, GX_CC_ZERO};
+  return config;
+}
+
+// Texture coordinate 1 embossed from texture coordinate 0, TEX0 as it is, by light 2.
+gx::ShaderConfig embossed() {
+  return texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0, .mtx = GX_IDENTITY}},
+                  {1, {.type = GX_TG_BUMP2, .src = GX_TG_TEXCOORD0, .embossSrc = 0}}},
+                 1, true);
+}
+
+// A texgen from TEXCOORD0 takes texgen 0's source, TEX0 (gx/shader.cpp): written once texgen 0 is, or as it would be.
+gx::ShaderConfig prior(bool sampled) {
+  auto config = texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_TEX0, .mtx = GX_TEXMTX3}},
+                         {1, {.type = GX_TG_MTX2x4, .src = GX_TG_TEXCOORD0, .mtx = GX_TEXMTX2}}},
+                        sampled ? 0 : 1);
+  if (sampled) {
+    // Stage 0 samples coordinate 0 and stage 1 coordinate 1 times it.
+    config.tevStageCount = 2;
+    config.tevStages[0].colorPass = {GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC};
+    auto& stage = config.tevStages[1];
+    stage = config.tevStages[0];
+    stage.texCoordId = GX_TEXCOORD1;
+    stage.colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_CPREV, GX_CC_ZERO};
+  }
+  return config;
+}
+
+TEST(Texgens, EmbossReadsTheBinormalAndTangentAfterTheNormal) {
+  const auto programs = built(embossed());
+  ASSERT_FALSE(programs.vertex.empty());
+  std::vector<glsl::NbtSlice> slices;
+  for (const auto& attribute : programs.layout.attributes) {
+    if (attribute.attr == GX_VA_NRM) {
+      slices.push_back(attribute.slice);
+    }
+  }
+  EXPECT_EQ(slices, (std::vector{glsl::NbtSlice::Binormal, glsl::NbtSlice::Tangent}));
+  EXPECT_TRUE(has(programs.vertex, "in vec3 in_binrm;"));
+  EXPECT_TRUE(has(programs.vertex, "in vec3 in_tangent;"));
+  EXPECT_TRUE(has(programs.vertex, "normalize(ulights.lights[10].xyz - mv_pos4.xyz)"));
+  EXPECT_TRUE(has(programs.vertex, "upush.nrm_mtx"));
+}
+
+TEST(Texgens, ReadZeroForWhatTheVertexLacks) {
+  // No binormals without an NBT normal, no position, and no TEX1.
+  auto config = texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_BINRM, .mtx = GX_TEXMTX3}},
+                         {1, {.type = GX_TG_MTX2x4, .src = GX_TG_TEX1, .mtx = GX_TEXMTX3}}},
+                        0);
+  config.attrs[GX_VA_POS] = {};
+  config.tevStageCount = 2;
+  config.tevStages[1] = config.tevStages[0];
+  config.tevStages[1].texCoordId = GX_TEXCOORD1;
+  const auto programs = built(config);
+  ASSERT_FALSE(programs.vertex.empty());
+  EXPECT_TRUE(has(programs.vertex, "vec4 pos4 = vec4(vec3(0.0, 0.0, 0.0), 1.0);"));
+  EXPECT_TRUE(has(programs.vertex, "vec4 tc0 = vec4(vec3(0.0, 0.0, 0.0), 1.0);"));
+  EXPECT_TRUE(has(programs.vertex, "vec4 tc1 = vec4(vec2(0.0, 0.0), 1.0, 1.0);"));
+  EXPECT_FALSE(has(programs.vertex, "in_binrm"));
+  EXPECT_FALSE(has(programs.vertex, "in_tex1_uv"));
+}
+
+TEST(Texgens, TakeAPriorTexgensSource) {
+  EXPECT_TRUE(has(built(prior(true)).vertex, "vec4 tc1 = tc0;"));
+  EXPECT_TRUE(has(built(prior(false)).vertex, "vec4 tc1 = vec4(in_tex0_uv, 1.0, 1.0);"));
+}
+
+TEST(Texgens, FitElevenInterpolants) {
+  // Both colours, eight 3x4 texgens and the fog: GX's most.
+  auto config = rasterized();
+  config.attrs[GX_VA_TEX0] = {.attrType = GX_DIRECT, .cnt = 2, .compType = GX_F32, .offset = 12};
+  config.vtxStride = 20;
+  config.fogType = GX_FOG_PERSP_LIN;
+  config.tevStageCount = 8;
+  for (u32 i = 0; i < 8; ++i) {
+    config.tcgs[i] = {.type = GX_TG_MTX3x4, .src = GX_TG_TEX0, .mtx = GX_TEXMTX3};
+    auto& stage = config.tevStages[i];
+    stage = config.tevStages[0];
+    stage.texCoordId = static_cast<GXTexCoordID>(i);
+    stage.texMapId = GX_TEXMAP0;
+    stage.channelId = i == 1 ? GX_COLOR1A1 : GX_COLOR0A0;
+    stage.colorPass = {GX_CC_ZERO, GX_CC_TEXC, GX_CC_RASC, i == 0 ? GX_CC_ZERO : GX_CC_CPREV};
+  }
+  const auto programs = built(config);
+  EXPECT_FALSE(programs.vertex.empty());
+  EXPECT_TRUE(has(programs.vertex, "out vec2 out_fog_zw;"));
+  EXPECT_TRUE(has(programs.vertex, "out vec3 out_tex7_uvw;"));
+  EXPECT_TRUE(has(programs.vertex, "out vec4 out_cc1;"));
+}
+
 TEST(MathCases, AreWritten) {
   named("lit_spot_clamp", lit(GX_DF_CLAMP, GX_AF_SPOT, 0x05));
   named("lit_spec_sign_alpha", lit(GX_DF_SIGN, GX_AF_SPEC, 0x06, true));
@@ -598,9 +715,68 @@ TEST(MathCases, AreWritten) {
   named("line_current", lines(1, false));
   named("line_picked", lines(2, true));
   named("points", lines(3, false));
+  named("emboss", embossed());
+  named("texgen_binormal", texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_BINRM, .mtx = GX_TEXMTX3}}}, 0, true));
+  named("texgen_tangent", texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_TANGENT, .mtx = GX_TEXMTX4}}}, 0, true));
+  named("texgen_prior", prior(true));
+  named("texgen_prior_inline", prior(false));
+  // A 3x4 texgen of the position, normalized: at a position of 0, nothing to normalize and a q of 0.
+  named("texgen_zero",
+        texgens({{0, {.type = GX_TG_MTX3x4, .src = GX_TG_POS, .mtx = GX_IDENTITY, .normalize = true}}}, 0));
+  // A 3x4 texgen through post-transform matrix 0, whose q check_glsl_math.py's matrix makes 0.
+  named("texgen_q_zero",
+        texgens({{0, {.type = GX_TG_MTX3x4, .src = GX_TG_TEX0, .mtx = GX_IDENTITY, .postMtx = GX_PTTEXMTX0}}}, 0));
+  {
+    // No position, and a texgen from TEX1, which the vertex lacks.
+    auto config = texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_TEX1, .mtx = GX_TEXMTX3}}}, 0);
+    config.attrs[GX_VA_POS] = {};
+    named("attr_defaults", config);
+  }
+  {
+    // Milestone 18, step 2: TEVREG0 as stage 0's a, set past [0, 1] and written by no stage before, so wrapped.
+    auto config = rasterized();
+    config.tevStages[0].colorPass = {GX_CC_C0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO};
+    config.tevStages[0].alphaPass = {GX_CA_A0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO};
+    named("tev_reg_wrap", config);
+  }
   named_programs("depth_z8", glsl::copy_vertex(), glsl::copy_fragment(GX_TF_Z8, false));
   named_programs("depth_z16", glsl::copy_vertex(), glsl::copy_fragment(GX_TF_Z16, false));
   named_programs("depth_peek", glsl::copy_vertex(), glsl::depth_peek_fragment());
+}
+
+// Milestone 18's console check (vulkan4xenon's tests/test_aurora_points.c, from tools/gen_aurora_points.py): step 1's
+// math cases as GX points, so each interpolant holds the one vertex's value over the point, written as
+// point_<name>.vert and .frag when AURORA_GLSL_CONSOLE_DIR is set.
+TEST(ConsoleCases, AreWritten) {
+  const char* dir = std::getenv("AURORA_GLSL_CONSOLE_DIR");
+  const auto point = [&](std::string_view name, gx::ShaderConfig config) {
+    config.lineMode = 3;
+    const auto programs = built(config);
+    ASSERT_FALSE(programs.vertex.empty()) << name;
+    for (const auto& [suffix, text] :
+         {std::pair{".vert"sv, &programs.vertex}, std::pair{".frag"sv, &programs.fragment}}) {
+      if (dir == nullptr) {
+        continue;
+      }
+      const auto path = fmt::format("{}/point_{}{}", dir, name, suffix);
+      std::FILE* file = std::fopen(path.c_str(), "wb");
+      ASSERT_NE(file, nullptr) << path;
+      std::fwrite(text->data(), 1, text->size(), file);
+      std::fclose(file);
+    }
+  };
+  point("emboss", embossed());
+  point("texgen_binormal", texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_BINRM, .mtx = GX_TEXMTX3}}}, 0, true));
+  point("texgen_tangent", texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_TANGENT, .mtx = GX_TEXMTX4}}}, 0, true));
+  point("texgen_prior", prior(true));
+  point("texgen_prior_inline", prior(false));
+  point("texgen_zero",
+        texgens({{0, {.type = GX_TG_MTX3x4, .src = GX_TG_POS, .mtx = GX_IDENTITY, .normalize = true}}}, 0));
+  point("texgen_q_zero",
+        texgens({{0, {.type = GX_TG_MTX3x4, .src = GX_TG_TEX0, .mtx = GX_IDENTITY, .postMtx = GX_PTTEXMTX0}}}, 0));
+  auto defaults = texgens({{0, {.type = GX_TG_MTX2x4, .src = GX_TG_TEX1, .mtx = GX_TEXMTX3}}}, 0);
+  defaults.attrs[GX_VA_POS] = {};
+  point("attr_defaults", defaults);
 }
 
 // Depth copies to Z8 and Z16, and GXPeekZ's snapshot, take GX's z from the sampled depth's red, reversed, as

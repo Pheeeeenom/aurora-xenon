@@ -102,6 +102,7 @@ uint64_t sampler_key(const SamplerConfig& config) noexcept {
   hasher.update(std::bit_cast<uint32_t>(config.minLod));
   hasher.update(std::bit_cast<uint32_t>(config.maxLod));
   hasher.update(config.maxAnisotropy);
+  hasher.update(std::bit_cast<uint32_t>(config.lodBias));
   return hasher.digest();
 }
 
@@ -232,11 +233,9 @@ VkSampler sampler(const SamplerConfig& config) noexcept {
   if (const auto it = g_samplers.find(key); it != g_samplers.end()) {
     return it->second;
   }
-  // The layer refuses a minLod above 0 and ignores maxLod (vulkan4xenon's docs/SUPPORT.md, Samplers), and GX's
-  // come in sixteenths. So a texture GX keeps off its finest levels draws sharper here, and one it keeps off its
-  // coarsest samples them anyway. Anisotropy as Aurora's rules give it (gfx/texture.cpp, sampler_config), at most the
-  // layer's 16, which its sampler rounds down to a power of two.
-  const bool linearMips = config.mipFilter == SamplerMipFilter::Linear;
+  // The texture's LOD bias and clamps, which the layer puts in the fetch constant, the clamps to the nearest whole
+  // levels, where GX's come in sixteenths (vulkan4xenon's docs/SUPPORT.md, Samplers). Anisotropy as Aurora's rules give
+  // it (gfx/texture.cpp, sampler_config), at most the layer's 16, which its sampler rounds down to a power of two.
   const float anisotropy = std::min(static_cast<float>(config.maxAnisotropy), max_anisotropy());
   const VkSamplerCreateInfo info{
       .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
@@ -247,18 +246,20 @@ VkSampler sampler(const SamplerConfig& config) noexcept {
       .addressModeU = address_mode(config.wrapS),
       .addressModeV = address_mode(config.wrapT),
       .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+      .mipLodBias = config.lodBias,
       .anisotropyEnable = anisotropy > 1.f,
       .maxAnisotropy = std::max(anisotropy, 1.f),
-      .minLod = 0.f,
-      .maxLod = linearMips ? std::floor(config.maxLod) : config.maxLod,
+      .minLod = config.minLod,
+      .maxLod = config.maxLod,
   };
   VkSampler value = VK_NULL_HANDLE;
   if (!succeeded(vkCreateSampler(g_device, &info, nullptr, &value), "vkCreateSampler")) {
     // Under its key all the same, so it fails once.
-    Log.error("Drawing with the fallback sampler in place of one vulkan4xenon refused (filters {} {} {}, LOD {} to {}, "
-              "anisotropy {})",
-              static_cast<int>(config.magFilter), static_cast<int>(config.minFilter),
-              static_cast<int>(config.mipFilter), config.minLod, config.maxLod, config.maxAnisotropy);
+    Log.error(
+        "Drawing with the fallback sampler in place of one vulkan4xenon refused (filters {} {} {}, LOD {} to {}, "
+        "bias {}, anisotropy {})",
+        static_cast<int>(config.magFilter), static_cast<int>(config.minFilter), static_cast<int>(config.mipFilter),
+        config.minLod, config.maxLod, config.lodBias, config.maxAnisotropy);
     value = g_fallbackSampler;
   }
   g_samplers.emplace(key, value);

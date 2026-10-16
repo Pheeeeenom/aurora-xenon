@@ -267,6 +267,7 @@ endif ()
 # The vulkan4xenon backend's GLSL generator, which needs no GPU
 add_executable(vulkan4xenon_glsl_tests
   vulkan4xenon_glsl_test.cpp
+  vulkan4xenon_glsl_coverage.cpp
   ../lib/vulkan4xenon/glsl.cpp
   ../lib/vulkan4xenon/record.cpp
   ../lib/gx/attr_fmt.cpp

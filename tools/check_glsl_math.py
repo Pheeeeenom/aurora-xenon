@@ -3,8 +3,9 @@
 writes for its named configs (MathCases, AURORA_GLSL_NAMED_DIR) on xost's simulator, compiled as the game's pack is,
 glslang to SPIR-V and xost to Xenos microcode, and compares what they compute with this tool's own reference of
 lib/gx/shader.cpp's WGSL: lighting, fog with its range adjustment, matrices picked per vertex and indirect texturing
-(vulkan4xenon's milestone 11, step 5), the corners of lines and points (milestone 14), and GX's z in depth copies
-and GXPeekZ's snapshot (milestone 14, step 5).
+(vulkan4xenon's milestone 11, step 5), the corners of lines and points (milestone 14), GX's z in depth copies
+and GXPeekZ's snapshot (milestone 14, step 5), and emboss, binormal, tangent and prior-texgen sources with the
+zero guards and missing attributes (milestone 18, step 1).
 
     check_glsl_math.py --xost <xost tree> [--glslang <glslang>] <directory of named programs>
 
@@ -535,6 +536,88 @@ def check_scene(programs, name, failures):
         failures.append(f"{name}: colour {color}, want {want}")
 
 
+# Texgens (milestone 18, step 1): emboss, binormal and tangent sources, a prior texgen's source, the guards for a zero
+# vector and a q of 0, and attributes the vertex lacks. The vertex's NBT normal has this binormal and tangent after it.
+BINORMAL = [0.7, -0.1, 0.3]
+TANGENT = [-0.2, 0.4, 0.85]
+# Post-transform matrix 0 for texgen_q_zero: a third row of 0, so q is 0, and x and y away from 0, inside -2 to 2.
+POST_Q_ZERO = [[0.8, 0.1, 0.0, 0.3], [0.2, 1.1, 0.0, -0.4], [0.0, 0.0, 0.0, 0.0]]
+
+
+def ref_emboss():
+    """shader.cpp's emboss: texgen 0's coordinates, TEX0 as it is, moved by the direction to light 2 from the vertex in
+    view space, along the tangent and the binormal the current normal matrix turns."""
+    mv, _ = ref_position(CURRENT_PNMTX)
+    ldir = normalize(sub(LIGHTS[2][0], mv))
+    tangent = rows3x4(nrm_matrix(CURRENT_PNMTX), TANGENT + [0.0])
+    binormal = rows3x4(nrm_matrix(CURRENT_PNMTX), BINORMAL + [0.0])
+    return [TEX0[0] + dot(ldir, tangent), TEX0[1] + dot(ldir, binormal)]
+
+
+def ref_texgen_uvs(name):
+    """Where the stages sample map 0, in their order."""
+    tex0 = TEX0 + [1.0, 1.0]
+    if name == "emboss":
+        return [ref_emboss()]
+    if name == "texgen_binormal":
+        return [rows3x4(tex_matrix(3), BINORMAL + [1.0])[:2]]
+    if name == "texgen_tangent":
+        return [rows3x4(tex_matrix(4), TANGENT + [1.0])[:2]]
+    if name == "texgen_prior":                    # texgen 1 takes texgen 0's source, TEX0, by its own matrix
+        return [rows3x4(tex_matrix(3), tex0)[:2], rows3x4(tex_matrix(2), tex0)[:2]]
+    if name == "texgen_prior_inline":
+        return [rows3x4(tex_matrix(2), tex0)[:2]]
+    if name == "texgen_zero":                     # nothing to normalize, then a q of 0 at the vertex and the pixel
+        return [[0.0, 0.0]]
+    if name == "texgen_q_zero":                   # q is 0: half of x and y, held in -1 to 1, and no divide
+        proj = rows3x4(POST_Q_ZERO, tex0)         # the post matrix times vec4(tc.xyz, 1), tc.xyz = (u, v, 1)
+        return [[clamp(proj[0] * 0.5, -1.0, 1.0), clamp(proj[1] * 0.5, -1.0, 1.0)]]
+    return [rows3x4(tex_matrix(3), [0.0, 0.0, 1.0, 1.0])[:2]]   # attr_defaults: TEX1 is 0
+
+
+def check_texgen(programs, name, failures):
+    # texgen_zero's position is 0; attr_defaults has none, so what its slot holds mustn't be read.
+    at_zero = name in ("texgen_zero", "attr_defaults")
+    position_in = {"texgen_zero": [0.0, 0.0, 0.0], "attr_defaults": [9.0, 9.0, 9.0]}.get(name, POSITION)
+    attributes = {"in_pos": position_in, "in_nrm": NORMAL, "in_binrm": BINORMAL, "in_tangent": TANGENT,
+                  "in_tex0_uv": TEX0}
+    values = uniforms()
+    if name == "texgen_q_zero":
+        values["uview.postmtx"] = POST_Q_ZERO
+    outputs, position = programs.vertex(values, attributes)
+    mv = rows3x4(pos_matrix(CURRENT_PNMTX), ([0.0, 0.0, 0.0] if at_zero else POSITION) + [1.0])
+    check_position(position, [dot(row, mv + [1.0]) for row in PROJ], failures, name)
+    uvs = ref_texgen_uvs(name)
+    sampled = {}
+    color, _ = programs.fragment(values, outputs, {(1, 0): image}, sampled)
+    got = sampled.get((1, 0), [])
+    # In any order: xost may fetch a later stage's texel first.
+    if len(got) != len(uvs) or not all(close(g, w, 1e-5) for g, w in zip(sorted(got), sorted(uvs))):
+        failures.append(f"{name}: map 0 sampled at {got}, want {uvs}")
+    rasterized = CHANNEL_COLORS[1][:3] + [CHANNEL_COLORS[3][3]]
+    if name == "texgen_prior":                    # stage 1's texel times stage 0's
+        want = mul(image(*uvs[1])[:3], image(*uvs[0])[:3]) + [rasterized[3]]
+    else:
+        want = mul(image(*uvs[0])[:3], rasterized[:3]) + [rasterized[3]]
+    if not close(color, clamp4(want)):
+        failures.append(f"{name}: colour {color}, want {clamp4(want)}")
+
+
+# A TEV register set past [0, 1], as GXSetTevColorS10 sets one, read by a stage before any stage writes it (milestone 18,
+# step 2): as a, b or c the stage takes its low 8 bits, as tev_overflow wraps it. TEVREG0's s10 values.
+TEVREG0_S10 = [300, -64, 128, 1000]
+
+
+def check_tev_wrap(programs, name, failures):
+    values = uniforms()
+    values["umat.tevreg"] = [[0.0] * 4, [c / 255.0 for c in TEVREG0_S10], [0.0] * 4, [0.0] * 4]
+    outputs, _ = programs.vertex(values, {"in_pos": POSITION})
+    color, _ = programs.fragment(values, outputs, {}, {})
+    want = [(c % 256) / 255.0 for c in TEVREG0_S10]
+    if not close(color, want):
+        failures.append(f"{name}: colour {color}, want {want}")
+
+
 # Lines and points (milestone 14): GX's line width 54, in sixths of a pixel, and a texture offset; the render viewport
 # twice the logical one across and half again down, so the width scales by the smaller, 1.5. A segment's two ends, or
 # the point at the first: position, TEX0 and the matrix it picks.
@@ -662,7 +745,10 @@ CHECKS = {**{name: check_lit for name in LIT}, **{name: check_fog for name in FO
           "texmtx_fixed": check_texmtx, "texmtx_picked": check_texmtx, "indirect_mtx": check_indirect,
           "indirect_dynamic_s": check_indirect, "indirect_bump": check_indirect, "scene": check_scene,
           "line_current": check_lines, "line_picked": check_lines, "points": check_lines,
-          "depth_z8": check_depth, "depth_z16": check_depth, "depth_peek": check_depth}
+          "depth_z8": check_depth, "depth_z16": check_depth, "depth_peek": check_depth,
+          **{name: check_texgen for name in ("emboss", "texgen_binormal", "texgen_tangent", "texgen_prior",
+                                             "texgen_prior_inline", "texgen_zero", "texgen_q_zero", "attr_defaults")},
+          "tev_reg_wrap": check_tev_wrap}
 
 
 def main():

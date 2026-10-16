@@ -198,6 +198,16 @@ void decode_attribute(const gx::ShaderConfig& config, const Attribute& attribute
                       const gx::DrawImmediateData& immediates, size_t vertex, Pool verts, Pool storage, Reach& reach,
                       uint8_t* value) noexcept {
   const auto& mapping = config.attrs[attribute.attr];
+  if (mapping.attrType == GX_NONE) {
+    // An attribute the vertex lacks, which only the position's slot can be (glsl.cpp, make_layout): zero, as the
+    // program reads it.
+    const float zeros[3]{};
+    write_floats(value, zeros,
+                 attribute.format == AttrFormat::F32x3   ? 3
+                 : attribute.format == AttrFormat::F32x2 ? 2
+                                                         : 1);
+    return;
+  }
   if (attribute.attr == GX_VA_PNMTXIDX) {
     const auto address = attr_address(mapping, attribute.attr, vertex, 0, 0, verts, storage, immediates);
     const float row = pnmtx_row(load_u8(address.pool, address.offset));
