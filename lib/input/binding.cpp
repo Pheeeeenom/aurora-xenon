@@ -172,17 +172,23 @@ struct State::Impl {
 
   [[nodiscard]] float aggregate(ControlId control) const {
     const auto bindings = list();
-    const auto producerValues = producers | std::views::values | std::views::transform([control](const Producer& p) {
-                                  const auto it = p.find(control);
-                                  return it != p.end() ? it->second : 0.f;
-                                });
+    // melee-pc: plain loops, not std::views::values (the iOS SDK's libc++ lacks it)
+    const auto producerValue = [&](const Producer& p) {
+      const auto it = p.find(control);
+      return it != p.end() ? it->second : 0.f;
+    };
     if (kind_of(control) == ControlKind::Button) {
       for (size_t i = 0; i < bindings.size(); ++i) {
         if (bindings[i].target == control && contributions[i] != 0.f) {
           return 1.f;
         }
       }
-      return std::ranges::any_of(producerValues, [](float value) { return value >= 0.5f; }) ? 1.f : 0.f;
+      for (const auto& entry : producers) {
+        if (producerValue(entry.second) >= 0.5f) {
+          return 1.f;
+        }
+      }
+      return 0.f;
     }
     float sum = 0.f;
     for (size_t i = 0; i < bindings.size(); ++i) {
@@ -190,8 +196,8 @@ struct State::Impl {
         sum += contributions[i];
       }
     }
-    for (const float value : producerValues) {
-      sum += value;
+    for (const auto& entry : producers) {
+      sum += producerValue(entry.second);
     }
     return std::clamp(sum, -1.f, 1.f);
   }
@@ -246,8 +252,8 @@ struct State::Impl {
   std::vector<ControlChange> cancel_all() {
     admitted.clear();
     std::ranges::fill(contributions, 0.f);
-    for (auto& producer : producers | std::views::values) {
-      producer.clear();
+    for (auto& entry : producers) {
+      entry.second.clear();
     }
     std::vector<ControlChange> changes;
     changes.reserve(values.size());
@@ -264,8 +270,11 @@ struct State::Impl {
     if (it == producers.end()) {
       return changes;
     }
-    const auto keys = std::views::keys(it->second);
-    const std::vector<ControlId> controls{keys.begin(), keys.end()};
+    std::vector<ControlId> controls;
+    controls.reserve(it->second.size());
+    for (const auto& entry : it->second) {
+      controls.push_back(entry.first);
+    }
     if (remove) {
       producers.erase(it);
     } else {

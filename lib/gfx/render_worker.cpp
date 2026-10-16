@@ -191,6 +191,11 @@ size_t FrameSlotPool::free_count() const {
 }
 
 void initialize() {
+#ifdef __EMSCRIPTEN__
+  // Browser WebGPU handles belong to the owning JavaScript realm.
+  g_workerThreadId=std::this_thread::get_id();
+  return;
+#endif
   if (g_running.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
@@ -198,6 +203,7 @@ void initialize() {
   g_pendingItems.store(0, std::memory_order_release);
   g_thread = thread::Thread{{
                                 .name = "Aurora render worker",
+                                .priority = thread::Priority::High,
                                 .affinity = thread::Affinity::SharedCache,
                             },
                             worker_main};

@@ -61,7 +61,27 @@
 
 #define PAD_BUTTON_COUNT 12
 
+// Virtual bits synthesized by HSD's pad layer (sysdolphin controller.c).
+#define PAD_STICK_UP (1 << 16)
+#define PAD_STICK_DOWN (1 << 17)
+#define PAD_STICK_LEFT (1 << 18)
+#define PAD_STICK_RIGHT (1 << 19)
+#define PAD_SUBSTICK_UP (1 << 20)
+#define PAD_SUBSTICK_DOWN (1 << 21)
+#define PAD_SUBSTICK_LEFT (1 << 22)
+#define PAD_SUBSTICK_RIGHT (1 << 23)
+#define PAD_TRIGGER_LR (1 << 31)
+#define PAD_CONFIRM (1ULL << 32)
+#define PAD_CANCEL (1ULL << 33)
+#define PAD_LR_START (1ULL << 34)
+#define PAD_LRA_START (1ULL << 35)
+#define PAD_ANY_UP (1ULL << 36)
+#define PAD_ANY_DOWN (1ULL << 37)
+#define PAD_ANY_LEFT (1ULL << 38)
+#define PAD_ANY_RIGHT (1ULL << 39)
+
 // added by Aurora, not present in original SDK
+void PADSetSamplingRate(u32 msec);
 #define PAD_AXIS_LEFT_X_POS 0
 #define PAD_AXIS_LEFT_X_NEG 1
 #define PAD_AXIS_LEFT_Y_POS 2

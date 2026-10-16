@@ -2,6 +2,12 @@
 #include "../internal.hpp"
 #include "dolphin/os.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+
 static aurora::Module Log("aurora::ar");
 
 static u32 AR_StackPointer;
@@ -17,13 +23,19 @@ static BOOL AR_init_flag;
 // and using a simple bump allocator (matching ARAlloc behavior on real hardware).
 static u8* sAramBuffer = nullptr;
 
-// Convert an ARAM "address" (offset) to a real host pointer
-static u8* aramToHost(u32 aramAddr) {
-  if (!sAramBuffer || aramAddr >= aurora::g_config.mem2Size) {
+// Convert an ARAM "address" (offset) to a real host pointer. `length` is the
+// size of the access: a transfer that starts inside ARAM but runs past its end
+// must be rejected, not clipped to the start check.
+static u8* aramToHost(u32 aramAddr, u32 length) {
+  const u32 size = aurora::g_config.mem2Size;
+  if (!sAramBuffer || aramAddr >= size || length > size - aramAddr) {
     return nullptr;
   }
   return sAramBuffer + aramAddr;
 }
+
+// melee-pc: the audio mixer decodes samples straight out of ARAM.
+extern "C" u8* aurora_aram_base(void) { return sAramBuffer; }
 
 u32 ARAlloc(u32 length) {
   u32 tmp;
@@ -82,34 +94,120 @@ u32 ARGetSize(void) { return aurora::g_config.mem2Size; }
 #if !defined(_MSC_VER)
 #pragma mark ARQ
 #endif
-void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest,
-                    u32 length, ARQCallback callback) {
-  // Emulate ARAM DMA transfers using memcpy.
+// ARQ requests complete asynchronously, like real DMA: the transfer and its
+// callback run on a worker thread. Games commonly post a request while
+// interrupts are disabled and finish updating their bookkeeping before the
+// callback may run; a synchronous callback would re-enter that code.
+namespace {
+struct ArqJob {
+  ARQRequest* request;
+  u32 type;
+  uintptr_t source;
+  uintptr_t dest;
+  u32 length;
+  ARQCallback callback;
+};
+std::mutex sArqMutex;
+std::condition_variable sArqCv;
+std::deque<ArqJob> sArqQueue;
+std::thread sArqThread;
+bool sArqStop = false;
+std::atomic<int> sArqInflight{0};
+
+void arq_transfer(const ArqJob& job) {
   // type 0 = MRAM -> ARAM, type 1 = ARAM -> MRAM
-  if (type == ARAM_DIR_MRAM_TO_ARAM) {
-    // Main RAM -> ARAM: source is a host pointer (cast to u32), dest is an ARAM offset
-    u8* hostSrc = (u8*)(uintptr_t)source;
-    u8* aramDst = aramToHost(dest);
+  if (job.type == ARAM_DIR_MRAM_TO_ARAM) {
+    u8* hostSrc = reinterpret_cast<u8*>(job.source);
+    u8* aramDst = aramToHost(static_cast<u32>(job.dest), job.length);
     if (aramDst && hostSrc) {
-      memcpy(aramDst, hostSrc, length);
+      memcpy(aramDst, hostSrc, job.length);
     }
   } else {
-    // ARAM -> Main RAM: source is an ARAM offset, dest is a host pointer (cast to u32)
-    u8* aramSrc = aramToHost(source);
-    u8* hostDst = (u8*)(uintptr_t)dest;
+    u8* aramSrc = aramToHost(static_cast<u32>(job.source), job.length);
+    u8* hostDst = reinterpret_cast<u8*>(job.dest);
     if (aramSrc && hostDst) {
-      memcpy(hostDst, aramSrc, length);
+      memcpy(hostDst, aramSrc, job.length);
     }
-  }
-
-  // Immediately invoke the callback (synchronous on PC, no DMA latency)
-  if (callback) {
-    callback((uintptr_t)request);
   }
 }
 
+void arq_worker() {
+  std::unique_lock lock{sArqMutex};
+  while (!sArqStop) {
+    if (sArqQueue.empty()) {
+      sArqCv.wait(lock);
+      continue;
+    }
+    ArqJob job = sArqQueue.front();
+    sArqQueue.pop_front();
+    lock.unlock();
+    arq_transfer(job);
+    if (job.callback) {
+      job.callback(job.request);
+    }
+    sArqInflight.fetch_sub(1, std::memory_order_release);
+    lock.lock();
+  }
+}
+} // namespace
+
+void ARQPostRequest(ARQRequest* request, uintptr_t owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest,
+                    u32 length, ARQCallback callback) {
+  // The SDK records the request parameters in the request itself; callbacks
+  // read them back (e.g. `owner` carries the caller's context).
+  request->next = nullptr;
+  request->owner = owner;
+  request->type = type;
+  request->priority = priority;
+  request->source = source;
+  request->dest = dest;
+  request->length = length;
+  request->callback = callback;
+  {
+    std::lock_guard lock{sArqMutex};
+    sArqInflight.fetch_add(1, std::memory_order_relaxed);
+    sArqQueue.push_back(ArqJob{request, type, source, dest, length, callback});
+  }
+  sArqCv.notify_one();
+}
+
+extern "C" int aurora_arq_inflight() { return sArqInflight.load(std::memory_order_acquire); }
+
+#ifdef __EMSCRIPTEN__
+extern "C" void browser_arq_deliver() {
+  static bool delivering=false;
+  if(delivering)return;
+  delivering=true;
+  size_t count=sArqQueue.size();
+  while(count-- && !sArqQueue.empty()) {
+    ArqJob job=sArqQueue.front();sArqQueue.pop_front();
+    arq_transfer(job);
+    if(job.callback)job.callback(job.request);
+  }
+  delivering=false;
+}
+#endif
 void ARQInit() {
-  // Nothing to do on PC - ARAM is initialized in ARInit
+#ifdef __EMSCRIPTEN__
+  return;
+#endif
+  std::lock_guard lock{sArqMutex};
+  if (!sArqThread.joinable()) {
+    sArqStop = false;
+    sArqThread = std::thread{arq_worker};
+  }
+}
+
+void ARQReset() {
+  {
+    std::lock_guard lock{sArqMutex};
+    sArqStop = true;
+    sArqQueue.clear();
+  }
+  sArqCv.notify_all();
+  if (sArqThread.joinable()) {
+    sArqThread.join();
+  }
 }
 
 void* ARGetStorageAddress() {

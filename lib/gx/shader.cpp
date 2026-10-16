@@ -10,6 +10,7 @@
 #include <dolphin/gx/GXEnum.h>
 
 #include <absl/container/flat_hash_set.h>
+#include <absl/container/flat_hash_map.h>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -568,6 +569,15 @@ std::string vtx_attr(const ShaderConfig& config, GXAttr attr) {
     if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
       return "vec4f(0.0, 0.0, 0.0, 0.0)"s;
     }
+    if (attr == GX_VA_POS) {
+      return "vec3f(0.0, 0.0, 0.0)"s;
+    }
+    if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
+      return "vec2f(0.0, 0.0)"s;
+    }
+    if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
+      return "0u"s;
+    }
     UNLIKELY FATAL("unmapped vtx attr {}", underlying(attr));
   }
   if (attr == GX_VA_POS) {
@@ -695,7 +705,7 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   const auto [offs, buf, le] = attr_address(mapping, attr, vidx, config.vtxStride, 0u, 0u);
   switch (attr) {
   case GX_VA_PNMTXIDX:
-    return fmt::format("(raw_fetch_u8_1(&{}, {}) / 3u)", buf, offs);
+    return fmt::format("min(raw_fetch_u8_1(&{}, {}) / 3u, {}u)", buf, offs, MaxPnMtx - 1);
   case GX_VA_TEX0MTXIDX:
   case GX_VA_TEX1MTXIDX:
   case GX_VA_TEX2MTXIDX:
@@ -991,7 +1001,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     }
     vidxAttr = "in_vidx"sv;
   } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
-    vtxXfrAttrsPre += "\n    let in_pnmtxidx = imm.current_pnmtx;";
+    vtxXfrAttrsPre += fmt::format("\n    let in_pnmtxidx = min(imm.current_pnmtx, {}u);", MaxPnMtx - 1);
   }
 
   // Load vertex attributes
@@ -1261,11 +1271,13 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
-        vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
+        vtxXfrAttrs += fmt::format(
+            "\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[min(in_texmtxidx{0} / 3u, {1}u)];", i,
+            MaxPnMtx + MaxTexMtx - 1);
       } else if (tcg.mtx == GX_IDENTITY) {
         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0}.xyz;", i);
       } else {
-        u32 texMtxIdx = (tcg.mtx) / 3;
+        u32 texMtxIdx = std::min(static_cast<u32>(tcg.mtx / 3), MaxPnMtx + MaxTexMtx - 1);
         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
       }
       if (tcg.type == GX_TG_MTX2x4) {
@@ -1275,7 +1287,8 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = vec3f(tc{0}.xy, 1.0f);", i);
     }
     if (tcg.normalize) {
-      vtxXfrAttrs += fmt::format("\n    tc{0}_tmp = normalize(tc{0}_tmp);", i);
+      vtxXfrAttrs += fmt::format(
+          "\n    tc{0}_tmp = select(tc{0}_tmp, normalize(tc{0}_tmp), dot(tc{0}_tmp, tc{0}_tmp) > 1e-10);", i);
     }
     if (tcg.postMtx == GX_PTIDENTITY) {
       vtxXfrAttrs += fmt::format("\n    var tc{0}_proj = tc{0}_tmp;", i);
@@ -1283,6 +1296,13 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       u32 postMtxIdx = (tcg.postMtx - GX_PTTEXMTX0) / 3;
       vtxXfrAttrs +=
           fmt::format("\n    var tc{0}_proj = vec4f(tc{0}_tmp.xyz, 1.0) * ubuf.postmtx[{1}];", i, postMtxIdx);
+    }
+    if (tcg.type == GX_TG_MTX3x4) {
+      vtxXfrAttrs += fmt::format(
+          "\n    if (tc{0}_proj.z == 0.0f) {{"
+          "\n        tc{0}_proj = vec3f(clamp(tc{0}_proj.xy * 0.5f, vec2f(-1.0f), vec2f(1.0f)), 0.0f);"
+          "\n    }}",
+          i);
     }
     // Apply line/point tex offset
     if (config.lineMode == 3) {
@@ -1303,7 +1323,10 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     }
     if (tcg.type == GX_TG_MTX3x4) {
       vtxXfrAttrs += fmt::format("\n    out.tex{0}_uvw = tc{0}_proj.xyz;", i);
-      fragmentFnPre += fmt::format("\n    var tex{0}_uv = in.tex{0}_uvw.xy / in.tex{0}_uvw.z;", i);
+      fragmentFnPre += fmt::format(
+          "\n    let tex{0}_q = select(in.tex{0}_uvw.z, 1.0f, abs(in.tex{0}_uvw.z) < 1e-6f);"
+          "\n    var tex{0}_uv = select(in.tex{0}_uvw.xy / tex{0}_q, in.tex{0}_uvw.xy, abs(in.tex{0}_uvw.z) < 1e-6f);",
+          i);
     } else {
       vtxXfrAttrs += fmt::format("\n    out.tex{0}_uv = tc{0}_proj.xy;", i);
       fragmentFnPre += fmt::format("\n    var tex{0}_uv = in.tex{0}_uv.xy;", i);
@@ -1363,7 +1386,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
     const bool hasIndirectStage = stage.indTexStage < config.numIndStages;
     const bool needsTevTexCoord =
         needsIndirectCoord || stage.indTexWrapS != GX_ITW_OFF || stage.indTexWrapT != GX_ITW_OFF || stage.indTexAddPrev;
-    const bool needsTextureSample = uses_texture_sample(stage);
+    const bool needsTextureSample = uses_texture_sample(stage) || i == info.zTexStage;
     if (!needsTevTexCoord && !needsTextureSample) {
       continue;
     }
@@ -1529,9 +1552,26 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
       // No indirect texturing
       uvIn = fmt::format("tex{0}_uv", underlying(stage.texCoordId));
     }
-    fragmentFnPre +=
-        fmt::format("\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
-                    underlying(stage.texMapId), uvIn);
+    // EFB copies (including projected fighter shadows) have only level zero.
+    // Avoid implicit LOD for those textures: projected coordinates outside the
+    // image produced black samples on Intel Vulkan even with a clamped sampler.
+    // Keep implicit derivatives and LOD bias for textures that actually have mips.
+    // AURORA_LEGACY_TEX_LOD=1 restores the old unconditional bias sample: the
+    // positive control for the black-floor sweep, so the detector is testable.
+    static const bool legacyTexLod = getenv("AURORA_LEGACY_TEX_LOD") != nullptr;
+    if (legacyTexLod) {
+      fragmentFnPre += fmt::format(
+          "\n    var sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);", i,
+          underlying(stage.texMapId), uvIn);
+    } else {
+      fragmentFnPre += fmt::format(
+          "\n    var sampled{0}: vec4f;"
+          "\n    if (textureNumLevels(tex{1}) == 1u) {{"
+          "\n        sampled{0} = textureSampleLevel(tex{1}, tex{1}_samp, {2}, 0.0);"
+          "\n    }} else {{"
+          "\n        sampled{0} = textureSampleBias(tex{1}, tex{1}_samp, {2}, ubuf.tex{1}_size_bias.z);"
+          "\n    }}", i, underlying(stage.texMapId), uvIn);
+    }
   }
   if (info.usesPTTexMtx.any()) {
     uniBufAttrs += fmt::format("\n    postmtx: array<mat3x4f, {}>,", MaxPTTexMtx);
@@ -1644,45 +1684,95 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
   }
 
   if (dstAlphaMode == DstAlphaMode::Replace) {
-    // GX destination alpha is set via the blend constant
-    fragmentFn += "\n    prev.a = 1.0;";
+    fragmentFn += "\n prev.a = 1.0;";
   }
 
-  std::string fragmentOutput;
-  std::string_view fragmentOutputType = "@location(0) vec4f"sv;
-  std::string fragmentReturn = "\n    return prev;"s;
-  if (normalAttachment != UINT32_MAX) {
-    fragmentOutput = fmt::format(
-        "\nstruct FragmentOutput {{\n"
-        "    @location(0) color: vec4f,\n"
-        "    @location({}) normal: vec4f,\n"
-        "}};\n",
-        normalAttachment);
-    fragmentOutputType = "FragmentOutput"sv;
-    fragmentReturn = "\n    var out: FragmentOutput;\n    out.color = prev;";
-    if (useNormalTarget) {
-      fragmentReturn +=
-          "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
-          "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
-          "\n    out.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
-    } else {
-      fragmentReturn += "\n    out.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
+  // Fragment output: default is a single colour location. Two independent
+  // optional outputs each need a struct return -- the scene normal attachment
+  // writes a second @location (upstream), and Z texture writes
+  // @builtin(frag_depth) (melee-pc). Emit a single FragmentOutput carrying
+  // whichever (or both) is active.
+  //
+  // Z texture: the fragment depth is derived from the last TEV stage's
+  // texture sample. Only reached with compare-after-texture selected
+  // (ztex_source_stage refuses the before-texture case), so writing
+  // frag_depth and losing early-Z is exactly the late depth test
+  // GXSetZCompLoc(GX_FALSE) asked for.
+  std::string fragOutStruct;
+  std::string_view fragRetType = "@location(0) vec4f"sv;
+  std::string fragReturn = "\n    return prev;"s;
+  const bool wantNormal = normalAttachment != UINT32_MAX;
+  const bool wantZTex = info.zTexStage >= 0;
+  const bool wantDualSource = dstAlphaMode == DstAlphaMode::DualSource;
+  if (wantNormal || wantZTex || wantDualSource) {
+    std::string members = wantDualSource
+                              ? "    @location(0) @blend_src(0) color: vec4f,\n"
+                                "    @location(0) @blend_src(1) blend: vec4f,\n"
+                              : "    @location(0) color: vec4f,\n";
+    if (wantNormal) {
+      members += fmt::format("    @location({}) normal: vec4f,\n", normalAttachment);
     }
-    fragmentReturn += "\n    return out;";
+    if (wantZTex) {
+      members += "    @builtin(frag_depth) depth: f32,\n";
+    }
+    fragOutStruct = fmt::format("\nstruct FragmentOutput {{\n{}}};\n", members);
+    fragRetType = "FragmentOutput"sv;
+    fragReturn = "\n var out_frag: FragmentOutput;";
+    if (wantDualSource) {
+      fragReturn += "\n out_frag.color = vec4f(prev.rgb, 1.0);"
+                    "\n out_frag.blend = prev;";
+    } else {
+      fragReturn += "\n out_frag.color = prev;";
+    }
+    if (wantNormal) {
+      if (useNormalTarget) {
+        fragReturn +=
+            "\n    let nrm_len_sq = dot(in.mv_nrm, in.mv_nrm);"
+            "\n    let unit_nrm = select(vec3f(0.0), normalize(in.mv_nrm), nrm_len_sq > 1e-10);"
+            "\n    out_frag.normal = vec4f(unit_nrm * 0.5 + 0.5, select(0.0, 1.0, nrm_len_sq > 1e-10));";
+      } else {
+        fragReturn += "\n    out_frag.normal = vec4f(0.5, 0.5, 0.5, 0.0);";
+      }
+    }
+    if (wantZTex) {
+      const auto& stage = config.tevStages[info.zTexStage];
+      // Same swap table the TEV colour input mux would have applied.
+      const auto& swap = config.tevSwapTable[stage.tevSwapTex];
+      const auto texel = fmt::format("sampled{}.{}{}{}", static_cast<int>(info.zTexStage), chan_comp(swap.red),
+                                     chan_comp(swap.green), chan_comp(swap.blue));
+      /* U24 is R:G:B, MSB first, matching FragZ24X8 in tex_copy_conv.cpp.
+       * U8's expansion is genuinely unsettled -- Dolphin's coefficients say
+       * z = alpha, this says high byte, and HSD_EraseRect's all-0xFF texture
+       * reads like it wants 0xFFFFFF. Three answers, so leave it: no site in
+       * this tree pairs U8 ztex with compare-after-texture, and ztex is
+       * ignored entirely under compare-before-texture (see ztex_source_stage),
+       * which is what HSD_EraseRect selects. */
+      const std::string_view ztexExpr =
+          config.zTexFmt == 2 ? "(zt_t.r << 16u) | (zt_t.g << 8u) | zt_t.b"sv : "zt_t.r << 16u"sv;
+      fragReturn += fmt::format("\n    // Z texture ({})\n    let zt_t = vec3u(round({} * 255.0));",
+                                config.zTexOp == GX_ZT_ADD ? "add" : "replace", texel);
+      if (config.zTexOp == GX_ZT_ADD) {
+        fragReturn += fmt::format("\n    let zt_poly = u32(clamp({}, 0.0, 1.0) * 16777215.0 + 0.5);",
+                                  UseReversedZ ? "1.0 - in.pos.z" : "in.pos.z");
+        fragReturn += fmt::format("\n    let zt_z = (zt_poly + ({}) + {}u) & 0xFFFFFFu;", ztexExpr, config.zTexBias);
+      } else {
+        fragReturn += fmt::format("\n    let zt_z = (({}) + {}u) & 0xFFFFFFu;", ztexExpr, config.zTexBias);
+      }
+      fragReturn += fmt::format("\n    out_frag.depth = {};",
+                                UseReversedZ ? "1.0 - f32(zt_z) / 16777215.0" : "f32(zt_z) / 16777215.0");
+    }
+    fragReturn += "\n    return out_frag;";
   }
 
-  if (dstAlphaMode == DstAlphaMode::DualSource) {
-    fragmentOutput =
-        "\nstruct FragmentOutput {\n"
-        "    @location(0) @blend_src(0) color: vec4f,\n"
-        "    @location(0) @blend_src(1) blend: vec4f,\n"
-        "};\n";
-    fragmentOutputType = "FragmentOutput"sv;
-    fragmentReturn = "\n    return FragmentOutput(vec4f(prev.rgb, 1.0), prev);";
-  }
-
-  auto shaderSource =
-      fmt::format(R"""(
+  /* Byte/half-word unpacking has no form every mobile compiler accepts:
+   * PowerVR Rogue miscompiles extractBits on storage-buffer reads (vertex
+   * explosions, Galaxy A04), while Adreno 750's compiler fails to link most
+   * vertex shaders once the same reads are written as shifts and masks
+   * (VK_ERROR_UNKNOWN from CreateGraphicsPipelines, OnePlus Pad 2). */
+  const std::string_view gxBitsBody = webgpu::g_adapterInfo.vendorID == 0x1010 /* Imagination */
+                                          ? "(v >> off) & ((1u << n) - 1u)"
+                                          : "extractBits(v, off, n)";
+  auto shaderSource = fmt::format(R"""(
 fn bswap32(v: u32, le: bool) -> u32 {{
   if (le) {{
     return v;
@@ -1695,6 +1785,10 @@ fn bswap32(v: u32, le: bool) -> u32 {{
 
 fn bswap16(v: u32, le: bool) -> u32 {{
   return select(((v & 0xFFu) << 8u) | (v >> 8u), v, le);
+}}
+
+fn gx_bits(v: u32, off: u32, n: u32) -> u32 {{
+  return {12};
 }}
 
 fn load_word(p: ptr<storage, array<u32>>, word_idx: u32) -> u32 {{
@@ -1731,10 +1825,10 @@ fn load_u16(p: ptr<storage, array<u32>>, byte_off: u32, le: bool) -> u32 {{
   let sub = byte_off & 3u;
   let word = load_word(p, word_idx);
   if (sub <= 2u) {{
-    return bswap16(extractBits(word, sub * 8u, 16u), le);
+    return bswap16(gx_bits(word, sub * 8u, 16u), le);
   }}
   let next = load_word(p, word_idx + 1u);
-  let raw = extractBits(word, 24u, 8u) | (extractBits(next, 0u, 8u) << 8u);
+  let raw = gx_bits(word, 24u, 8u) | (gx_bits(next, 0u, 8u) << 8u);
   return bswap16(raw, le);
 }}
 
@@ -1767,33 +1861,33 @@ fn raw_fetch_u8_2(p: ptr<storage, array<u32>>, byte_off: u32) -> vec2u {{
   if (sub <= 2u) {{
     let shift = sub * 8u;
     return vec2u(
-      extractBits(word, shift + 0u, 8u),
-      extractBits(word, shift + 8u, 8u),
+      gx_bits(word, shift + 0u, 8u),
+      gx_bits(word, shift + 8u, 8u),
     );
   }}
   let next = load_word(p, word_idx + 1u);
   return vec2u(
-    extractBits(word, 24u, 8u),
-    extractBits(next, 0u, 8u),
+    gx_bits(word, 24u, 8u),
+    gx_bits(next, 0u, 8u),
   );
 }}
 
 fn raw_fetch_u8_3(p: ptr<storage, array<u32>>, byte_off: u32) -> vec3u {{
   let raw = load_u32_raw(p, byte_off);
   return vec3u(
-    extractBits(raw, 0u, 8u),
-    extractBits(raw, 8u, 8u),
-    extractBits(raw, 16u, 8u),
+    gx_bits(raw, 0u, 8u),
+    gx_bits(raw, 8u, 8u),
+    gx_bits(raw, 16u, 8u),
   );
 }}
 
 fn raw_fetch_u8_4(p: ptr<storage, array<u32>>, byte_off: u32) -> vec4u {{
   let raw = load_u32_raw(p, byte_off);
   return vec4u(
-    extractBits(raw, 0u, 8u),
-    extractBits(raw, 8u, 8u),
-    extractBits(raw, 16u, 8u),
-    extractBits(raw, 24u, 8u),
+    gx_bits(raw, 0u, 8u),
+    gx_bits(raw, 8u, 8u),
+    gx_bits(raw, 16u, 8u),
+    gx_bits(raw, 24u, 8u),
   );
 }}
 
@@ -2050,8 +2144,9 @@ fn vs_main(
 fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
 }}
 )""",
-                  uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn, fragmentFnPre,
-                  vtxXfrAttrsPre, uniformPre, fragmentOutput, fragmentOutputType, fragmentReturn);
+                                        uniBufAttrs, texBindings, vtxOutAttrs, vtxInAttrs, vtxXfrAttrs, fragmentFn,
+                                        fragmentFnPre, vtxXfrAttrsPre, uniformPre, fragOutStruct, fragRetType,
+                                        fragReturn, gxBitsBody);
   if (dstAlphaMode == DstAlphaMode::DualSource) {
     shaderSource.insert(0, "enable dual_source_blending;\n");
   }
@@ -2059,6 +2154,11 @@ fn fs_main(in: VertexOutput) -> {10} {{{6}{5}{11}
     Log.info("Generated shader (hash {:x}): {}", hash, shaderSource);
   }
 
+#ifdef __EMSCRIPTEN__
+  const std::string needle="var<immediate> imm: Immediate;";
+  if(auto at=shaderSource.find(needle);at!=std::string::npos)
+    shaderSource.replace(at,needle.size(),"@group(3) @binding(0) var<uniform> imm: Immediate;");
+#endif
   return shaderSource;
 }
 
@@ -2071,8 +2171,18 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
       normalAttachment = i;
     }
   }
+const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
+#ifdef __EMSCRIPTEN__
+  // Retain shader modules while browser pipelines compile asynchronously.
+  static absl::flat_hash_map<HashType, wgpu::ShaderModule> modules;
+  static WGPUDevice device = nullptr;
+  if (device != webgpu::g_device.Get()) {
+    modules.clear();
+    device = webgpu::g_device.Get();
+  }
+  if (auto it = modules.find(hash); it != modules.end()) return it->second;
+#endif
   const auto shaderSource = build_shader_source(config, dstAlphaMode, normalAttachment);
-  const auto hash = xxh3_hash(dstAlphaMode, xxh3_hash(normalAttachment, xxh3_hash(config)));
   wgpu::ShaderSourceWGSL wgslDescriptor{};
   wgslDescriptor.code = shaderSource.c_str();
   const auto label = fmt::format("GX Shader {:x}", hash);
@@ -2080,6 +2190,10 @@ wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTar
       .nextInChain = &wgslDescriptor,
       .label = label.c_str(),
   };
-  return webgpu::g_device.CreateShaderModule(&shaderDescriptor);
+  auto module = webgpu::g_device.CreateShaderModule(&shaderDescriptor);
+#ifdef __EMSCRIPTEN__
+  modules.emplace(hash, module);
+#endif
+  return module;
 }
 } // namespace aurora::gx

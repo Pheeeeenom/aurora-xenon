@@ -1,3 +1,6 @@
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include "command_processor.hpp"
 
 #include "../gfx/depth_peek.hpp"
@@ -209,6 +212,8 @@ u8 line_mode_for_prim(GXPrimitive prim) noexcept {
   }
 }
 } // namespace
+
+static uint32_t sMarkerTag = 0;
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
 static void handle_aurora(ByteReader& reader) noexcept;
@@ -424,6 +429,21 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     const auto prevBindGroup = cache.bindGroups.textureBindGroup;
     resolve_sampled_textures(cache.shaderInfo);
     cache.bindGroups = build_bind_groups(cache.shaderInfo);
+    // AURORA_LOG_TEV=1: when a draw ends up sampling no texture, report what
+    // the TEV stages actually asked for. A stage whose texMapId is
+    // GX_TEXMAP_NULL means the game never pointed the stage at a texture.
+    if (!cache.bindGroups.textureBindGroup && std::getenv("AURORA_LOG_TEV") != nullptr) {
+      static uint64_t n = 0;
+      if ((n++ % 4000) == 0) {
+        const auto& sc = cache.config.shaderConfig;
+        fmt::print(stderr, "no-tex draw #{}: tevStages={}", n, sc.tevStageCount);
+        for (uint32_t i = 0; i < sc.tevStageCount && i < 4; ++i) {
+          fmt::print(stderr, " [s{} texMap={} texCoord={} coloridx={}]", i, static_cast<int>(sc.tevStages[i].texMapId),
+                     static_cast<int>(sc.tevStages[i].texCoordId), static_cast<int>(sc.tevStages[i].channelId));
+        }
+        fmt::print(stderr, "\n");
+      }
+    }
     cache.bindGeneration = texture::current_bind_generation();
     state.dirty &= ~DirtyTextures;
     // For texture_size_bias uniform
@@ -457,6 +477,73 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
   } else if (prim == GX_POINTS) {
     instanceCount = vtxCount;
   }
+  // AURORA_LOG_UNTEX_REGS=1: for an untextured 4-vertex quad (the shape of
+  // the white-HUD artifact), report the TEV colour registers as they stand
+  // AT RECORD TIME. The FIFO is drained on a worker thread, so this state
+  // must be read here and not at render time.
+  {
+    static const bool logRegs = [] {
+      const char* v = std::getenv("AURORA_LOG_UNTEX_REGS");
+      return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    if (logRegs && vtxCount == 4 && !cache.shaderInfo.sampledTextures.any()) {
+      static uint64_t n = 0;
+      // Sample across the WHOLE run, not just the first draws: the opening
+      // movie and title issue thousands of these before gameplay starts, so
+      // a first-N sample describes the wrong scene entirely.
+      ++n;
+      static uint64_t n_add = 0;
+      // Filter to the ARTIFACT CLASS (additive: dst=GX_BL_ONE) rather than
+      // sampling by count. There are ~57000 untextured quads per run and only
+      // the additive ones are the white blobs, so a periodic sample almost
+      // never lands on one -- which is why every field previously looked
+      // faithful: it was describing the wrong draws.
+      if (state.blendFacDst == GX_BL_ONE && n_add++ < 12) {
+        const auto& c0 = state.colorRegs[0];
+        const auto& c1 = state.colorRegs[1];
+        const auto& c2 = state.colorRegs[2];
+        fmt::print(stderr,
+                   "untex quad #{}: stages={} c0=({:.3f},{:.3f},{:.3f},{:.3f}) "
+                   "c1=({:.3f},{:.3f},{:.3f},{:.3f}) c2=({:.3f},{:.3f},{:.3f},{:.3f}) "
+                   "s0.color a={} b={} c={} d={} s0.alpha a={} b={} c={} d={} "
+                   "s0.texMap={} s0.chan={} | chan0 lit={} matSrc={} ambSrc={} "
+                   "mat=({:.3f},{:.3f},{:.3f},{:.3f}) amb=({:.3f},{:.3f},{:.3f},{:.3f}) "
+                   "vtxClr0={} clr0fmt cnt={} type={} desc={} | blend={} src={} dst={} op={} alphaUpd={} numChans={} | posDesc={} posCnt={} posType={} arrStride={}\n",
+                   n, cache.config.shaderConfig.tevStageCount,
+                   c0[0], c0[1], c0[2], c0[3], c1[0], c1[1], c1[2], c1[3],
+                   c2[0], c2[1], c2[2], c2[3],
+                   underlying(cache.config.shaderConfig.tevStages[0].colorPass.a),
+                   underlying(cache.config.shaderConfig.tevStages[0].colorPass.b),
+                   underlying(cache.config.shaderConfig.tevStages[0].colorPass.c),
+                   underlying(cache.config.shaderConfig.tevStages[0].colorPass.d),
+                   underlying(cache.config.shaderConfig.tevStages[0].alphaPass.a),
+                   underlying(cache.config.shaderConfig.tevStages[0].alphaPass.b),
+                   underlying(cache.config.shaderConfig.tevStages[0].alphaPass.c),
+                   underlying(cache.config.shaderConfig.tevStages[0].alphaPass.d),
+                   underlying(cache.config.shaderConfig.tevStages[0].texMapId),
+                   underlying(cache.config.shaderConfig.tevStages[0].channelId),
+                   state.colorChannelConfig[0].lightingEnabled,
+                   underlying(state.colorChannelConfig[0].matSrc),
+                   underlying(state.colorChannelConfig[0].ambSrc),
+                   state.colorChannelState[0].matColor[0], state.colorChannelState[0].matColor[1],
+                   state.colorChannelState[0].matColor[2], state.colorChannelState[0].matColor[3],
+                   state.colorChannelState[0].ambColor[0], state.colorChannelState[0].ambColor[1],
+                   state.colorChannelState[0].ambColor[2], state.colorChannelState[0].ambColor[3],
+                   state.vtxDesc[GX_VA_CLR0] != GX_NONE,
+                   underlying(state.vtxFmts[fmt].attrs[GX_VA_CLR0].cnt),
+                   underlying(state.vtxFmts[fmt].attrs[GX_VA_CLR0].type),
+                   underlying(state.vtxDesc[GX_VA_CLR0]),
+                   underlying(state.blendMode), underlying(state.blendFacSrc),
+                   underlying(state.blendFacDst), underlying(state.blendOp),
+                   state.alphaUpdate, state.numChans,
+                   underlying(state.vtxDesc[GX_VA_POS]),
+                   underlying(state.vtxFmts[fmt].attrs[GX_VA_POS].cnt),
+                   underlying(state.vtxFmts[fmt].attrs[GX_VA_POS].type),
+                   state.arrays[GX_VA_POS].stride);
+      }
+    }
+  }
+
   cache.lastDrawFmt = fmt;
   gfx::push_draw_command(DrawData{
       .pipeline = cache.pipelineRef,
@@ -465,10 +552,14 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
       .idxRange = idxRange,
       .uniformRange = cache.uniformRange,
       .immediateData = immediates,
+#ifdef __EMSCRIPTEN__
+      .immediateRange = gfx::push_uniform(immediates),
+#endif
       .vtxCount = vtxCount,
       .indexCount = numIndices,
       .instanceCount = instanceCount,
       .dstAlpha = state.dstAlpha,
+      .tag = sMarkerTag,
   });
 }
 
@@ -507,6 +598,40 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader& 
 
   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
   const auto vertexData = reader.take(totalVtxBytes);
+  // AURORA_LOG_QUADPOS=1: log the vertex POSITIONS of untextured 4-vertex
+  // quads. Sampling these draws by count is useless -- there are tens of
+  // thousands per run and only a handful are the white artifact -- so the
+  // artifact has to be picked out by WHERE it is on screen.
+  {
+    static const bool logPos = [] {
+      const char* v = std::getenv("AURORA_LOG_QUADPOS");
+      return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    if (logPos && vtxCount == 4 && g_gxState.vtxDesc[GX_VA_POS] == GX_DIRECT &&
+        g_gxState.vtxFmts[fmt].attrs[GX_VA_POS].type == GX_F32) {
+      const auto cnt = g_gxState.vtxFmts[fmt].attrs[GX_VA_POS].cnt;
+      const u32 nComp = (cnt == GX_POS_XYZ) ? 3u : 2u;
+      if (vtxSize >= nComp * 4) {
+        float px[4], py[4];
+        for (u32 v = 0; v < 4; ++v) {
+          u32 off = v * vtxSize;
+          // Vertex data is big-endian regardless of host.
+          auto be32 = [&](u32 o) {
+            return (u32(vertexData[o]) << 24) | (u32(vertexData[o + 1]) << 16) |
+                   (u32(vertexData[o + 2]) << 8) | u32(vertexData[o + 3]);
+          };
+          u32 bx = be32(off), by = be32(off + 4);
+          std::memcpy(&px[v], &bx, 4);
+          std::memcpy(&py[v], &by, 4);
+        }
+        fmt::print(stderr, "quad blend={} src={} dst={} v=({:.1f},{:.1f}) "
+                           "({:.1f},{:.1f}) ({:.1f},{:.1f}) ({:.1f},{:.1f})\n",
+                   underlying(g_gxState.blendMode), underlying(g_gxState.blendFacSrc),
+                   underlying(g_gxState.blendFacDst),
+                   px[0], py[0], px[1], py[1], px[2], py[2], px[3], py[3]);
+      }
+    }
+  }
   gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
 
   // Try to merge with previous draw call
@@ -755,6 +880,9 @@ void handle_aurora(ByteReader& reader) noexcept {
     pop_debug_group();
   } else if (subCmd == GX_AURORA_DEBUG_MARKER_INSERT) {
     auto label = reader.read_string();
+    // A numeric marker is kept as a breadcrumb for the following draws. This
+    // runs on the same worker that records draws, so ordering is exact.
+    sMarkerTag = static_cast<uint32_t>(std::strtoul(label.c_str(), nullptr, 0));
     gfx::insert_debug_marker(std::move(label));
   }
 

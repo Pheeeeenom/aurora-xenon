@@ -69,8 +69,16 @@ fn quantize4(v: f32) -> f32 {
 }
 )"sv;
 
-static const std::string DepthShaderPreamble = R"(
+/* textureLoad's third argument is the mip level for texture_depth_2d and the
+ * sample index for texture_depth_multisampled_2d, and textureDimensions works
+ * on both, so only the binding declaration differs between the two. */
+static std::string depth_shader_preamble(bool multisampled) {
+  return (multisampled ? R"(
+@group(0) @binding(0) var src: texture_depth_multisampled_2d;
+)"s
+                       : R"(
 @group(0) @binding(0) var src: texture_depth_2d;
+)"s) + R"(
 
 struct UVTransform {
     offset: vec2f,
@@ -116,6 +124,7 @@ fn gx_z24(uv: vec2f) -> u32 {
     return min(u32(clamp(depth, 0.0, 1.0) * 16777215.0 + 0.5), 0x00ffffffu);
 }
 )"s);
+}
 
 // Passthrough blit (for scaling)
 static constexpr std::string_view FragPassthrough = R"(
@@ -260,6 +269,17 @@ static constexpr std::string_view FragZ16 = R"(
 }
 )"sv;
 
+// GX_TF_Z24X8: full 24-bit depth -> RGBA8, X8 reads back as 1.0
+static constexpr std::string_view FragZ24X8 = R"(
+@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+    let z = gx_z24(in.uv);
+    return vec4f(f32((z >> 16u) & 0xFFu) / 255.0,
+                 f32((z >> 8u) & 0xFFu) / 255.0,
+                 f32(z & 0xFFu) / 255.0,
+                 1.0);
+}
+)"sv;
+
 // Depth -> R32Float (no scaling)
 static constexpr std::string_view DepthSnapshotShader = R"(
 @group(0) @binding(0) var src: texture_depth_2d;
@@ -312,6 +332,7 @@ static constexpr std::array ConvPipelines{
     ConvPipeline{GX_TF_IA4, FragIA4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv IA4"},
     ConvPipeline{GX_TF_IA8, FragIA8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv IA8"},
     ConvPipeline{GX_TF_RGB565, FragRGB565, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RGB565"},
+    ConvPipeline{GX_TF_RGB5A3, FragRGB565, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RGB5A3"},
     ConvPipeline{GX_CTF_R4, FragR4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv R4"},
     ConvPipeline{GX_CTF_RA4, FragRA4, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RA4"},
     ConvPipeline{GX_CTF_RA8, FragRA8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv RA8"},
@@ -326,13 +347,16 @@ static constexpr std::array ConvPipelines{
 static constexpr std::array DepthConvPipelines{
     ConvPipeline{GX_TF_Z8, FragZ8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z8"},
     ConvPipeline{GX_TF_Z16, FragZ16, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z16"},
+    ConvPipeline{GX_TF_Z24X8, FragZ24X8, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv Z24X8"},
 };
 
 static wgpu::BindGroupLayout g_bindGroupLayout;
 static wgpu::BindGroupLayout g_depthBindGroupLayout;
+static wgpu::BindGroupLayout g_depthBindGroupLayoutMS;
 static wgpu::Sampler g_nearestSampler;
 static wgpu::Sampler g_linearSampler;
 static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
+static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_depthPipelinesMS;
 static wgpu::RenderPipeline g_blitPipeline;
 static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayout;
 static wgpu::BindGroupLayout g_depthSnapshotBindGroupLayoutMS;
@@ -490,31 +514,36 @@ void initialize() {
   };
   g_bindGroupLayout = g_device.CreateBindGroupLayout(&bindGroupLayoutDescriptor);
 
-  static constexpr std::array depthBindGroupLayoutEntries{
-      wgpu::BindGroupLayoutEntry{
-          .binding = 0,
-          .visibility = wgpu::ShaderStage::Fragment,
-          .texture =
-              wgpu::TextureBindingLayout{
-                  .sampleType = wgpu::TextureSampleType::Depth,
-                  .viewDimension = wgpu::TextureViewDimension::e2D,
-              },
-      },
-      wgpu::BindGroupLayoutEntry{
-          .binding = 1,
-          .visibility = wgpu::ShaderStage::Vertex,
-          .buffer =
-              wgpu::BufferBindingLayout{
-                  .type = wgpu::BufferBindingType::Uniform,
-              },
-      },
+  const auto make_depth_layout = [](bool multisampled, const char* label) {
+    const std::array entries{
+        wgpu::BindGroupLayoutEntry{
+            .binding = 0,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .texture =
+                wgpu::TextureBindingLayout{
+                    .sampleType = wgpu::TextureSampleType::Depth,
+                    .viewDimension = wgpu::TextureViewDimension::e2D,
+                    .multisampled = multisampled,
+                },
+        },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1,
+            .visibility = wgpu::ShaderStage::Vertex,
+            .buffer =
+                wgpu::BufferBindingLayout{
+                    .type = wgpu::BufferBindingType::Uniform,
+                },
+        },
+    };
+    const wgpu::BindGroupLayoutDescriptor descriptor{
+        .label = label,
+        .entryCount = entries.size(),
+        .entries = entries.data(),
+    };
+    return g_device.CreateBindGroupLayout(&descriptor);
   };
-  static constexpr wgpu::BindGroupLayoutDescriptor depthBindGroupLayoutDescriptor{
-      .label = "TexCopyConv Depth Bind Group Layout",
-      .entryCount = depthBindGroupLayoutEntries.size(),
-      .entries = depthBindGroupLayoutEntries.data(),
-  };
-  g_depthBindGroupLayout = g_device.CreateBindGroupLayout(&depthBindGroupLayoutDescriptor);
+  g_depthBindGroupLayout = make_depth_layout(false, "TexCopyConv Depth Bind Group Layout");
+  g_depthBindGroupLayoutMS = make_depth_layout(true, "TexCopyConv Depth MS Bind Group Layout");
 
   g_blitPipeline = create_pipeline(
       {GX_TF_RGBA8, FragPassthrough, webgpu::g_graphicsConfig.surfaceConfiguration.format, "TexCopyConv Blit"},
@@ -525,14 +554,18 @@ void initialize() {
       Log.fatal("Output format mismatch for {}", conv.fmt);
     }
   }
-  // Skip depth copies in compatibility mode
-  if (webgpu::g_hasCoreFeatures) {
-    for (const auto& conv : DepthConvPipelines) {
-      g_pipelines[conv.fmt] = create_pipeline(conv, DepthShaderPreamble, g_depthBindGroupLayout);
-      if (conv.outputFormat != to_wgpu(conv.fmt)) {
-        Log.fatal("Output format mismatch for {}", conv.fmt);
-      }
+  for (const auto& conv : DepthConvPipelines) {
+    g_pipelines[conv.fmt] = create_pipeline(conv, depth_shader_preamble(false), g_depthBindGroupLayout);
+    /* The EFB depth buffer is never resolved -- WebGPU has no depth resolve
+     * target -- so a depth copy taken while MSAA is on has to read sample 0
+     * of the multisampled texture through its own pipeline. */
+    g_depthPipelinesMS[conv.fmt] = create_pipeline(conv, depth_shader_preamble(true), g_depthBindGroupLayoutMS);
+    if (conv.outputFormat != to_wgpu(conv.fmt)) {
+      Log.fatal("Output format mismatch for {}", conv.fmt);
     }
+  }
+  // Depth snapshots for depth peeking
+  if (webgpu::g_hasCoreFeatures) {
     g_depthSnapshotBindGroupLayout = create_depth_snapshot_layout(false, "Depth Snapshot Bind Group Layout");
     g_depthSnapshotBindGroupLayoutMS = create_depth_snapshot_layout(true, "Depth Snapshot MS Bind Group Layout");
     g_depthSnapshotPipeline =
@@ -560,7 +593,9 @@ void shutdown() {
   g_pipelines.clear();
   g_blitPipeline = {};
   g_bindGroupLayout = {};
+  g_depthPipelinesMS.clear();
   g_depthBindGroupLayout = {};
+  g_depthBindGroupLayoutMS = {};
   g_nearestSampler = {};
   g_linearSampler = {};
   g_depthSnapshotBindGroupLayout = {};
@@ -575,10 +610,6 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
   }
   wgpu::BindGroup bindGroup;
   if (gx::is_depth_format(req.fmt)) {
-    // Skip depth copies in compatibility mode
-    if (!webgpu::g_hasCoreFeatures) {
-      return;
-    }
     const std::array bindGroupEntries{
         wgpu::BindGroupEntry{
             .binding = 0,
@@ -592,7 +623,7 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
         },
     };
     const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .layout = g_depthBindGroupLayout,
+        .layout = req.msaaSamples > 1 ? g_depthBindGroupLayoutMS : g_depthBindGroupLayout,
         .entryCount = bindGroupEntries.size(),
         .entries = bindGroupEntries.data(),
     };
@@ -645,8 +676,9 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
 }
 
 void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
-  const auto it = g_pipelines.find(req.fmt);
-  if (it == g_pipelines.end()) {
+  auto& pipelines = (req.msaaSamples > 1 && gx::is_depth_format(req.fmt)) ? g_depthPipelinesMS : g_pipelines;
+  const auto it = pipelines.find(req.fmt);
+  if (it == pipelines.end()) {
     Log.fatal("No copy conversion pipeline for format {}", static_cast<int>(req.fmt));
   }
   execute(cmd, req, it->second);

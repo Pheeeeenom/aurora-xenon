@@ -35,7 +35,9 @@ extern "C" void Android_UnlockActivityMutex(void);
 #include <string>
 #include <vector>
 
+#ifdef AURORA_ENABLE_RMLUI
 #include "rmlui.hpp"
+#endif
 #include "time_internal.hpp"
 #include "dolphin/vi/vi_internal.hpp"
 
@@ -46,7 +48,7 @@ constexpr Module Log{"aurora::window"};
 SDL_Window* g_window;
 SDL_Renderer* g_renderer;
 float g_frameBufferScale = 0.f;
-bool g_frameBufferAspectFit = false;
+float g_frameBufferAspect = 0.f; // 0 = follow the native surface
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
 std::deque<std::string> g_eventStrings;
@@ -110,6 +112,10 @@ Vec2<int> fit_frame_buffer_to_aspect(int width, int height, float aspect) {
 
 void resize_swapchain() noexcept {
   const auto size = get_window_size();
+  if (size.native_fb_width == 0 || size.native_fb_height == 0 ||
+      size.fb_width == 0 || size.fb_height == 0) {
+    return;
+  }
   if (size == g_windowSize) {
     return;
   }
@@ -338,6 +344,11 @@ const AuroraEvent* poll_events() {
 
 bool create_window(AuroraBackend backend) {
   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef __EMSCRIPTEN__
+  // Browser launchers choose a render budget in physical pixels. Applying
+  // phone DPR again multiplies attachment memory and fill cost by DPR squared.
+  flags = 0;
+#endif
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
@@ -473,31 +484,51 @@ AuroraWindowSize get_window_size() {
   int height = 0;
   int native_fb_w = 0;
   int native_fb_h = 0;
-  AURORA_ASSERT(SDL_GetWindowSize(g_window, &width, &height), "Failed to get window size: {}", SDL_GetError());
-  AURORA_ASSERT(SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h), "Failed to get window size in pixels: {}",
-         SDL_GetError());
+  if (g_window != nullptr) {
+    if (!SDL_GetWindowSize(g_window, &width, &height)) {
+      Log.warn("Failed to get window size: {}", SDL_GetError());
+    }
+    if (!SDL_GetWindowSizeInPixels(g_window, &native_fb_w, &native_fb_h)) {
+      Log.warn("Failed to get window size in pixels: {}", SDL_GetError());
+    }
+  }
+  width = std::max(0, width);
+  height = std::max(0, height);
+  native_fb_w = std::max(0, native_fb_w);
+  native_fb_h = std::max(0, native_fb_h);
 
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
-  if (g_frameBufferScale > 0.f) {
+  if (fb_w > 0 && fb_h > 0) {
+    const float aspect = static_cast<float>(fb_w) / static_cast<float>(fb_h);
+#if defined(__ANDROID__)
+    // On mobile devices, native display pixel size (e.g. 2000x1200, 2400x1080) imposes severe fillrate
+    // and memory bandwidth bottlenecks on mobile GPUs (such as Adreno 610).
+    // For "Auto" (0.0f) render scale, clamp baseline to 1.0x GameCube native resolution (480p height)
+    // aspect-scaled to the window dimensions.
+    const float effective_scale = (g_frameBufferScale > 0.f) ? g_frameBufferScale : 1.0f;
     const auto [baseW, baseH] = vi::configured_fb_size();
     const auto [scaledW, scaledH] =
-        scale_frame_buffer_to_aspect(static_cast<int>(baseW), static_cast<int>(baseH), g_frameBufferScale,
-                                     static_cast<float>(fb_w) / static_cast<float>(fb_h));
+        scale_frame_buffer_to_aspect(static_cast<int>(baseW), static_cast<int>(baseH), effective_scale, aspect);
     fb_w = scaledW;
     fb_h = scaledH;
-  }
-  if (g_frameBufferAspectFit) {
-    const auto [baseW, baseH] = vi::configured_fb_size();
-    if (baseW > 0 && baseH > 0) {
-      const auto [fitW, fitH] =
-          fit_frame_buffer_to_aspect(fb_w, fb_h, static_cast<float>(baseW) / static_cast<float>(baseH));
+#else
+    if (g_frameBufferScale > 0.f) {
+      const auto [baseW, baseH] = vi::configured_fb_size();
+      const auto [scaledW, scaledH] =
+          scale_frame_buffer_to_aspect(static_cast<int>(baseW), static_cast<int>(baseH), g_frameBufferScale, aspect);
+      fb_w = scaledW;
+      fb_h = scaledH;
+    }
+#endif
+    if (g_frameBufferAspect > 0.f) {
+      const auto [fitW, fitH] = fit_frame_buffer_to_aspect(fb_w, fb_h, g_frameBufferAspect);
       fb_w = fitW;
       fb_h = fitH;
     }
   }
 
-  const float scale = SDL_GetWindowDisplayScale(g_window);
+  const float scale = (g_window != nullptr) ? SDL_GetWindowDisplayScale(g_window) : 1.0f;
   return {
       .width = static_cast<uint32_t>(width),
       .height = static_cast<uint32_t>(height),
@@ -530,8 +561,19 @@ bool is_paused() noexcept {
 }
 
 bool is_presentable() noexcept {
-  return g_window != nullptr && !g_backgrounded.load(std::memory_order_acquire) &&
-         g_surfaceReady.load(std::memory_order_acquire);
+  if (g_window == nullptr || g_backgrounded.load(std::memory_order_acquire) ||
+      !g_surfaceReady.load(std::memory_order_acquire)) {
+    return false;
+  }
+  const auto flags = SDL_GetWindowFlags(g_window);
+  if ((flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) != 0u) {
+    return false;
+  }
+  int w = 0, h = 0;
+  if (!SDL_GetWindowSizeInPixels(g_window, &w, &h) || w <= 0 || h <= 0) {
+    return false;
+  }
+  return true;
 }
 
 void set_surface_ready(bool ready) noexcept {
@@ -603,12 +645,15 @@ void set_frame_buffer_scale(float scale) {
   request_frame_buffer_resize();
 }
 
-void set_frame_buffer_aspect_fit(bool fit) {
-  if (g_frameBufferAspectFit == fit) {
+void set_frame_buffer_aspect(float aspect) {
+  if (aspect < 0.f) {
+    aspect = 0.f;
+  }
+  if (g_frameBufferAspect == aspect) {
     return;
   }
 
-  g_frameBufferAspectFit = fit;
+  g_frameBufferAspect = aspect;
   request_frame_buffer_resize();
 }
 

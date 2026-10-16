@@ -36,8 +36,8 @@ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsStandard{{
 
 std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsXBox360{{
     {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
-    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_X},
-    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_B},
+    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_B},
+    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_X},
     {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_Y},
     {SDL_GAMEPAD_BUTTON_START, PAD_BUTTON_START},
     {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_TRIGGER_Z},
@@ -51,8 +51,8 @@ std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsXBox360{{
 
 std::array<PADButtonMapping, PAD_BUTTON_COUNT> g_defaultButtonsXBoxOne{{
     {SDL_GAMEPAD_BUTTON_SOUTH, PAD_BUTTON_A},
-    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_X},
-    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_B},
+    {SDL_GAMEPAD_BUTTON_EAST, PAD_BUTTON_B},
+    {SDL_GAMEPAD_BUTTON_WEST, PAD_BUTTON_X},
     {SDL_GAMEPAD_BUTTON_NORTH, PAD_BUTTON_Y},
     {SDL_GAMEPAD_BUTTON_START, PAD_BUTTON_START},
     {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_TRIGGER_Z},
@@ -475,9 +475,6 @@ aurora::pad::detail::default_buttons(const gamepad::GameController& controller) 
   case SDL_GAMEPAD_TYPE_PS5:
     return g_defaultButtonsPS5;
   case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
-    if (controller.m_pid == 0x2073) {
-      return g_defaultButtonsNSOGamecube;
-    }
     return g_defaultButtonsProCon;
   case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
     return g_defaultButtonsJoyConRight;
@@ -650,6 +647,7 @@ u32 PADRead(PADStatus* status) {
         controller->m_isColorDirty = false;
       }
     }
+
   }
   return rumbleSupport;
 }
@@ -1171,7 +1169,8 @@ void PADSerializeMappings() {
   }
   const auto basePath = aurora::io::fs_path_from_string(aurora::g_config.userPath);
 
-  for (auto& controller : aurora::gamepad::g_GameControllers | std::views::values) {
+  for (auto& entry : aurora::gamepad::g_GameControllers) {
+    auto& controller = entry.second;
     EnsureMappingLoaded(&controller);
     const auto filePath =
         basePath / fmt::format("{}_{:04X}_{:04X}.controller", aurora::gamepad::controller_name(controller.m_index),
@@ -1284,6 +1283,12 @@ const char* PADGetButtonName(const PADButton button) {
 }
 
 const char* PADGetNativeButtonName(u32 button) {
+  constexpr uint32_t kNativeButtonAxisBit = 0x40000000u;
+  constexpr uint32_t kNativeButtonAxisNegBit = 0x20000000u;
+  if ((button & kNativeButtonAxisBit) != 0 && button != PAD_NATIVE_BUTTON_INVALID) {
+    const auto axis = static_cast<SDL_GamepadAxis>(button & ~(kNativeButtonAxisBit | kNativeButtonAxisNegBit));
+    return SDL_GetGamepadStringForAxis(axis);
+  }
   return SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(button));
 }
 

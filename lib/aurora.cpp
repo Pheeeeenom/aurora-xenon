@@ -1,5 +1,6 @@
 #include <aurora/aurora.h>
 #include <aurora/time.hpp>
+#include <cmath>
 
 #ifdef AURORA_ENABLE_GX
 #include "gfx/resources.hpp"
@@ -71,14 +72,17 @@ constexpr std::array PreferredBackendOrder{
 #ifdef DAWN_ENABLE_BACKEND_D3D12
     BACKEND_D3D12,
 #endif
+// D3D11 before Vulkan: it is in-box on every Windows install, whereas Vulkan
+// needs a vendor ICD and the GPUs that fail D3D12 (Intel Gen7, which Dawn
+// refuses outright) never got one.
+#ifdef DAWN_ENABLE_BACKEND_D3D11
+    BACKEND_D3D11,
+#endif
 #ifdef DAWN_ENABLE_BACKEND_METAL
     BACKEND_METAL,
 #endif
 #ifdef DAWN_ENABLE_BACKEND_VULKAN
     BACKEND_VULKAN,
-#endif
-#ifdef DAWN_ENABLE_BACKEND_D3D11
-    BACKEND_D3D11,
 #endif
 // #ifdef DAWN_ENABLE_BACKEND_DESKTOP_GL
 //     BACKEND_OPENGL,
@@ -93,6 +97,32 @@ constexpr std::array PreferredBackendOrder{
 #else
 constexpr std::array<AuroraBackend, 0> PreferredBackendOrder{};
 #endif
+
+// Not magic_enum: AuroraBackend is a plain C enum with no fixed underlying
+// type, and instantiating enum_name on one fails to compile under Apple clang.
+constexpr const char* backend_name(AuroraBackend backend) noexcept {
+  switch (backend) {
+  case BACKEND_AUTO:
+    return "auto";
+  case BACKEND_D3D11:
+    return "D3D11";
+  case BACKEND_D3D12:
+    return "D3D12";
+  case BACKEND_METAL:
+    return "Metal";
+  case BACKEND_VULKAN:
+    return "Vulkan";
+  case BACKEND_OPENGL:
+    return "OpenGL";
+  case BACKEND_OPENGLES:
+    return "OpenGL ES";
+  case BACKEND_WEBGPU:
+    return "WebGPU";
+  case BACKEND_NULL:
+    return "null";
+  }
+  return "?";
+}
 
 bool g_initialFrame = false;
 
@@ -120,9 +150,10 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   } else {
     g_config.resourcesPath = strdup(g_config.resourcesPath);
   }
-  if (g_config.msaa == 0) {
-    g_config.msaa = 1;
-  }
+  // WebGPU only guarantees sample counts 1 and 4, and Dawn rejects the rest
+  // outright: an unsupported count aborts device creation rather than
+  // degrading, so clamp here instead of trusting the caller.
+  g_config.msaa = g_config.msaa > 1 ? 4 : 1;
   if (g_config.maxTextureAnisotropy == 0) {
     g_config.maxTextureAnisotropy = 16;
   }
@@ -159,6 +190,15 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
     }
   }
 
+  // A pinned backend that cannot come up silently falls through to the
+  // preferred order, and the only trace of that was the per-attempt warnings
+  // a few hundred lines earlier. Say it once, plainly, so a log tail still
+  // shows the pin was not honoured.
+  if (windowCreated && config.desiredBackend != BACKEND_AUTO && selectedBackend != config.desiredBackend) {
+    Log.warn("Requested backend {} could not be initialized; running on {} instead",
+             backend_name(config.desiredBackend), backend_name(selectedBackend));
+  }
+
   AURORA_ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
 
   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
@@ -174,6 +214,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   window::show_window();
   thread::set_current({
       .name = "Main thread",
+      .priority = thread::Priority::High,
       .affinity = thread::Affinity::SharedCache,
   });
 
@@ -199,6 +240,17 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   g_config.desiredBackend = selectedBackend;
   return {
       .backend = selectedBackend,
+#ifdef AURORA_ENABLE_GX
+      .adapterName = webgpu::g_adapterName.c_str(),
+      .adapterDriver = webgpu::g_adapterDriver.c_str(),
+      .adapterVendorId = webgpu::g_adapterInfo.vendorID,
+      .adapterDeviceId = webgpu::g_adapterInfo.deviceID,
+#else
+      .adapterName = "",
+      .adapterDriver = "",
+      .adapterVendorId = 0,
+      .adapterDeviceId = 0,
+#endif
       .userPath = g_config.userPath,
       .cachePath = g_config.cachePath,
       .window = window::get_sdl_window(),
@@ -252,7 +304,9 @@ bool begin_frame() noexcept {
     }
   }
 
+#ifndef __EMSCRIPTEN__
   imgui::new_frame(window::get_window_size());
+#endif
   if (!gfx::begin_frame()) {
     return false;
   }
@@ -268,7 +322,11 @@ void end_frame() noexcept {
   gx::fifo::end_frame();
   gx::texture::end_frame();
   gfx::finish();
+#ifdef __EMSCRIPTEN__
+  imgui::DrawData imguiDrawData; // Browser controls live in the launcher.
+#else
   auto imguiDrawData = imgui::freeze();
+#endif
 
   const auto& presentSource = webgpu::present_source();
   const auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
@@ -298,18 +356,31 @@ void end_frame() noexcept {
         wgpu::SurfaceTexture surfaceTexture;
         g_surface.GetCurrentTexture(&surfaceTexture);
         surfaceStatus = surfaceTexture.status;
-        if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal) {
+        /* SuccessSuboptimal still hands back a usable texture -- the surface
+         * merely no longer matches the compositor's preferred configuration.
+         * Treating it as a failure means never presenting again on a
+         * compositor that reports it persistently (Xwayland/KDE does), which
+         * leaves the window frozen on a stale frame while the game runs on.
+         * Present it, and ask for a reconfigure afterwards. */
+        if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
+            surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
           currentTexture = std::move(surfaceTexture.texture);
-          currentView = currentTexture.CreateView();
+          if (currentTexture) {
+            currentView = currentTexture.CreateView();
+          }
         }
       }
     }
 
-    const bool canPresent = currentTexture && currentView;
+    const bool canPresent = currentTexture && currentView &&
+                            webgpu::g_graphicsConfig.surfaceConfiguration.width > 0 &&
+                            webgpu::g_graphicsConfig.surfaceConfiguration.height > 0;
     if (canPresent) {
       wgpu::BindGroup presentBindGroup;
       if (rmlBindGroup && !rmlOverlay) {
         presentBindGroup = rmlBindGroup;
+      } else if (webgpu::get_resampler() == SAMPLER_BILINEAR) {
+        presentBindGroup = webgpu::g_CopyBindGroup;
       } else {
         const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
         presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
@@ -332,8 +403,12 @@ void end_frame() noexcept {
         // Copy EFB -> XFB (swapchain)
         pass.SetPipeline(webgpu::g_CopyPipeline);
         pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
-        set_present_viewport(pass, viewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
-                             webgpu::g_graphicsConfig.surfaceConfiguration.height);
+        /* The acquired texture's own size, not the configured one: a browser
+         * canvas that the page resized (SDL follows its CSS size) hands back
+         * a texture of the new size before the resize event reconfigures the
+         * surface, and a scissor outside it is a fatal validation error.
+         * Natively the two sizes are always equal. */
+        set_present_viewport(pass, viewport, currentTexture.GetWidth(), currentTexture.GetHeight());
 
         pass.Draw(3);
         if (rmlBindGroup && rmlOverlay) {
@@ -364,7 +439,7 @@ void end_frame() noexcept {
         pass.End();
       }
     } else {
-      Log.info("Skipping present; window not presentable");
+      Log.info("Skipping present; no usable surface texture ({})", magic_enum::enum_name(surfaceStatus));
     }
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
@@ -380,11 +455,25 @@ void end_frame() noexcept {
       {
         window::SurfaceLock surfaceLock;
         if (window::is_presentable()) {
+#ifdef __EMSCRIPTEN__
+          // The browser presents the canvas when control returns to its event loop.
+          status = wgpu::Status::Success;
+#else
           status = g_surface.Present();
+#endif
         }
       }
       if (status) {
         gfx::after_present();
+        /* Only on the transition into suboptimal: refresh_surface() calls
+         * gpu_synchronize(), so asking every frame would stall the pipeline
+         * for as long as the compositor keeps reporting it. */
+        static bool wasSuboptimal = false;
+        const bool suboptimal = surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal;
+        if (suboptimal && !wasSuboptimal) {
+          window::push_custom_event(window::CustomEvent::RefreshSurface);
+        }
+        wasSuboptimal = suboptimal;
       } else {
         Log.warn("Surface present failed");
         webgpu::release_surface();
@@ -404,8 +493,8 @@ void end_frame() noexcept {
         webgpu::release_surface();
         break;
       case wgpu::SurfaceGetCurrentTextureStatus::Error:
-        Log.warn("Surface texture is {}, dropping surface", magic_enum::enum_name(surfaceStatus));
-        g_surface = {};
+        Log.warn("Surface texture is {}, releasing surface", magic_enum::enum_name(surfaceStatus));
+        webgpu::release_surface();
         break;
       default:
         if (!window::is_presentable()) {
@@ -476,6 +565,13 @@ void aurora_set_resampler(AuroraSampler sampler) {
   aurora::webgpu::set_resampler(sampler);
 #else
   (void)sampler;
+#endif
+}
+void aurora_preserve_frame_buffer(bool preserve) {
+#ifdef AURORA_ENABLE_GX
+  aurora::gfx::set_preserve_frame_buffer(preserve);
+#else
+  (void)preserve;
 #endif
 }
 void aurora_set_timescale(float scale) { aurora::time::set_scale(scale); }

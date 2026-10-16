@@ -260,9 +260,6 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
                               dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
     const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
-    if (isDepth && passInfo.msaaSamples > 1) {
-      Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
-    }
     const tex_copy_conv::ConvRequest convReq{
         .fmt = passInfo.resolveFormat,
         .srcFmt = passInfo.resolveSourceFormat,
@@ -270,6 +267,9 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
         .uniformRange = passInfo.resolveUniformRange,
         .dst = passInfo.resolveTarget,
         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
+        /* Colour reaches us already resolved; depth never is, so the copy
+         * shader reads sample 0 of the multisampled texture instead. */
+        .msaaSamples = isDepth ? passInfo.msaaSamples : 1,
     };
     const bool needsOpaqueAlpha = !isDepth && !gx::efb_has_alpha(convReq.srcFmt);
     const bool sameFormat =
@@ -335,14 +335,22 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   }
 }
 
+#ifdef __EMSCRIPTEN__
+// end_frame writes vertex, uniform, index and storage data straight into their
+// final buffers (browser_upload_pools in frame.cpp); only textures are staged,
+// in a buffer of their own.
+constexpr uint64_t TextureUploadStagingOffset = 0;
+#else
 constexpr uint64_t VertexStagingOffset = 0;
 constexpr uint64_t UniformStagingOffset = VertexStagingOffset + VertexBufferSize;
 constexpr uint64_t IndexStagingOffset = UniformStagingOffset + UniformBufferSize;
 constexpr uint64_t StorageStagingOffset = IndexStagingOffset + IndexBufferSize;
 constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
+#endif
 
 constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
 
+#ifndef __EMSCRIPTEN__
 void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
                                uint32_t highWater, uint64_t stagingOffset, const wgpu::Buffer& dst) {
   if (highWater <= copied) {
@@ -354,6 +362,7 @@ void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& fra
                          copyEnd - copyStart);
   copied = highWater;
 }
+#endif
 
 bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
   const auto& highWater = op.highWater;
@@ -374,12 +383,19 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
   const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
   const auto& highWater = op.highWater;
   auto& res = resources();
+#ifdef __EMSCRIPTEN__
+  frame.copied.verts = highWater.verts;
+  frame.copied.uniforms = highWater.uniforms;
+  frame.copied.indices = highWater.indices;
+  frame.copied.storage = highWater.storage;
+#else
   copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
                             res.uniformBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, res.indexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
                             res.storageBuffer);
+#endif
 
   if constexpr (UseTextureBuffer) {
     for (size_t i = frame.copied.textureUploadCount; i < op.textureUploads.size(); ++i) {

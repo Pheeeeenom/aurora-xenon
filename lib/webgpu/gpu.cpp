@@ -4,6 +4,7 @@
 #include <atomic>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -29,6 +30,7 @@
 #include "../dawn/TracyPlatform.hpp"
 #include <dawn/native/DawnNative.h>
 #endif
+
 
 namespace aurora::webgpu {
 static Module Log("aurora::gpu");
@@ -57,6 +59,8 @@ static TextureWithSampler g_resampledFrameBuffer;
 static wgpu::Adapter g_adapter;
 wgpu::Instance g_instance;
 wgpu::AdapterInfo g_adapterInfo;
+std::string g_adapterName;
+std::string g_adapterDriver;
 static wgpu::SurfaceCapabilities g_surfaceCapabilities;
 bool g_hasCoreFeatures = false;
 bool g_dualSourceBlendingSupported = false;
@@ -64,10 +68,15 @@ bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 static std::atomic_bool g_initialized = false;
+// Set by the device-lost callback for any reason but Destroyed. Checked at the end of initialize()
+// so a device that dies while its first pipelines compile fails over to the next backend instead
+// of reaching the frame loop and aborting there.
+static std::atomic_bool g_deviceLost = false;
 static std::atomic_bool g_vsyncEnabled = true;
 
 namespace {
 
+#ifndef __EMSCRIPTEN__
 AuroraLogLevel wgpu_log_level(wgpu::LoggingType type) {
   switch (type) {
   case wgpu::LoggingType::Verbose:
@@ -86,6 +95,7 @@ AuroraLogLevel wgpu_log_level(wgpu::LoggingType type) {
 void wgpu_log(wgpu::LoggingType type, wgpu::StringView message) {
   Log.report(wgpu_log_level(type), "WebGPU message: {}", message);
 }
+#endif
 
 struct ResampleUniformBlock {
   uint32_t samplerMode = 0;
@@ -182,6 +192,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var color = textureSample(t, s, in.uv);
     if (uniforms.sampler_mode == 1u) {
         color = sample_area(in.position);
+    } else if (uniforms.sampler_mode == 2u) {
+        // Scanlines follow the 480 virtual lines of the original display, not
+        // the output pixel grid. The gap has to be asymmetric inside the line:
+        // any pattern symmetric about the line centre (a cos, a triangle) gives
+        // the two output rows of a 960-tall window the same value and flattens
+        // into a uniform dim. The grille is a three-phosphor triad.
+        let scanline = mix(1.0, 0.72, step(0.5, fract(in.uv.y * 480.0)));
+        let phase = u32(in.position.x) % 3u;
+        let grille = vec3<f32>(select(0.9, 1.0, phase == 0u),
+                               select(0.9, 1.0, phase == 1u),
+                               select(0.9, 1.0, phase == 2u));
+        color = vec4(color.rgb * scanline * grille, 1.0);
+    } else if (uniforms.sampler_mode == 3u) {
+        let lum = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let saturated = mix(vec3<f32>(lum), color.rgb, 1.25);
+        color = vec4(clamp(saturated, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
     return vec4(color.rgb, 1.0);
 }
@@ -201,9 +227,17 @@ wgpu::TextureFormat best_surface_format() {
   if (g_surfaceCapabilities.formatCount == 0) {
     return wgpu::TextureFormat::Undefined;
   }
+  // Prefer RGBA8Unorm if supported to match decoded texture formats (critical on Android/Adreno
+  // where drivers advertise BGRA8Unorm first but texture decoders output RGBA8, causing red/blue swap)
   for (size_t i = 0; i < g_surfaceCapabilities.formatCount; ++i) {
     const auto format = to_linear(g_surfaceCapabilities.formats[i]);
-    if (format == wgpu::TextureFormat::RGBA8Unorm || format == wgpu::TextureFormat::BGRA8Unorm) {
+    if (format == wgpu::TextureFormat::RGBA8Unorm) {
+      return format;
+    }
+  }
+  for (size_t i = 0; i < g_surfaceCapabilities.formatCount; ++i) {
+    const auto format = to_linear(g_surfaceCapabilities.formats[i]);
+    if (format == wgpu::TextureFormat::BGRA8Unorm) {
       return format;
     }
   }
@@ -214,6 +248,10 @@ uint32_t sampler_mode(AuroraSampler sampler) noexcept {
   switch (sampler) {
   case SAMPLER_AREA:
     return 1;
+  case SAMPLER_CRT:
+    return 2;
+  case SAMPLER_VIBRANT:
+    return 3;
   case SAMPLER_BILINEAR:
   default:
     return 0;
@@ -316,6 +354,8 @@ const TextureWithSampler& present_source() noexcept {
 void set_resampler(AuroraSampler sampler) noexcept {
   switch (sampler) {
   case SAMPLER_AREA:
+  case SAMPLER_CRT:
+  case SAMPLER_VIBRANT:
   case SAMPLER_BILINEAR:
     g_Resampler = sampler;
     return;
@@ -774,7 +814,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         .requiredFeatureCount = requiredInstanceFeatures.size(),
         .requiredFeatures = requiredInstanceFeatures.data(),
     };
-#ifdef WEBGPU_DAWN
+#if defined(WEBGPU_DAWN) && !defined(__MINGW32__)
     constexpr std::array instanceToggles{
         "allow_unsafe_apis",
     };
@@ -790,6 +830,31 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     dawnInstanceDescriptor.platform = tracy_dawn_platform();
 #endif
     instanceDescriptor.nextInChain = &dawnInstanceDescriptor;
+#elif defined(WEBGPU_DAWN)
+    // dawn::native::DawnInstanceDescriptor is unusable from MinGW against the MSVC-built prebuilt
+    // DLL: its constructor is an MSVC-mangled export, and GCC lays the struct out differently
+    // (Itanium reuses ChainedStruct's tail padding, MSVC does not: 72 vs 80 bytes). Mirror the
+    // MSVC layout as a plain struct and chain that. Without it Dawn drops every instance-level
+    // message -- "D3D12 backend is not allowed on Intel gen-7 GPUs", a missing vulkan-1.dll --
+    // and a skipped backend leaves no reason in the log. Validated under Proton against the
+    // v20260807 prebuilt; the asserts pin the MSVC offsets so a header change fails loudly.
+    struct {
+      WGPUChainedStruct chain{nullptr, WGPUSType_DawnInstanceDescriptor};
+      uint32_t additionalRuntimeSearchPathsCount = 0;
+      const char* const* additionalRuntimeSearchPaths = nullptr;
+      dawn::platform::Platform* platform = nullptr;
+      dawn::native::BackendValidationLevel backendValidationLevel = dawn::native::BackendValidationLevel::Disabled;
+      bool beginCaptureOnStartup = false;
+      WGPULoggingCallbackInfo loggingCallbackInfo = WGPU_LOGGING_CALLBACK_INFO_INIT;
+    } dawnInstanceDescriptor;
+    static_assert(sizeof(dawnInstanceDescriptor) == 80);
+    static_assert(offsetof(decltype(dawnInstanceDescriptor), backendValidationLevel) == 40);
+    static_assert(offsetof(decltype(dawnInstanceDescriptor), loggingCallbackInfo) == 48);
+    dawnInstanceDescriptor.loggingCallbackInfo.callback = [](WGPULoggingType type, WGPUStringView message, void*,
+                                                             void*) {
+      wgpu_log(static_cast<wgpu::LoggingType>(type), message);
+    };
+    instanceDescriptor.nextInChain = reinterpret_cast<wgpu::ChainedStruct*>(&dawnInstanceDescriptor);
 #endif
     g_instance = wgpu::CreateInstance(&instanceDescriptor);
     if (!g_instance) {
@@ -803,6 +868,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   // D3D12's debug layer is very slow
   g_dawnInstance->EnableBackendValidation(backend != WGPUBackendType::D3D12);
 #endif
+  g_deviceLost = false;
 
   if (!create_surface()) {
     return false;
@@ -845,10 +911,11 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     }
     if (!g_adapter) {
       if (requestAdapterCallbackCompleted) {
-        Log.error("Failed to create adapter: request status {}, message: {}",
+        Log.error("No usable {} adapter ({}: {}); trying the next backend", magic_enum::enum_name(backend),
                   magic_enum::enum_name(requestAdapterStatus), requestAdapterMessage);
       } else {
-        Log.error("Failed to create adapter: request callback did not complete");
+        Log.error("No usable {} adapter (request callback did not complete); trying the next backend",
+                  magic_enum::enum_name(backend));
       }
       return false;
     }
@@ -868,10 +935,18 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   if (description.IsUndefined()) {
     description = wgpu::StringView("Unknown");
   }
+#ifdef __EMSCRIPTEN__
+  // Browsers deliberately omit the native backend from adapter information.
+  g_backendType = wgpu::BackendType::WebGPU;
+#else
   g_backendType = g_adapterInfo.backendType;
+#endif
+  g_adapterName = std::string_view{adapterName};
+  g_adapterDriver = std::string_view{description};
   const auto backendName = magic_enum::enum_name(g_backendType);
-  Log.info("Graphics adapter information\n  API: {}\n  Device: {} ({})\n  Driver: {}", backendName, adapterName,
-           magic_enum::enum_name(g_adapterInfo.adapterType), description);
+  Log.info("Graphics adapter information\n  API: {}\n  Device: {} ({}) [{:04x}:{:04x}]\n  Driver: {}", backendName,
+           adapterName, magic_enum::enum_name(g_adapterInfo.adapterType), g_adapterInfo.vendorID,
+           g_adapterInfo.deviceID, description);
 
   {
     wgpu::Limits supportedLimits{};
@@ -896,7 +971,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
             supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
         .minStorageBufferOffsetAlignment =
             supportedLimits.minStorageBufferOffsetAlignment < 16 ? 16 : supportedLimits.minStorageBufferOffsetAlignment,
+#ifndef __EMSCRIPTEN__
         .maxImmediateSize = sizeof(gx::DrawImmediateData),
+#endif
     };
     Log.info(
         "Using limits:"
@@ -911,7 +988,12 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         requiredLimits.maxTextureDimension1D, requiredLimits.maxTextureDimension2D,
         requiredLimits.maxTextureDimension3D, requiredLimits.maxTextureArrayLayers,
         requiredLimits.maxStorageBuffersPerShaderStage, requiredLimits.minUniformBufferOffsetAlignment,
-        requiredLimits.minStorageBufferOffsetAlignment, requiredLimits.maxImmediateSize);
+        requiredLimits.minStorageBufferOffsetAlignment,
+#ifdef __EMSCRIPTEN__
+        0);
+#else
+        requiredLimits.maxImmediateSize);
+#endif
     std::vector<wgpu::FeatureName> requiredFeatures;
     g_hasCoreFeatures = false;
     g_bcTexturesSupported = false;
@@ -1013,9 +1095,12 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         wgpu::CallbackMode::AllowSpontaneous,
         [](const wgpu::Device& device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
           if (g_initialized) {
-            FATAL("Device lost: {}", message);
+            FATAL("Device lost on {} ({}): {}", g_adapterName, magic_enum::enum_name(g_backendType), message);
           } else {
-            Log.warn("Device lost: {}", message);
+            if (reason != wgpu::DeviceLostReason::Destroyed) {
+              g_deviceLost = true;
+            }
+            Log.warn("Device lost on {} ({}): {}", g_adapterName, magic_enum::enum_name(g_backendType), message);
           }
         });
     const auto future =
@@ -1024,7 +1109,8 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
                                   if (status == wgpu::RequestDeviceStatus::Success) {
                                     g_device = std::move(device);
                                   } else {
-                                    Log.warn("Device request failed: {}", message);
+                                    Log.error("{} ({}) rejected device creation: {}; trying the next backend",
+                                              g_adapterName, magic_enum::enum_name(g_backendType), message);
                                   }
                                 });
     const auto status = g_instance.WaitAny(future, 5000000000);
@@ -1035,7 +1121,9 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     if (!g_device) {
       return false;
     }
+#ifndef __EMSCRIPTEN__
     g_device.SetLoggingCallback(wgpu_log);
+#endif
   }
   g_queue = g_device.GetQueue();
 
@@ -1075,6 +1163,14 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   create_resample_pipeline();
   gpu_prof::initialize();
   resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+  // Flush any device-lost raised by the pipeline/swapchain work above before
+  // declaring this backend usable.
+  g_instance.ProcessEvents();
+  if (g_deviceLost) {
+    Log.error("{} ({}) lost its device during initialization; trying the next backend", g_adapterName,
+              magic_enum::enum_name(g_backendType));
+    return false;
+  }
   g_initialized = true;
   return true;
 }
@@ -1166,13 +1262,16 @@ bool refresh_surface(bool recreate) {
     nativeWidth = size.native_fb_width;
     nativeHeight = size.native_fb_height;
   }
-  if (width != 0 && height != 0) {
+  if (width != 0 && height != 0 && nativeWidth != 0 && nativeHeight != 0) {
     resize_swapchain_internal(width, height, nativeWidth, nativeHeight, true);
   }
   return true;
 }
 
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force) {
+  if (width == 0 || height == 0 || nativeWidth == 0 || nativeHeight == 0) {
+    return;
+  }
   gfx::gpu_synchronize();
   resize_swapchain_internal(width, height, nativeWidth, nativeHeight, force);
 }
@@ -1183,4 +1282,8 @@ void aurora_enable_vsync(const bool enabled) {
   aurora::webgpu::g_graphicsConfig.surfaceConfiguration.presentMode =
       aurora::webgpu::select_present_mode(aurora::webgpu::g_surfaceCapabilities);
   aurora::window::push_custom_event(aurora::window::CustomEvent::RefreshSurface);
+}
+
+bool aurora_vsync_enabled(void) {
+  return aurora::webgpu::vsync_enabled();
 }

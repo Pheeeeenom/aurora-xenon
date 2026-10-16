@@ -7,6 +7,17 @@
 #include <SDL3/SDL_iostream.h>
 #include <tracy/Tracy.hpp>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -123,6 +134,61 @@ bool isAligned(const void* addr, uintptr_t align) {
   return (reinterpret_cast<uintptr_t>(addr) & (align - 1)) == 0;
 }
 
+struct MmapStreamData {
+  const uint8_t* data = nullptr;
+  uint64_t size = 0;
+#if defined(_WIN32)
+  HANDLE fileHandle = INVALID_HANDLE_VALUE;
+  HANDLE mappingHandle = NULL;
+#else
+  int fd = -1;
+#endif
+};
+
+int64_t mmapStreamReadAt(void* userData, uint64_t offset, void* out, size_t len) {
+  auto* stream = static_cast<MmapStreamData*>(userData);
+  if (stream == nullptr || out == nullptr || offset >= stream->size) {
+    return -1;
+  }
+  const size_t toRead = static_cast<size_t>(std::min<uint64_t>(len, stream->size - offset));
+  std::memcpy(out, stream->data + offset, toRead);
+  return static_cast<int64_t>(toRead);
+}
+
+int64_t mmapStreamLen(void* userData) {
+  auto* stream = static_cast<MmapStreamData*>(userData);
+  if (stream == nullptr) {
+    return -1;
+  }
+  return static_cast<int64_t>(stream->size);
+}
+
+void mmapStreamClose(void* userData) {
+  auto* stream = static_cast<MmapStreamData*>(userData);
+  if (stream == nullptr) {
+    return;
+  }
+#if defined(_WIN32)
+  if (stream->data != nullptr) {
+    UnmapViewOfFile(stream->data);
+  }
+  if (stream->mappingHandle != NULL) {
+    CloseHandle(stream->mappingHandle);
+  }
+  if (stream->fileHandle != INVALID_HANDLE_VALUE) {
+    CloseHandle(stream->fileHandle);
+  }
+#else
+  if (stream->data != nullptr && stream->data != MAP_FAILED) {
+    munmap(const_cast<uint8_t*>(stream->data), static_cast<size_t>(stream->size));
+  }
+  if (stream->fd >= 0) {
+    close(stream->fd);
+  }
+#endif
+  delete stream;
+}
+
 int64_t sdlStreamReadAt(void* userData, uint64_t offset, void* out, size_t len) {
   auto* io = static_cast<SDL_IOStream*>(userData);
   if (io == nullptr || out == nullptr ||
@@ -220,7 +286,23 @@ std::string build_path(FstIndex fstIndex) {
   return out;
 }
 
+// melee-pc: MELEE_DISC_READ_DELAY_US (fixture) stands in for a slow device's
+// disc. tools/net_test.py --cold-cache puts it on one peer only, so a load
+// costs that peer more simulated frames than the other and the pair hits the
+// scene-alignment defect on one machine (docs/netcode-plan.md §5.2). Reading
+// the env per read is fine: this is never set in a shipped run.
+s32 readDelayUs() {
+  static const s32 us = [] {
+    const char* env = getenv("MELEE_DISC_READ_DELAY_US");
+    return env != nullptr ? atoi(env) : 0;
+  }();
+  return us;
+}
+
 s32 readFromHandle(CommandDataBase* handle, void* out, s32 length, s32 offset, u32* transferredOut) {
+  if (const s32 us = readDelayUs(); us > 0) {
+    std::this_thread::sleep_for(std::chrono::microseconds(us));
+  }
   if (transferredOut != nullptr) {
     *transferredOut = 0;
   }
@@ -341,6 +423,10 @@ void finishCommand(DVDCommandBlock* block, s32 result, u32 transferred) {
   setCommandResult(block, stateForResult(result), transferred);
 }
 
+// melee-pc: commands enqueued and not yet completed (callback included), so
+// the netplay snapshot can refuse to roll back across an in-flight read.
+std::atomic<int> s_inflight{0};
+
 class DvdWorker {
 public:
   ~DvdWorker() { stop(); }
@@ -389,6 +475,7 @@ public:
 
   void enqueue(DVDCommandBlock* block) {
     bool executeNow = false;
+    s_inflight.fetch_add(1, std::memory_order_relaxed);
     {
       std::lock_guard lk(m_mutex);
       if (!m_running || m_shutdown) {
@@ -543,6 +630,7 @@ private:
     if (block->callback != nullptr) {
       block->callback(result, block);
     }
+    s_inflight.fetch_sub(1, std::memory_order_release);
   }
 
   void execute(DVDCommandBlock* block) {
@@ -579,6 +667,7 @@ private:
     if (block->callback != nullptr) {
       block->callback(DVD_RESULT_CANCELED, block);
     }
+    s_inflight.fetch_sub(1, std::memory_order_release);
   }
 
   static void complete_canceled_commands(const std::vector<DVDCommandBlock*>& blocks) {
@@ -609,6 +698,10 @@ private:
 };
 
 DvdWorker s_worker;
+
+} // namespace
+extern "C" int aurora_dvd_inflight() { return s_inflight.load(std::memory_order_acquire); }
+namespace {
 
 int completeImmediateCommand(DVDCommandBlock* block, u32 command, s32 result, u32 transferred, DVDCBCallback callback) {
   beginCommand(block, command, nullptr, 0, 0, callback);
@@ -655,24 +748,97 @@ bool aurora_dvd_open(const char* disc_path) {
   s_worker.stop();
   clearState();
 
-  SDL_IOStream* io = SDL_IOFromFile(disc_path, "rb");
-  if (io == nullptr) {
-    return false;
+  NodDiscStream stream{};
+  bool streamReady = false;
+
+#if defined(_WIN32)
+  HANDLE hFile = CreateFileA(disc_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hFile != INVALID_HANDLE_VALUE) {
+    LARGE_INTEGER fileSize;
+    if (GetFileSizeEx(hFile, &fileSize) && fileSize.QuadPart > 0) {
+      HANDLE hMapping = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+      if (hMapping != nullptr) {
+        void* mapped = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        if (mapped != nullptr) {
+          auto* streamData = new MmapStreamData{
+              .data = static_cast<const uint8_t*>(mapped),
+              .size = static_cast<uint64_t>(fileSize.QuadPart),
+              .fileHandle = hFile,
+              .mappingHandle = hMapping,
+          };
+          stream = {
+              .user_data = streamData,
+              .read_at = mmapStreamReadAt,
+              .stream_len = mmapStreamLen,
+              .close = mmapStreamClose,
+          };
+          streamReady = true;
+        } else {
+          CloseHandle(hMapping);
+          CloseHandle(hFile);
+        }
+      } else {
+        CloseHandle(hFile);
+      }
+    } else {
+      CloseHandle(hFile);
+    }
+  }
+#elif defined(__unix__) || defined(__APPLE__)
+  int fd = open(disc_path, O_RDONLY);
+  if (fd >= 0) {
+    struct stat st{};
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+      void* mapped = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+      if (mapped != MAP_FAILED) {
+#if defined(MADV_WILLNEED)
+        madvise(mapped, static_cast<size_t>(st.st_size), MADV_WILLNEED);
+#endif
+        auto* streamData = new MmapStreamData{
+            .data = static_cast<const uint8_t*>(mapped),
+            .size = static_cast<uint64_t>(st.st_size),
+            .fd = fd,
+        };
+        stream = {
+            .user_data = streamData,
+            .read_at = mmapStreamReadAt,
+            .stream_len = mmapStreamLen,
+            .close = mmapStreamClose,
+        };
+        streamReady = true;
+      } else {
+        close(fd);
+      }
+    } else {
+      close(fd);
+    }
+  }
+#endif
+
+  if (!streamReady) {
+    SDL_IOStream* io = SDL_IOFromFile(disc_path, "rb");
+    if (io == nullptr) {
+      return false;
+    }
+    stream = {
+        .user_data = io,
+        .read_at = sdlStreamReadAt,
+        .stream_len = sdlStreamLen,
+        .close = sdlStreamClose,
+    };
   }
 
-  const NodDiscStream stream{
-      .user_data = io,
-      .read_at = sdlStreamReadAt,
-      .stream_len = sdlStreamLen,
-      .close = sdlStreamClose,
-  };
+  const uint32_t hwThreads = std::thread::hardware_concurrency();
   const NodDiscOptions options{
-      .preloader_threads = 1,
+      .preloader_threads = hwThreads > 0 ? std::clamp(hwThreads, 2u, 4u) : 2u,
   };
 
   NodHandle* discHandle;
   NodResult result = nod_disc_open_stream(&stream, &options, &discHandle);
   if (result != NOD_RESULT_OK || discHandle == nullptr) {
+    if (stream.close != nullptr) {
+      stream.close(stream.user_data);
+    }
     clearState();
     return false;
   }
@@ -989,9 +1155,43 @@ int DVDSetAutoFatalMessaging(BOOL enable) {
   return prev;
 }
 
+static char s_localeExt[4] = {};
+
+void aurora_dvd_set_locale_extension(const char* ext) {
+  std::lock_guard lock(s_fstLock);
+  if (ext == nullptr || std::strlen(ext) != 3) {
+    s_localeExt[0] = '\0';
+    return;
+  }
+  std::memcpy(s_localeExt, ext, 4);
+}
+
+static s32 convertPathToEntrynumLocked(const char* pathPtr);
+
 s32 DVDConvertPathToEntrynum(const char* pathPtr) {
   std::lock_guard lock(s_fstLock);
 
+  s32 entry = convertPathToEntrynumLocked(pathPtr);
+  if (entry >= 0 || s_localeExt[0] == '\0' || pathPtr == nullptr) {
+    return entry;
+  }
+  // Locale fallback: the game names its localized files by the region it was
+  // built for (.usd / .dat for NTSC-U); other regions carry the same files
+  // under their own extension (.ukd, .frd, ...). Retry with that extension.
+  const size_t len = std::strlen(pathPtr);
+  if (len < 4 || pathPtr[len - 4] != '.') {
+    return entry;
+  }
+  const char* ext = pathPtr + len - 3;
+  if (!nameEqualsIgnoreCase(std::string(ext), "usd", 3) && !nameEqualsIgnoreCase(std::string(ext), "dat", 3)) {
+    return entry;
+  }
+  std::string alt(pathPtr, len - 3);
+  alt += s_localeExt;
+  return convertPathToEntrynumLocked(alt.c_str());
+}
+
+static s32 convertPathToEntrynumLocked(const char* pathPtr) {
   if (!s_initialized || pathPtr == nullptr || s_fstEntries.empty()) {
     return -1;
   }

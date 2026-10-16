@@ -28,6 +28,7 @@ struct ConvRequest {
   Range uniformRange;        // Uniforms
   TextureHandle dst;         // Destination texture
   SampleFilter sampleFilter = SampleFilter::Nearest;
+  uint32_t msaaSamples = 1; // Sample count of srcView; depth copies read sample 0
 };
 
 bool needs_conversion(GXTexFmt fmt);

@@ -8,7 +8,15 @@
 namespace aurora::gfx::detail {
 
 inline constexpr size_t FrameSlotCount = 2;
-inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
+#ifdef __EMSCRIPTEN__
+// The browser renderer submits inline and yields between VI ticks. One mapped
+// staging set bounds GPU work in flight and avoids five 87 MiB allocations.
+inline constexpr size_t StagingBufferCount = 1;
+#elif defined(__ANDROID__)
+inline constexpr size_t StagingBufferCount = FrameSlotCount + 1; // 3 staging buffers on mobile
+#else
+inline constexpr size_t StagingBufferCount = FrameSlotCount + 3; // 5 staging buffers on desktop
+#endif
 inline constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize +
                                               StorageBufferSize + (UseTextureBuffer ? TextureUploadSize : 0);
 

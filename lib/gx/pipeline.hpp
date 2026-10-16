@@ -11,13 +11,24 @@ struct DrawData {
   gfx::Range idxRange;
   gfx::Range uniformRange;
   DrawImmediateData immediateData;
+#ifdef __EMSCRIPTEN__
+  gfx::Range immediateRange;
+#endif
   uint32_t vtxCount;
   uint32_t indexCount;
   uint32_t instanceCount;
   uint32_t dstAlpha;
+  // Breadcrumb from the most recent GXInsertDebugMarker. Captured here
+  // because the FIFO is processed on a worker thread, so reading a global at
+  // render time attributes draws to whatever the game thread did last.
+  uint32_t tag;
 };
 
+#ifdef __EMSCRIPTEN__
+constexpr uint32_t GXPipelineConfigVersion = 10013;
+#else
 constexpr uint32_t GXPipelineConfigVersion = 13;
+#endif
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1; // deprecated

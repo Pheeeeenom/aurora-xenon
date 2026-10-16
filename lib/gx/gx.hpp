@@ -353,6 +353,11 @@ struct GXState {
   GXPixelFmt pixelFmt = GX_PF_RGB8_Z24;
   GXZFmt16 zFmt = GX_ZC_LINEAR;
   bool zCompLocBeforeTex = false;
+  // Z texture unit (BP 0xF4/0xF5). zTexFmt is the raw ztex2 encoding:
+  // 0 = U8, 1 = U16, 2 = U24.
+  GXZTexOp zTexOp = GX_ZT_DISABLE;
+  u8 zTexFmt = 0;
+  u32 zTexBias = 0;
   u32 dstAlpha; // u8; UINT32_MAX = disabled
   AlphaCompare alphaCompare;
   std::array<Vec4<float>, MaxTevRegs> colorRegs;
@@ -437,6 +442,7 @@ void initialize() noexcept;
 void shutdown() noexcept;
 void update() noexcept;
 void set_viewport_policy(AuroraViewportPolicy policy) noexcept;
+void set_presentation_aspect(float aspect) noexcept;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;
 void evict_copy_texture(const void* dest) noexcept;
@@ -495,7 +501,14 @@ struct ShaderConfig {
   u8 vtxStride = 0;
   u8 lineMode : 2 = 0; // 1 = GX_LINES, 2 = GX_LINESTRIP, 3 = GX_POINTS
   u8 fogRangeEnabled : 1 = false;
-  u8 pad1 : 5 = 0;
+  u8 zTexOp : 2 = 0;  // GXZTexOp
+  u8 zTexFmt : 2 = 0; // ztex2 encoding: 0 = U8, 1 = U16, 2 = U24
+  /* GX only lets a Z texture reach the depth buffer under compare-after-
+   * texture; before-texture writes the polygon's own depth and ztex affects
+   * fog only. In the shader key because it decides whether frag_depth is
+   * emitted. Takes the spare pad bit, so sizeof is unchanged and the
+   * persisted pipeline cache stays valid. */
+  u8 zCompLocBeforeTex : 1 = 0;
   u8 pad2 = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
@@ -506,6 +519,7 @@ struct ShaderConfig {
   AlphaCompare alphaCompare;
   std::array<IndStage, MaxIndStages> indStages{};
   u32 numIndStages = 0;
+  u32 zTexBias = 0;
 
   bool operator==(const ShaderConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
 };
@@ -531,6 +545,9 @@ struct ShaderInfo {
   std::bitset<MaxTextures> sampledIndTextures;
   std::bitset<MaxIndTexMtxs> usedIndTexMtxs;
   u32 uniformSize = 0;
+  // TEV stage whose texture sample feeds the Z texture unit, or -1 if the
+  // fragment shader emits no frag_depth.
+  s8 zTexStage = -1;
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   u8 lineMode : 2 = 0;
@@ -542,6 +559,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
 wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, const gfx::RenderTargetLayout& layout,
                                     const PipelineOptions& options, ArrayRef<wgpu::VertexBufferLayout> vtxBuffers,
                                     wgpu::ShaderModule shader, const char* label) noexcept;
+#ifdef __EMSCRIPTEN__
+bool take_browser_pipeline(gfx::PipelineRef ref, wgpu::RenderPipeline& pipeline);
+#endif
 std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlphaMode,
                                 uint32_t normalAttachment = UINT32_MAX) noexcept;
 wgpu::ShaderModule build_shader(const ShaderConfig& config, const gfx::RenderTargetLayout& layout,

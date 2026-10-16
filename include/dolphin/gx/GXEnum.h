@@ -576,6 +576,8 @@ typedef enum {
 
 typedef enum { GX_TB_ZERO, GX_TB_ADDHALF, GX_TB_SUBHALF, GX_MAX_TEVBIAS } GXTevBias;
 
+typedef enum { GX_TC_LINEAR, GX_TC_GE, GX_TC_EQ, GX_TC_LE, GX_MAX_TEVCLAMPMODE } GXTevClampMode;
+
 typedef enum { GX_CS_SCALE_1, GX_CS_SCALE_2, GX_CS_SCALE_4, GX_CS_DIVIDE_2, GX_MAX_TEVSCALE } GXTevScale;
 
 typedef enum {

@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 struct SDL_Window;
 
@@ -56,6 +57,8 @@ extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
 extern wgpu::Instance g_instance;
 extern wgpu::AdapterInfo g_adapterInfo;
+extern std::string g_adapterName;
+extern std::string g_adapterDriver;
 extern bool g_hasCoreFeatures;
 extern bool g_bcTexturesSupported;
 extern bool g_astcTexturesSupported;
@@ -83,5 +86,14 @@ size_t load_from_cache(void const* key, size_t keySize, void* value, size_t valu
 void store_to_cache(void const* key, size_t keySize, void const* value, size_t valueSize, void* userdata);
 void cache_prune();
 void cache_shutdown();
+
+/* melee-pc: Dawn blob-cache traffic since startup. A hit is a Tint compile
+ * (shader module) or a VkPipelineCache payload (pipeline) Dawn did not have
+ * to produce again; a miss is followed by a store once Dawn has made it. */
+struct CacheStats {
+  uint32_t hits = 0, misses = 0, stores = 0;
+  uint64_t hitBytes = 0, storeBytes = 0;
+};
+CacheStats cache_stats();
 
 } // namespace aurora::webgpu

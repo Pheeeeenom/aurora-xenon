@@ -15,6 +15,8 @@ extern "C" {
 typedef enum {
   SAMPLER_BILINEAR,
   SAMPLER_AREA,
+  SAMPLER_CRT,
+  SAMPLER_VIBRANT,
 } AuroraSampler;
 
 typedef enum {
@@ -120,6 +122,12 @@ typedef struct {
 
 typedef struct {
   AuroraBackend backend;
+  /* Adapter the backend landed on: WebGPU device name, driver description,
+   * PCI vendor/device id. Empty strings / 0 without a GPU backend. */
+  const char* adapterName;
+  const char* adapterDriver;
+  uint32_t adapterVendorId;
+  uint32_t adapterDeviceId;
   const char* userPath;
   const char* cachePath;
   SDL_Window* window;
@@ -136,6 +144,9 @@ void aurora_set_log_level(AuroraLogLevel level);
 void aurora_set_pause_on_focus_lost(bool value);
 void aurora_set_background_input(bool value);
 void aurora_set_resampler(AuroraSampler sampler);
+/** Keeps the previous frame instead of clearing, for hosts that pause the
+ *  game: with nothing drawing, a cleared framebuffer presents as black. */
+void aurora_preserve_frame_buffer(bool preserve);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
 

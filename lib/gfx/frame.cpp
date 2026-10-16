@@ -1,4 +1,12 @@
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+extern "C" void browser_yield(void);
+// Implemented in browser_upload.js.
+extern "C" void browser_upload_pools(void* queue, const unsigned* entries, unsigned count);
+#endif
 #include "frame.hpp"
+#include <aurora/gfx.h>
+#include <cstdlib>
 
 #include "depth_peek.hpp"
 #include "pipeline_cache.hpp"
@@ -48,6 +56,13 @@ enum class BufferMapState {
 };
 
 std::array<wgpu::Buffer, StagingBufferCount> g_stagingBuffers;
+#ifdef __EMSCRIPTEN__
+// Browser rendering is inline. WriteBuffer copies the CPU bytes before returning,
+// so this arena can be reused after end_frame, independently of GPU completion.
+// emdawn mapped ranges otherwise allocate/clear/copy the entire 87 MiB pool on
+// every frame even when only a small part is used.
+std::vector<u8> g_browserStagingBytes;
+#endif
 std::array<std::atomic<BufferMapState>, StagingBufferCount> g_mappingStates;
 uint32_t g_frameIndex = UINT32_MAX;
 
@@ -118,7 +133,7 @@ std::atomic_int64_t g_lastPresentNs = 0;
 std::atomic_int64_t g_presentPeriodNs = 0;
 std::atomic_int64_t g_cpuFrameTimeNs = 0;
 PresentClock::time_point g_cpuFrameStart;
-constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{2};
+constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{1};
 constexpr auto MaxPacingSample = std::chrono::milliseconds{250};
 constexpr uint32_t PacingEmaWeight = 8;
 
@@ -179,7 +194,12 @@ void wait_for_gpu_progress(std::chrono::nanoseconds sleepDuration) {
   if (render_worker::is_idle()) {
     enqueue_process_events();
   }
+#ifdef __EMSCRIPTEN__
+  // Browser GPU promises resolve only after yielding the JavaScript event loop.
+  browser_yield();
+#else
   std::this_thread::sleep_for(sleepDuration);
+#endif
 }
 
 void pace_frame_start() {
@@ -214,6 +234,12 @@ void pace_frame_start() {
 }
 
 void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
+#ifdef __EMSCRIPTEN__
+  // CPU recording uses its own arena; queued writes need no GPU mapping.
+  g_mappingStates[slot].store(BufferMapState::Mapped, std::memory_order_release);
+  if (releaseSlotOnCompletion) g_stagingSlots.release(slot);
+  return;
+#endif
   auto expected = BufferMapState::Unmapped;
   if (!g_mappingStates[slot].compare_exchange_strong(expected, BufferMapState::Mapping, std::memory_order_acq_rel,
                                                      std::memory_order_acquire)) {
@@ -426,10 +452,23 @@ void initialize() {
                "Shared Index Buffer");
   createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
                "Shared Storage Buffer");
+#ifdef __EMSCRIPTEN__
+  g_browserStagingBytes.resize(StagingBufferSize);
+#endif
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
+#ifdef __EMSCRIPTEN__
+    // writeBuffer is queue-ordered before this frame's submission. Vertex,
+    // uniform, index and storage ranges are append-only within the packet,
+    // so end_frame uploads them directly to their final buffers instead of
+    // keeping 63 MiB of duplicate GPU staging. Textures still need a copy
+    // source, which is all the browser's staging buffer holds.
+    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc, TextureUploadSize,
+                 label.c_str());
+#else
     createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
                  label.c_str());
+#endif
   }
   for (auto& state : g_mappingStates) {
     state.store(BufferMapState::Unmapped, std::memory_order_release);
@@ -561,6 +600,11 @@ void shutdown() {
   g_resources.indexBuffer = {};
   g_resources.storageBuffer = {};
   g_stagingBuffers.fill({});
+#ifdef __EMSCRIPTEN__
+  EM_ASM({ delete Module.gpuUploadScratch; });
+  g_browserStagingBytes.clear();
+  g_browserStagingBytes.shrink_to_fit();
+#endif
   for (auto& packet : g_framePackets) {
     packet = {};
   }
@@ -622,7 +666,13 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
 
 bool begin_frame() {
   ZoneScoped;
-  // pace_frame_start();
+  // Opt-in until display-specific button-to-photon measurements validate it.
+  // The simulation retains its independent 60 Hz pacing in pc/vi.c.
+  static const bool jit = [] {
+    const char* value = std::getenv("MELEE_NET_JIT");
+    return value && value[0] == '1';
+  }();
+  if (jit && aurora_vsync_enabled()) pace_frame_start();
   const size_t frameSlot = acquire_frame_slot();
   const auto stagingSlot = acquire_mapped_staging_buffer();
   if (!stagingSlot) {
@@ -637,19 +687,24 @@ bool begin_frame() {
   frame.stagingBuffer = *stagingSlot;
   size_t bufferOffset = 0;
   const auto& stagingBuf = g_stagingBuffers[*stagingSlot];
-  const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size) {
+  const auto mapBuffer = [&](ByteBuffer& buf, uint64_t size, const char* name) {
     if (size <= 0) {
       return;
     }
-    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+#ifdef __EMSCRIPTEN__
+    buf = ByteBuffer{g_browserStagingBytes.data() + bufferOffset, static_cast<size_t>(size), name};
+#else
+    buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)),
+                     static_cast<size_t>(size), name};
+#endif
     bufferOffset += size;
   };
-  mapBuffer(frame.verts, VertexBufferSize);
-  mapBuffer(frame.uniforms, UniformBufferSize);
-  mapBuffer(frame.indices, IndexBufferSize);
-  mapBuffer(frame.storage, StorageBufferSize);
+  mapBuffer(frame.verts, VertexBufferSize, "verts");
+  mapBuffer(frame.uniforms, UniformBufferSize, "uniforms");
+  mapBuffer(frame.indices, IndexBufferSize, "indices");
+  mapBuffer(frame.storage, StorageBufferSize, "storage");
   if constexpr (UseTextureBuffer) {
-    mapBuffer(frame.textureUpload, TextureUploadSize);
+    mapBuffer(frame.textureUpload, TextureUploadSize, "textureUpload");
   }
 
   begin_recording(frame, frameSlot);
@@ -678,10 +733,51 @@ void end_frame(EndFrameCallback callback) {
   end_pipeline_frame();
   ++g_frameIndex;
 
+  /* MELEE_GFX_STATS=1: peak per-pool high-water marks, so the frame budgets
+   * in resources.hpp can be sized from data instead of guessed at. */
+  {
+    static const bool report = getenv("MELEE_GFX_STATS") != nullptr;
+    if (report) {
+      static size_t peakVerts, peakUniforms, peakIndices, peakStorage, peakTexture;
+      static auto last = PresentClock::now();
+      peakVerts = std::max(peakVerts, frame.verts.size());
+      peakUniforms = std::max(peakUniforms, frame.uniforms.size());
+      peakIndices = std::max(peakIndices, frame.indices.size());
+      peakStorage = std::max(peakStorage, frame.storage.size());
+      peakTexture = std::max(peakTexture, frame.textureUpload.size());
+      const auto now = PresentClock::now();
+      if (now - last >= std::chrono::seconds{1}) {
+        last = now;
+        Log.info("staging peak KiB: verts {} uniforms {} indices {} storage {} texture {}",
+                 peakVerts / 1024, peakUniforms / 1024, peakIndices / 1024, peakStorage / 1024,
+                 peakTexture / 1024);
+      }
+    }
+  }
+
   const size_t stagingSlot = frame.stagingBuffer;
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
+#ifdef __EMSCRIPTEN__
+    unsigned entries[15]{};
+    size_t count = 0;
+    const auto upload = [&](const wgpu::Buffer& dst, const ByteBuffer& data, size_t capacity) {
+      const size_t bytes = (data.size() + 3) & ~size_t{3};
+      AURORA_ASSERT(bytes <= capacity, "Browser upload exceeds its destination buffer");
+      entries[count * 3] = reinterpret_cast<uintptr_t>(dst.Get());
+      entries[count * 3 + 1] = reinterpret_cast<uintptr_t>(data.data());
+      entries[count * 3 + 2] = bytes;
+      ++count;
+    };
+    upload(g_resources.vertexBuffer, packet.verts, VertexBufferSize);
+    upload(g_resources.uniformBuffer, packet.uniforms, UniformBufferSize);
+    upload(g_resources.indexBuffer, packet.indices, IndexBufferSize);
+    upload(g_resources.storageBuffer, packet.storage, StorageBufferSize);
+    if constexpr (UseTextureBuffer) upload(g_stagingBuffers[stagingSlot], packet.textureUpload, TextureUploadSize);
+    browser_upload_pools(g_queue.Get(), entries, count);
+#else
     g_stagingBuffers[stagingSlot].Unmap();
+#endif
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;

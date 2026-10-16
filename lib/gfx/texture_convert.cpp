@@ -632,6 +632,24 @@ ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, ui
   case GX_TF_CMPR:
     converted = BuildRGBA8FromCMPR(width, height, mips, data);
     break;
+
+    /* Depth textures live in RAM with the same tiling as the colour format of
+     * equal bit depth: Z8 like I8, Z16 like IA8, Z24X8 like RGBA8. The
+     * Z-texture unit reads the decoded texel as a 24-bit depth, so only the
+     * byte layout matters here. Currently unreached: HSD_EraseRect is the
+     * tree's only Z8 loader and its ztex is refused on compare-before-texture
+     * grounds, so nothing puts a depth texture in sampledTextures. Kept
+     * because the decodes are correct and are what this path needs the moment
+     * anything pairs a depth format with compare-after-texture Z. */
+  case GX_TF_Z8:
+    converted = DecodeTiled<TextureDecoderI8>(width, height, mips, data);
+    break;
+  case GX_TF_Z16:
+    converted = DecodeTiled<TextureDecoderIA8>(width, height, mips, data);
+    break;
+  case GX_TF_Z24X8:
+    converted = BuildRGBA8FromGCN(width, height, mips, data);
+    break;
   }
   const auto wgpuFormat = to_wgpu(format);
   bool hasArbitraryMips = false;

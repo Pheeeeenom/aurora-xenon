@@ -65,6 +65,11 @@ void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
 bool has_normal_attachment() noexcept;
 RenderTargetLayout get_render_target_layout() noexcept;
+void clear_caches() noexcept;
+/* Keep the EFB contents instead of clearing at the start of a frame. Used
+   when the host pauses the game: nothing draws, so a cleared EFB would
+   present as black. */
+void set_preserve_frame_buffer(bool preserve) noexcept;
 
 namespace tex_palette_conv {
 struct ConvRequest;

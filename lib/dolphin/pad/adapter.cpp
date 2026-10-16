@@ -232,12 +232,43 @@ struct PortInputs {
 
 private:
   void add_controller_bindings(std::vector<Binding>& out) const {
+    constexpr uint32_t kNativeButtonAxisBit = 0x40000000u;
+    constexpr uint32_t kNativeButtonAxisNegBit = 0x20000000u;
     const auto& c = controls();
-    bool leftTriggerSet = false;
-    bool rightTriggerSet = false;
     for (const auto& mapping : buttons) {
       const ControlId target = control_for_button(mapping.padButton);
-      if (target == kInvalidControlId || mapping.nativeButton >= SDL_GAMEPAD_BUTTON_COUNT) {
+      if (target == kInvalidControlId) {
+        continue;
+      }
+      if ((mapping.nativeButton & kNativeButtonAxisBit) != 0 && mapping.nativeButton != PAD_NATIVE_BUTTON_INVALID) {
+        const auto axis = static_cast<int32_t>(mapping.nativeButton & ~(kNativeButtonAxisBit | kNativeButtonAxisNegBit));
+        if (axis >= 0 && axis < SDL_GAMEPAD_AXIS_COUNT) {
+          using Direction = PhysicalInput::GamepadAxis::Direction;
+          float threshold = 0.5f;
+          if (mapping.padButton == PAD_TRIGGER_L) {
+            threshold = std::clamp(static_cast<float>(deadZones.leftTriggerActivationZone + 1) / 32767.f,
+                                   1.f / 32767.f, 1.f);
+          } else if (mapping.padButton == PAD_TRIGGER_R) {
+            threshold = std::clamp(static_cast<float>(deadZones.rightTriggerActivationZone + 1) / 32767.f,
+                                   1.f / 32767.f, 1.f);
+          }
+          out.push_back({
+              .input =
+                  {
+                      .source = controller,
+                      .control = PhysicalInput::GamepadAxis{
+                          .axis = static_cast<SDL_GamepadAxis>(axis),
+                          .direction = (mapping.nativeButton & kNativeButtonAxisNegBit) != 0 ? Direction::Negative
+                                                                                             : Direction::Positive,
+                      },
+                  },
+              .target = target,
+              .threshold = threshold,
+          });
+        }
+        continue;
+      }
+      if (mapping.nativeButton >= SDL_GAMEPAD_BUTTON_COUNT) {
         continue;
       }
       out.push_back({
@@ -248,8 +279,6 @@ private:
               },
           .target = target,
       });
-      leftTriggerSet = leftTriggerSet || mapping.padButton == PAD_TRIGGER_L;
-      rightTriggerSet = rightTriggerSet || mapping.padButton == PAD_TRIGGER_R;
     }
 
     const float stickDeadZone = deadZones.useDeadzones ? deadZones.stickDeadZone / 32767.f : 0.f;
@@ -260,11 +289,17 @@ private:
       if (target.control == kInvalidControlId || !input) {
         continue;
       }
+      float scale = target.scale;
+      if (mapping.padAxis >= PAD_AXIS_LEFT_X_POS && mapping.padAxis <= PAD_AXIS_LEFT_Y_NEG) {
+        scale *= 80.f / 127.f;
+      } else if (mapping.padAxis >= PAD_AXIS_RIGHT_X_POS && mapping.padAxis <= PAD_AXIS_RIGHT_Y_NEG) {
+        scale *= 72.f / 127.f;
+      }
       out.push_back({
           .input = *input,
           .target = target.control,
           .deadZone = input->control.is<PhysicalInput::GamepadAxis>() ? target.deadZone : 0.f,
-          .scale = target.scale,
+          .scale = scale,
       });
     }
 
@@ -279,12 +314,8 @@ private:
           });
         }
       };
-      if (!leftTriggerSet) {
-        emulate(PAD_AXIS_TRIGGER_L, c.l, deadZones.leftTriggerActivationZone);
-      }
-      if (!rightTriggerSet) {
-        emulate(PAD_AXIS_TRIGGER_R, c.r, deadZones.rightTriggerActivationZone);
-      }
+      emulate(PAD_AXIS_TRIGGER_L, c.l, deadZones.leftTriggerActivationZone);
+      emulate(PAD_AXIS_TRIGGER_R, c.r, deadZones.rightTriggerActivationZone);
     }
 
     for (size_t i = 0; i < kExtButtons.size(); ++i) {

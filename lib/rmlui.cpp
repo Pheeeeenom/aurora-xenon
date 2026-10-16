@@ -37,6 +37,7 @@ struct TrackedTouch {
 };
 
 uint32_t s_pressedMouseButtons = 0;
+input::LayerId s_inputLayer = input::kInvalidLayerId;
 std::array<TrackedTouch, MaxTrackedTouches> s_trackedTouches{};
 float s_uiScale = 0.0f;
 webgpu::TextureWithSampler s_renderTarget;
@@ -408,6 +409,7 @@ void cancel_touches() noexcept {
       touch_cancel(touch);
     }
   }
+
 }
 } // namespace
 
@@ -439,6 +441,13 @@ void initialize(const AuroraWindowSize& size) noexcept {
 
   if (g_context) {
     sync_context_metrics(dim);
+    s_inputLayer = input::register_layer({
+        .label = "aurora.rmlui",
+        .priority = input::kRmlUiLayerPriority,
+        .onEvent = [](const input::InputEvent& event, void*) {
+          return process_input(event).handled ? input::EventResult::Consume : input::EventResult::Pass;
+        },
+    });
   } else {
     Log.error("Failed to initialize RmlUI Context!");
     Rml::Shutdown();
@@ -565,6 +574,8 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
 }
 
 void shutdown() noexcept {
+  input::unregister_layer(s_inputLayer);
+  s_inputLayer = input::kInvalidLayerId;
   if (g_context == nullptr) {
     return;
   }

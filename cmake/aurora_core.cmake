@@ -43,7 +43,11 @@ endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL Windows)
     # stuff for fetching system info.
-    target_link_libraries(aurora_core PRIVATE wbemuuid.lib comsuppw.lib ntdll.lib DXGI.lib)
+    if (MSVC)
+        target_link_libraries(aurora_core PRIVATE wbemuuid.lib comsuppw.lib ntdll.lib DXGI.lib)
+    else ()
+        target_link_libraries(aurora_core PRIVATE wbemuuid ntdll dxgi)
+    endif ()
 elseif (APPLE)
     target_sources(aurora_core PRIVATE lib/system_info_mac.mm)
 endif ()
@@ -79,7 +83,10 @@ if (AURORA_ENABLE_RMLUI)
 endif ()
 
 if (AURORA_ENABLE_GX)
-    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX WEBGPU_DAWN)
+    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:WEBGPU_DAWN>)
+    if (EMSCRIPTEN)
+        target_link_options(aurora_core PUBLIC --js-library=${CMAKE_CURRENT_SOURCE_DIR}/lib/gfx/browser_upload.js)
+    endif ()
     target_sources(aurora_core PRIVATE
             lib/webgpu/gpu.cpp
             lib/webgpu/gpu_cache.cpp

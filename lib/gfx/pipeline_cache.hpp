@@ -42,5 +42,8 @@ PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTarge
 PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
 
 bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
+/* Blocks up to maxWaitMs while queued pipelines compile; returns how many are
+ * still pending (queued or mid-compile). */
+uint32_t wait_pipelines(uint32_t maxWaitMs);
 
 } // namespace aurora::gfx
