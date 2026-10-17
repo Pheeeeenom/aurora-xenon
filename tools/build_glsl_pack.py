@@ -40,10 +40,9 @@ def compile_spirv(glslang, source, directory):
 def lower(build_shaders, xost, spirv_bytes, source, optimize):
     """build_shaders.lower's result, or the reason xost refused the program."""
     try:
-        container, literals, resources = build_shaders.lower(xost, spirv_bytes, source, optimize)
-    except (Exception, SystemExit) as error:  # xost raises its own errors, and build_shaders exits
+        return build_shaders.lower(xost, spirv_bytes, source, optimize), None
+    except SystemExit as error:  # build_shaders exits on what xost refuses; anything else is a bug here
         return None, f"xost: {type(error).__name__}: {error}"
-    return (container, literals, resources), None
 
 
 def write_pack(output, shaders, recorded, left_out, optimize):
@@ -91,10 +90,10 @@ def main():
                 left_out.append((source.name, reason))
                 print(f"left out {source.name}: {reason}")
                 continue
-            container, literals, resources = lowered
+            container, literals, resources, clip_planes = lowered
             shaders.append({"name": build_shaders.c_name(source, C_PREFIX), "spirv": spirv_bytes,
                             "hash": build_shaders.fnv1a_64(spirv_bytes), "container": container,
-                            "literals": literals, "resources": resources,
+                            "literals": literals, "resources": resources, "clip_planes": clip_planes,
                             "program": int(PROGRAM_NAME.match(source.name).group(1), 16)})
     build_shaders.write_outputs(args.output, shaders, [s["name"] for s in shaders], build_shaders.DEFAULT_BUNDLE)
     write_pack(args.output, shaders, len(sources), left_out, args.optimize)
