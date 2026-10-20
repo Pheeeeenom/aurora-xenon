@@ -265,7 +265,8 @@ VkSampler sampler(const SamplerConfig& config) noexcept {
   return value;
 }
 
-std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc) noexcept {
+std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc, VkSampleCountFlagBits samples,
+                                               VkImageUsageFlags transfer) noexcept {
   using backend::TextureUsage;
   const bool depth = desc.format == TextureFormat::Depth32Float;
   // BC1 only as sampled images, where the layer has it (samples_bc1); 32-bit floats only sampled, as the layer has them
@@ -296,7 +297,7 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
       .extent = {desc.width, desc.height, 1},
       .mipLevels = 1,
       .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .samples = samples,
       .tiling = VK_IMAGE_TILING_OPTIMAL,
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -318,6 +319,11 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc)
                  (desc.width > SampledDepthMinSide && desc.height > SampledDepthMinSide ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
     break;
   }
+  // The layer samples no multisampled image (vulkan4xenon's docs/SUPPORT.md, Images).
+  if (samples != VK_SAMPLE_COUNT_1_BIT) {
+    info.usage &= ~VK_IMAGE_USAGE_SAMPLED_BIT;
+  }
+  info.usage |= transfer;
   if (!succeeded(vkCreateImage(g_device, &info, nullptr, &texture->image), "vkCreateImage")) {
     Log.error("No image for {} ({}x{})", desc.label, desc.width, desc.height);
     return {};
@@ -419,9 +425,6 @@ UploadBuffer::~UploadBuffer() {
 }
 
 bool initialize(AuroraBackend& backend) noexcept {
-  if (g_config.msaa > 1) {
-    Log.warn("vulkan4xenon has no multisampling; drawing with one sample, not {}", g_config.msaa);
-  }
   if (!initialize_device()) {
     return false;
   }
@@ -491,15 +494,16 @@ std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPe
 }
 
 // One pipeline a config, never a prepass: what Dawn's backend draws in two passes, destination alpha, make_pipeline
-// refuses. Every pass draws into one RGBA8 colour target at one sample, with or without depth (efb_layout and the
-// offscreen targets make_texture creates).
+// refuses. Every pass draws into one RGBA8 colour target, with or without depth, at one sample or, the EFB's, at its
+// samples (efb_layout and the offscreen targets make_texture creates).
 CompiledPipeline create_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout) noexcept {
-  if (layout.colorAttachmentCount != 1 || layout.sampleCount != 1) {
+  if (layout.colorAttachmentCount != 1 ||
+      (layout.sampleCount != 1 && layout.sampleCount != static_cast<uint32_t>(efb_samples()))) {
     Log.error("No pipeline for a pass of {} colour targets at {} samples; its draws are skipped",
               layout.colorAttachmentCount, layout.sampleCount);
     return {};
   }
-  return {.main = make_pipeline(config)};
+  return {.main = make_pipeline(config, static_cast<VkSampleCountFlagBits>(layout.sampleCount))};
 }
 
 std::shared_ptr<Pipeline> create_pipeline(const clear::PipelineConfig& config,
@@ -537,7 +541,7 @@ RenderTargetLayout efb_layout() noexcept {
           .height = size.height,
       }}},
       .depthStencilFormat = TextureFormat::Depth32Float,
-      .sampleCount = 1,
+      .sampleCount = static_cast<uint32_t>(efb_samples()),
   };
   detail::finalize_render_target_layout(layout);
   return layout;

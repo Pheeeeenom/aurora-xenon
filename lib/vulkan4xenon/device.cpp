@@ -88,9 +88,10 @@ VkExtent2D g_swapchainExtent{};
 std::vector<VkImage> g_swapchainImages;
 std::vector<VkImageView> g_swapchainViews;
 std::vector<VkFramebuffer> g_swapchainFramebuffers;
-// By how depth is left (DepthStore), whether a loaded depth was left to be read, then colour load op, then depth load
-// op. Scenes only load or clear.
-std::array<std::array<std::array<std::array<VkRenderPass, 3>, 3>, 2>, 3> g_scenePasses{};
+// By whether at the EFB's samples, then how depth is left (DepthStore), whether a loaded depth was left to be read,
+// colour load op and depth load op. Scenes only load or clear. At one sample only the first half is made.
+std::array<std::array<std::array<std::array<std::array<VkRenderPass, 3>, 3>, 2>, 3>, 2> g_scenePasses{};
+VkSampleCountFlagBits g_efbSamples = VK_SAMPLE_COUNT_1_BIT;
 std::array<VkRenderPass, 3> g_colorPasses{};
 // The swapchain's, cleared and left as it is, by Load.
 std::array<VkRenderPass, 3> g_presentPasses{};
@@ -228,8 +229,12 @@ bool add_block(MemoryPool& pool, VkDeviceSize minSize) noexcept {
   return true;
 }
 
+// At 2 or 4 samples, a scene's: its colour's average goes into a third attachment at one sample, which the layer
+// resolves at the pass's end (its docs/SUPPORT.md, Render passes).
 bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore depthStore, bool fromRead,
-                        VkRenderPass& out, VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM) noexcept {
+                        VkRenderPass& out, VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM,
+                        VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) noexcept {
+  const bool multisampled = samples != VK_SAMPLE_COUNT_1_BIT;
   const auto load_op = [](Load load) {
     switch (load) {
     case Load::Load:
@@ -253,7 +258,7 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore d
   const std::array attachments{
       VkAttachmentDescription{
           .format = colorFormat,
-          .samples = VK_SAMPLE_COUNT_1_BIT,
+          .samples = samples,
           .loadOp = load_op(colorLoad),
           .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
@@ -263,7 +268,7 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore d
       },
       VkAttachmentDescription{
           .format = VK_FORMAT_D24_UNORM_S8_UINT,
-          .samples = VK_SAMPLE_COUNT_1_BIT,
+          .samples = samples,
           .loadOp = load_op(depthLoad),
           .storeOp = depthStore == DepthStore::Dropped ? VK_ATTACHMENT_STORE_OP_DONT_CARE
                                                        : VK_ATTACHMENT_STORE_OP_STORE,
@@ -272,18 +277,30 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore d
           .initialLayout = depthBefore,
           .finalLayout = depthAfter,
       },
+      VkAttachmentDescription{
+          .format = colorFormat,
+          .samples = VK_SAMPLE_COUNT_1_BIT,
+          .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .initialLayout = VK_IMAGE_LAYOUT_GENERAL,
+          .finalLayout = VK_IMAGE_LAYOUT_GENERAL,
+      },
   };
   const VkAttachmentReference colorRef{.attachment = 0, .layout = VK_IMAGE_LAYOUT_GENERAL};
   const VkAttachmentReference depthRef{.attachment = 1, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+  const VkAttachmentReference resolveRef{.attachment = 2, .layout = VK_IMAGE_LAYOUT_GENERAL};
   const VkSubpassDescription subpass{
       .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
       .colorAttachmentCount = 1,
       .pColorAttachments = &colorRef,
+      .pResolveAttachments = multisampled ? &resolveRef : nullptr,
       .pDepthStencilAttachment = depth ? &depthRef : nullptr,
   };
   const VkRenderPassCreateInfo info{
       .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-      .attachmentCount = depth ? 2u : 1u,
+      .attachmentCount = multisampled ? 3u : depth ? 2u : 1u,
       .pAttachments = attachments.data(),
       .subpassCount = 1,
       .pSubpasses = &subpass,
@@ -291,20 +308,58 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore d
   return succeeded(vkCreateRenderPass(g_device, &info, nullptr, &out), "vkCreateRenderPass");
 }
 
-bool create_render_passes() noexcept {
+bool create_scene_passes(bool multisampled) noexcept {
   constexpr std::array SceneLoads{Load::Load, Load::Clear};
   for (const DepthStore store : {DepthStore::Kept, DepthStore::Read, DepthStore::Dropped}) {
     for (const bool fromRead : {false, true}) {
       for (const Load color : SceneLoads) {
         for (const Load depth : SceneLoads) {
           if (!create_render_pass(true, color, depth, store, fromRead,
-                                  g_scenePasses[static_cast<size_t>(store)][fromRead][static_cast<size_t>(color)]
-                                               [static_cast<size_t>(depth)])) {
+                                  g_scenePasses[multisampled][static_cast<size_t>(store)][fromRead]
+                                               [static_cast<size_t>(color)][static_cast<size_t>(depth)],
+                                  VK_FORMAT_R8G8B8A8_UNORM, multisampled ? g_efbSamples : VK_SAMPLE_COUNT_1_BIT)) {
             return false;
           }
         }
       }
     }
+  }
+  return true;
+}
+
+// The EFB's samples: the config's 2 or 4 where the layer draws its formats, R8G8B8A8 colour and D24S8 depth, at that
+// count (its docs/SUPPORT.md, Images), else one, with a warning.
+void pick_efb_samples() noexcept {
+  const auto wanted = static_cast<VkSampleCountFlagBits>(g_config.msaa);
+  if (wanted == VK_SAMPLE_COUNT_1_BIT) {
+    return;
+  }
+  VkImageFormatProperties color{};
+  VkImageFormatProperties depth{};
+  const bool taken =
+      (wanted == VK_SAMPLE_COUNT_2_BIT || wanted == VK_SAMPLE_COUNT_4_BIT) &&
+      vkGetPhysicalDeviceImageFormatProperties(g_physicalDevice, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
+                                               VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0,
+                                               &color) == VK_SUCCESS &&
+      vkGetPhysicalDeviceImageFormatProperties(
+          g_physicalDevice, VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0, &depth) == VK_SUCCESS &&
+      (color.sampleCounts & wanted) != 0 && (depth.sampleCounts & wanted) != 0;
+  if (!taken) {
+    Log.warn(
+        "vulkan4xenon draws the EFB's R8G8B8A8 colour and D24S8 depth at 1, 2 or 4 samples where it takes them; "
+        "drawing at one sample, not {}",
+        g_config.msaa);
+    return;
+  }
+  g_efbSamples = wanted;
+  Log.info("The EFB at {} samples", g_config.msaa);
+}
+
+bool create_render_passes() noexcept {
+  pick_efb_samples();
+  if (!create_scene_passes(false) || (g_efbSamples != VK_SAMPLE_COUNT_1_BIT && !create_scene_passes(true))) {
+    return false;
   }
   for (const Load color : {Load::Load, Load::Clear, Load::DontCare}) {
     if (!create_render_pass(false, color, Load::DontCare, DepthStore::Kept, false,
@@ -675,12 +730,14 @@ void shutdown_device() noexcept {
     vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
     g_swapchain = VK_NULL_HANDLE;
   }
-  for (auto& stored : g_scenePasses) {
-    for (auto& loaded : stored) {
-      for (auto& passes : loaded) {
-        for (auto& pass : passes) {
-          vkDestroyRenderPass(g_device, pass, nullptr);
-          pass = VK_NULL_HANDLE;
+  for (auto& counts : g_scenePasses) {
+    for (auto& stored : counts) {
+      for (auto& loaded : stored) {
+        for (auto& passes : loaded) {
+          for (auto& pass : passes) {
+            vkDestroyRenderPass(g_device, pass, nullptr);
+            pass = VK_NULL_HANDLE;
+          }
         }
       }
     }
@@ -874,10 +931,12 @@ bool wait_for_frame(uint64_t serial) noexcept {
   return true;
 }
 
-VkRenderPass scene_pass(Load color, Load depth, DepthStore depthStore, bool fromRead) noexcept {
-  return g_scenePasses[static_cast<size_t>(depthStore)][fromRead][static_cast<size_t>(color)]
+VkRenderPass scene_pass(Load color, Load depth, DepthStore depthStore, bool fromRead, bool multisampled) noexcept {
+  return g_scenePasses[multisampled][static_cast<size_t>(depthStore)][fromRead][static_cast<size_t>(color)]
                       [static_cast<size_t>(depth)];
 }
+
+VkSampleCountFlagBits efb_samples() noexcept { return g_efbSamples; }
 
 VkRenderPass color_pass(Load color) noexcept { return g_colorPasses[static_cast<size_t>(color)]; }
 

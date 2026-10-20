@@ -79,6 +79,9 @@ struct FrameState {
   VkDescriptorSet uniformSet = VK_NULL_HANDLE;
   std::shared_ptr<backend::Texture> efbColor;
   std::shared_ptr<backend::Texture> efbDepth;
+  // At 2 or 4 samples (update_efb), else null.
+  std::shared_ptr<backend::Texture> efbMultisampled;
+  std::shared_ptr<backend::Texture> efbDepthRead;
   // Render worker only.
   bool recording = false;
   size_t uploadsDone = 0;
@@ -100,10 +103,14 @@ constexpr uint64_t IndexListBytes = 4u << 20;
 decode::IndexLists g_lists{IndexListBytes};
 // The index patterns (gx::fifo::index_patterns), for every frame's draws; none when they're off.
 Buffer g_indexPatterns;
-// Game thread, between frames: the EFB the next frame draws into.
+// Game thread, between frames: the EFB the next frame draws into. At 2 or 4 samples its passes draw into the
+// multisampled colour and depth, the colour's average going into g_efbColor and the depth's sample 0, when a copy or
+// GXPeekZ reads it, into g_efbDepthRead (encode_pass).
 TextureExtent g_efbSize{};
 std::shared_ptr<backend::Texture> g_efbColor;
 std::shared_ptr<backend::Texture> g_efbDepth;
+std::shared_ptr<backend::Texture> g_efbMultisampled;
+std::shared_ptr<backend::Texture> g_efbDepthRead;
 
 // Render worker: what the pass being recorded has bound.
 PipelineRef g_currentPipeline = UINTPTR_MAX;
@@ -226,7 +233,7 @@ bool update_efb() noexcept {
     Log.warn("The EFB is {}x{}, not the window's {}x{}: vulkan4xenon draws at most {}x{}", size.width, size.height,
              window.fb_width, window.fb_height, screen.width, screen.height);
   }
-  auto color = backend::create_texture({
+  const backend::TextureDesc colorDesc{
       .width = size.width,
       .height = size.height,
       .mips = 1,
@@ -234,8 +241,8 @@ bool update_efb() noexcept {
       .gxFormat = InvalidTextureFormat,
       .usage = backend::TextureUsage::Render,
       .label = "EFB colour",
-  });
-  auto depth = backend::create_texture({
+  };
+  const backend::TextureDesc depthDesc{
       .width = size.width,
       .height = size.height,
       .mips = 1,
@@ -243,12 +250,21 @@ bool update_efb() noexcept {
       .gxFormat = InvalidTextureFormat,
       .usage = backend::TextureUsage::Depth,
       .label = "EFB depth",
-  });
-  if (!color || !depth) {
+  };
+  const VkSampleCountFlagBits samples = efb_samples();
+  const bool multisampled = samples != VK_SAMPLE_COUNT_1_BIT;
+  auto color = make_texture(colorDesc);
+  auto depth = make_texture(depthDesc, samples, multisampled ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+  auto drawn = multisampled ? make_texture(colorDesc, samples) : nullptr;
+  auto depthRead =
+      multisampled ? make_texture(depthDesc, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT) : nullptr;
+  if (!color || !depth || (multisampled && (!drawn || !depthRead))) {
     return false;
   }
   g_efbColor = std::move(color);
   g_efbDepth = std::move(depth);
+  g_efbMultisampled = std::move(drawn);
+  g_efbDepthRead = std::move(depthRead);
   g_efbSize = size;
   return true;
 }
@@ -297,8 +313,10 @@ VkRect2D to_scissor(const ClipRect& scissor, const TextureExtent& size) noexcept
   };
 }
 
-// A colour target's framebuffer, alone or with a depth target.
-VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture* depth) noexcept {
+// A colour target's framebuffer, alone or with a depth target; the multisampled EFB's with its depth and the EFB its
+// colour's average goes into, which update_efb makes and replaces together.
+VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture* depth,
+                                 const backend::Texture* resolve = nullptr) noexcept {
   if (color.framebuffer != VK_NULL_HANDLE && color.framebufferDepth == depth) {
     return color.framebuffer;
   }
@@ -306,11 +324,13 @@ VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture
     retire([framebuffer = color.framebuffer] { vkDestroyFramebuffer(g_device, framebuffer, nullptr); });
     color.framebuffer = VK_NULL_HANDLE;
   }
-  const std::array attachments{color.view, depth != nullptr ? depth->view : VK_NULL_HANDLE};
+  const std::array attachments{color.view, depth != nullptr ? depth->view : VK_NULL_HANDLE,
+                               resolve != nullptr ? resolve->view : VK_NULL_HANDLE};
   const VkFramebufferCreateInfo info{
       .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-      .renderPass = depth != nullptr ? scene_pass(Load::Load, Load::Load) : color_pass(Load::Load),
-      .attachmentCount = depth != nullptr ? 2u : 1u,
+      .renderPass = depth != nullptr ? scene_pass(Load::Load, Load::Load, DepthStore::Kept, false, resolve != nullptr)
+                                     : color_pass(Load::Load),
+      .attachmentCount = resolve != nullptr ? 3u : depth != nullptr ? 2u : 1u,
       .pAttachments = attachments.data(),
       .width = color.width,
       .height = color.height,
@@ -962,6 +982,18 @@ void encode_palette_conv(const tex_palette_conv::ConvRequest& conv, VkCommandBuf
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, push);
 }
 
+// The multisampled EFB depth's sample 0 into the one-sample depth copies and GXPeekZ sample: the layer takes it out of
+// eDRAM at the end of the pass just before, so it must follow vkCmdEndRenderPass (vulkan4xenon's docs/SUPPORT.md,
+// Commands), and it ignores layouts.
+void resolve_depth(const backend::Texture& depth, const backend::Texture& read, VkCommandBuffer cmd) noexcept {
+  const VkImageResolve region{
+      .srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+      .dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1},
+      .extent = {depth.width, depth.height, 1},
+  };
+  vkCmdResolveImage(cmd, depth.image, VK_IMAGE_LAYOUT_GENERAL, read.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+}
+
 void encode_pass(const detail::FramePacket& frame, FrameState& state, const detail::FrameOp& op,
                  detail::RenderPass& pass, VkCommandBuffer cmd) noexcept {
   if (!pass.sealed) {
@@ -980,24 +1012,31 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
   if (color == nullptr || (pass.hasDepth && depth == nullptr)) {
     return;
   }
+  // At 2 or 4 samples the EFB's passes, which always have depth (gfx/recording.cpp, set_efb_targets), draw into its
+  // multisampled colour and depth, and readDepth is the one-sample depth that copies and GXPeekZ sample.
+  backend::Texture* const multisampled = colorAttachment.target ? nullptr : state.efbMultisampled.get();
+  backend::Texture* const readDepth = multisampled != nullptr ? state.efbDepthRead.get() : depth;
   // A depth copy or GXPeekZ's snapshot samples the pass's depth, which the layer copies out of eDRAM only from a pass
-  // that leaves it to be read; one with nothing to draw is encoded all the same to leave it so.
-  const bool sampledDepth = pass.hasDepth && depth->depthView != VK_NULL_HANDLE;
+  // that leaves it to be read, or at 2 and 4 samples resolves after it; one with nothing to draw is encoded all the
+  // same to leave it so.
+  const bool sampledDepth = pass.hasDepth && readDepth->depthView != VK_NULL_HANDLE;
   const bool depthCopy = pass.resolveTarget && gx::is_depth_format(pass.resolveFormat);
   DepthPeekSlot* const peek = pass.captureDepthSnapshot && sampledDepth ? due_depth_peek() : nullptr;
   const bool depthRead = sampledDepth && (depthCopy || peek != nullptr);
   // A pass with nothing to draw leaves its targets as they are, so only its copy is encoded.
   if (pass.has_content() || depthRead) {
-    const VkFramebuffer framebuffer = target_framebuffer(*color, pass.hasDepth ? depth : nullptr);
+    const VkFramebuffer framebuffer = multisampled != nullptr
+                                          ? target_framebuffer(*multisampled, depth, color)
+                                          : target_framebuffer(*color, pass.hasDepth ? depth : nullptr);
     if (framebuffer == VK_NULL_HANDLE) {
       return;
     }
     const Load colorLoad = colorAttachment.clear ? Load::Clear : Load::Load;
     // The frame's last pass (recording.cpp's finish marks it) drops the EFB's depth unless a snapshot reads it: the
-    // next frame's first pass clears it.
-    const DepthStore depthStore = depthRead                                         ? DepthStore::Read
+    // next frame's first pass clears it. A multisampled depth is kept for its resolve.
+    const DepthStore depthStore = depthRead ? (multisampled != nullptr ? DepthStore::Kept : DepthStore::Read)
                                   : pass.captureDepthSnapshot && !pass.depthTarget ? DepthStore::Dropped
-                                                                                    : DepthStore::Kept;
+                                                                                   : DepthStore::Kept;
     const bool fromRead = pass.hasDepth && depth->depthLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
     const std::array clearValues{
         VkClearValue{.color = {.float32 = {colorAttachment.clearValue.x(), colorAttachment.clearValue.y(),
@@ -1006,9 +1045,9 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
     };
     const VkRenderPassBeginInfo begin{
         .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = pass.hasDepth
-                          ? scene_pass(colorLoad, pass.clearDepth ? Load::Clear : Load::Load, depthStore, fromRead)
-                          : color_pass(colorLoad),
+        .renderPass = pass.hasDepth ? scene_pass(colorLoad, pass.clearDepth ? Load::Clear : Load::Load, depthStore,
+                                                 fromRead, multisampled != nullptr)
+                                    : color_pass(colorLoad),
         .framebuffer = framebuffer,
         .renderArea = {{0, 0}, {color->width, color->height}},
         .clearValueCount = pass.hasDepth ? 2u : 1u,
@@ -1050,16 +1089,19 @@ void encode_pass(const detail::FramePacket& frame, FrameState& state, const deta
       }
     }
     vkCmdEndRenderPass(cmd);
+    if (multisampled != nullptr && depthRead) {
+      resolve_depth(*depth, *readDepth, cmd);
+    }
     if (pass.hasDepth) {
       depth->depthLayout = depthStore == DepthStore::Read ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                                                           : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     }
   }
   if (peek != nullptr) {
-    encode_depth_peek(*peek, *depth, cmd);
+    encode_depth_peek(*peek, *readDepth, cmd);
   }
   if (pass.resolveTarget) {
-    encode_copy(pass, *color, depth, depthRead, cmd);
+    encode_copy(pass, *color, readDepth, depthRead, cmd);
   }
 }
 } // namespace
@@ -1131,6 +1173,8 @@ void shutdown_frames() noexcept {
   g_lists = decode::IndexLists{IndexListBytes};
   g_efbColor.reset();
   g_efbDepth.reset();
+  g_efbMultisampled.reset();
+  g_efbDepthRead.reset();
   for (const auto& table : g_fogRangeTables) {
     free_set(table.set);
   }
@@ -1186,6 +1230,8 @@ bool begin_frame(detail::FramePacket& frame) noexcept {
   }
   state.efbColor = g_efbColor;
   state.efbDepth = g_efbDepth;
+  state.efbMultisampled = g_efbMultisampled;
+  state.efbDepthRead = g_efbDepthRead;
   frame.verts = ByteBuffer{state.verts.get(), VertexBufferSize};
   frame.uniforms = ByteBuffer{state.uniformData.get(), UniformBufferSize};
   frame.indices = ByteBuffer{state.indexData.get(), IndexBufferSize};

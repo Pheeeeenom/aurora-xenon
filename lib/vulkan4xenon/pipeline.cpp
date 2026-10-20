@@ -65,6 +65,8 @@ struct PipelineDesc {
   uint32_t stride;
   std::span<const VkVertexInputAttributeDescription> attributes;
   VkCullModeFlags cullMode = VK_CULL_MODE_NONE;
+  // The render pass's samples: the EFB's for its passes, else one.
+  VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   bool depthTest = false;
   bool depthWrite = false;
   VkCompareOp depthCompare = VK_COMPARE_OP_ALWAYS;
@@ -128,7 +130,7 @@ VkPipeline create_pipeline(const PipelineDesc& desc) noexcept {
   };
   const VkPipelineMultisampleStateCreateInfo multisample{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-      .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+      .rasterizationSamples = desc.samples,
   };
   const VkPipelineDepthStencilStateCreateInfo depthStencil{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -464,13 +466,16 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const clear::PipelineConfig& co
   if (vertex.empty() || fragment.empty()) {
     return nullptr;
   }
+  const bool multisampled = layout.sampleCount != 1;
   pipeline->pipeline = create_pipeline({
       .vertex = vertex,
       .fragment = fragment,
       .layout = g_clearLayout,
-      .renderPass = depth ? scene_pass(Load::Load, Load::Load) : color_pass(Load::Load),
+      .renderPass =
+          depth ? scene_pass(Load::Load, Load::Load, DepthStore::Kept, false, multisampled) : color_pass(Load::Load),
       .stride = TriangleStride,
       .attributes = std::span{attributes}.first(1),
+      .samples = static_cast<VkSampleCountFlagBits>(layout.sampleCount),
       .depthTest = depth,
       .depthWrite = depth && config.clearDepth,
       .blend = {.colorWriteMask = writeMask},
@@ -478,7 +483,8 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const clear::PipelineConfig& co
   return pipeline->pipeline != VK_NULL_HANDLE ? pipeline : nullptr;
 }
 
-std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& config) noexcept {
+std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& config,
+                                                 VkSampleCountFlagBits samples) noexcept {
   if (const char* reason = unsupported(config)) {
     Log.error("vulkan4xenon can't draw {}; a pipeline's draws are skipped", reason);
     return nullptr;
@@ -521,10 +527,11 @@ std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& confi
       .vertex = vertex,
       .fragment = fragment,
       .layout = g_gxLayout,
-      .renderPass = scene_pass(Load::Load, Load::Load),
+      .renderPass = scene_pass(Load::Load, Load::Load, DepthStore::Kept, false, samples != VK_SAMPLE_COUNT_1_BIT),
       .stride = pipeline->vertexLayout.stride,
       .attributes = attributes,
       .cullMode = cull_mode(config.cullMode),
+      .samples = samples,
       .depthTest = config.depthCompare,
       .depthWrite = config.depthCompare && config.depthUpdate,
       .depthCompare = compare_op(config.depthFunc),

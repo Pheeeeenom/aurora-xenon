@@ -103,9 +103,12 @@ enum class DepthStore : uint8_t {
   Dropped,
 };
 // RGBA8 colour, stored, and, for scenes, D24S8 depth, left as depthStore says. A loaded depth comes in as the pass
-// before left it: to be read when fromRead is set, else as an attachment.
-VkRenderPass scene_pass(Load color, Load depth, DepthStore depthStore = DepthStore::Kept,
-                        bool fromRead = false) noexcept;
+// before left it: to be read when fromRead is set, else as an attachment. Multisampled, both are at the EFB's samples,
+// and the colour's average goes into a third attachment, at one sample.
+VkRenderPass scene_pass(Load color, Load depth, DepthStore depthStore = DepthStore::Kept, bool fromRead = false,
+                        bool multisampled = false) noexcept;
+// The EFB's samples: 1, or the config's 2 or 4 where the layer draws the EFB's formats at that count.
+VkSampleCountFlagBits efb_samples() noexcept;
 VkRenderPass color_pass(Load color) noexcept;
 // B8G8R8A8 colour, the swapchain's only format (vulkan4xenon's docs/SUPPORT.md, Display and swapchain), cleared or
 // left as it is: what the present draws into.
@@ -162,8 +165,9 @@ VkBuffer triangle_buffer() noexcept;
 std::shared_ptr<backend::Pipeline> make_pipeline(const clear::PipelineConfig& config,
                                                  const RenderTargetLayout& layout) noexcept;
 // Null, with the reason logged, for a config the layer can't draw as GX does, glsl.hpp can't express or the game's
-// shader pack doesn't hold; its draws are skipped.
-std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& config) noexcept;
+// shader pack doesn't hold; its draws are skipped. At more than one sample, for the EFB's passes.
+std::shared_ptr<backend::Pipeline> make_pipeline(const gx::PipelineConfig& config,
+                                                 VkSampleCountFlagBits samples) noexcept;
 // Whether an EFB copy to this format draws a conversion rather than the texels as they are.
 bool converts(GXTexFmt format) noexcept;
 // Render worker: the pipeline drawing a copy to `format`, with alpha read as 1 when opaqueAlpha is set (copies from an
@@ -180,8 +184,11 @@ VkPipeline present_pipeline() noexcept;
 // backend.cpp: textures and descriptor sets.
 bool initialize_textures() noexcept;
 // Tiled, as every image the layer makes is. R32Float only sampled, as the range fog table; R8 and RG8 only sampled, as
-// intensity, and as intensity and alpha.
-std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc) noexcept;
+// intensity, and as intensity and alpha. At 2 or 4 samples, the EFB's colour or depth, never sampled; transfer adds
+// the usages a resolve takes.
+std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc,
+                                               VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
+                                               VkImageUsageFlags transfer = 0) noexcept;
 void shutdown_textures() noexcept;
 VkDescriptorSet allocate_set(VkDescriptorSetLayout layout) noexcept;
 void free_set(VkDescriptorSet set) noexcept;
