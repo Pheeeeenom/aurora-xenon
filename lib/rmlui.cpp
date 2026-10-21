@@ -21,6 +21,9 @@
 #include "rmlui/WebGPURenderInterface.hpp"
 #include "webgpu/gpu.hpp"
 #else
+#include "rmlui/RecordingRenderInterface.hpp"
+
+#include <RmlUi/Core/StyleSheetTypes.h>
 #include <aurora/gfx.hpp>
 #endif
 
@@ -394,6 +397,8 @@ void initialize(const AuroraWindowSize& size) noexcept {
 
   static GlassFilterInstancer s_glassInstancer;
   Rml::Factory::RegisterFilterInstancer("glass", &s_glassInstancer);
+#else
+  register_identity_filters();
 #endif
 
   g_context = Rml::CreateContext("main", dim);
@@ -515,12 +520,68 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
   };
 }
 #else
-void update() noexcept {
-  if (g_context == nullptr) {
+namespace {
+// An opacity filter at 0, which keeps RmlUi from drawing the element (rmlui:Source/Core/FilterBasic.cpp:40-50).
+bool filtered_out(Rml::Element& element) noexcept {
+  if (!element.GetComputedValues().has_filter()) {
+    return false;
+  }
+  const Rml::Property* property = element.GetProperty(Rml::PropertyId::Filter);
+  if (property == nullptr || property->unit != Rml::Unit::FILTER) {
+    return false;
+  }
+  const auto filters = property->Get<Rml::FiltersPtr>();
+  if (!filters) {
+    return false;
+  }
+  return std::ranges::any_of(filters->list, [](const Rml::FilterDeclaration& filter) {
+    const auto& properties = filter.properties.GetProperties();
+    return filter.type == "opacity" && properties.size() == 1 && properties.begin()->second.Get<float>() <= 0.f;
+  });
+}
+
+// Whether the element, shown, may draw: one that isn't a document, or anything inside a document.
+bool may_draw(Rml::Element& element) noexcept {
+  if (!element.IsVisible() || element.GetComputedValues().opacity() <= 0.f || filtered_out(element)) {
+    return false;
+  }
+  if (element.GetOwnerDocument() != &element) {
+    return true;
+  }
+  const int count = element.GetNumChildren();
+  for (int i = 0; i < count; ++i) {
+    if (may_draw(*element.GetChild(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool shows_anything(Rml::Context& context) noexcept {
+  for (int i = 0; i < context.GetNumDocuments(); ++i) {
+    if (may_draw(*context.GetDocument(i))) {
+      return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
+// Context::Render runs only on frames where something may draw: measured on the console, it took 0.19 ms a frame
+// with no more than one toast up (vulkan4xenon milestone 16, step 1).
+void update(gfx::ui::Frame& frame) noexcept {
+  auto* recorder = static_cast<RecordingRenderInterface*>(Backend::GetRenderInterface()); // NOLINT
+  if (g_context == nullptr || recorder == nullptr) {
+    frame.clear();
     return;
   }
   sync_context_metrics(presentation_dimensions_from_window_size(window::get_window_size()));
   g_context->Update();
+  if (shows_anything(*g_context)) {
+    recorder->BeginFrame(g_context->GetDimensions());
+    g_context->Render();
+  }
+  recorder->TakeFrame(frame);
 }
 #endif
 

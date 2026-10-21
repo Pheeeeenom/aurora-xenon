@@ -1624,6 +1624,41 @@ std::string palette_fragment(bool fourBit) {
       fourBit ? 15 : 255);
 }
 
+// z is 0 and w is 1, so the matrix's third column is never read. Components go through vectors, as in depth_fragment.
+std::string ui_vertex() {
+  return "#version 450\n"
+         "layout(push_constant, std140) uniform Push {\n"
+         "    vec4 column0;\n"
+         "    vec4 column1;\n"
+         "    vec4 column2;\n"
+         "    vec4 column3;\n"
+         "    vec4 translation;\n"
+         "} upush;\n"
+         "layout(location = 0) in vec2 in_position;\n"
+         "layout(location = 1) in vec4 in_color;\n"
+         "layout(location = 2) in vec2 in_uv;\n"
+         "layout(location = 0) out vec4 out_color;\n"
+         "layout(location = 1) out vec2 out_uv;\n"
+         "void main() {\n"
+         "    vec4 position = vec4(in_position, 0.0, 0.0) + upush.translation;\n"
+         "    gl_Position = upush.column0 * position.xxxx + upush.column1 * position.yyyy + upush.column3;\n"
+         "    out_color = in_color;\n"
+         "    out_uv = in_uv;\n"
+         "}\n";
+}
+
+// No gamma: Dawn applies it only to sRGB targets (rmlui/WebGPURenderInterface.cpp:1752-1780).
+std::string ui_fragment() {
+  return "#version 450\n"
+         "layout(set = 0, binding = 0) uniform sampler2D source;\n"
+         "layout(location = 0) in vec4 in_color;\n"
+         "layout(location = 1) in vec2 in_uv;\n"
+         "layout(location = 0) out vec4 o_color;\n"
+         "void main() {\n"
+         "    o_color = in_color * texture(source, in_uv);\n"
+         "}\n";
+}
+
 std::vector<std::pair<std::string, bool>> fixed_programs() {
   std::vector<std::pair<std::string, bool>> programs{
       {clear_vertex(), false},
@@ -1642,6 +1677,8 @@ std::vector<std::pair<std::string, bool>> fixed_programs() {
   for (const bool fourBit : {false, true}) {
     programs.emplace_back(palette_fragment(fourBit), true);
   }
+  programs.emplace_back(ui_vertex(), false);
+  programs.emplace_back(ui_fragment(), true);
   return programs;
 }
 

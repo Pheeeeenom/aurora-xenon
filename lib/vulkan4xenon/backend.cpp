@@ -266,7 +266,7 @@ VkSampler sampler(const SamplerConfig& config) noexcept {
 }
 
 std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc, VkSampleCountFlagBits samples,
-                                               VkImageUsageFlags transfer) noexcept {
+                                               VkImageUsageFlags transfer, bool depthSampled) noexcept {
   using backend::TextureUsage;
   const bool depth = desc.format == TextureFormat::Depth32Float;
   // BC1 only as sampled images, where the layer has it (samples_bc1); 32-bit floats only sampled, as the layer has them
@@ -316,7 +316,9 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc,
     // Sampled too, for depth copies and GXPeekZ, where the layer can resolve into it: more than 16 texels on a side
     // (vulkan4xenon's docs/SUPPORT.md, Images).
     info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                 (desc.width > SampledDepthMinSide && desc.height > SampledDepthMinSide ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
+                 (depthSampled && desc.width > SampledDepthMinSide && desc.height > SampledDepthMinSide
+                      ? VK_IMAGE_USAGE_SAMPLED_BIT
+                      : 0);
     break;
   }
   // The layer samples no multisampled image (vulkan4xenon's docs/SUPPORT.md, Images).
@@ -435,7 +437,7 @@ bool initialize(AuroraBackend& backend) noexcept {
     shutdown_device();
     return false;
   }
-  if (!initialize_textures() || !initialize_frames()) {
+  if (!initialize_textures() || !initialize_frames() || !initialize_ui()) {
     shutdown();
     return false;
   }
@@ -449,6 +451,7 @@ void shutdown() noexcept {
   if (g_device != VK_NULL_HANDLE) {
     succeeded(vkDeviceWaitIdle(g_device), "vkDeviceWaitIdle");
   }
+  shutdown_ui();
   shutdown_frames();
   shutdown_textures();
   shutdown_pipelines();
@@ -555,15 +558,7 @@ void shutdown() noexcept { ImGui::DestroyContext(); }
 
 void process_event(const SDL_Event& event) noexcept { (void)event; }
 
-void new_frame(const AuroraWindowSize& size) noexcept {
-  ImGuiIO& io = ImGui::GetIO();
-  // A renderer would build the font atlas, and NewFrame needs it built.
-  if (!io.Fonts->IsBuilt()) {
-    io.Fonts->Build();
-  }
-  io.DisplaySize = {static_cast<float>(size.width), static_cast<float>(size.height)};
-  ImGui::NewFrame();
-}
+// new_frame is ui.cpp's.
 } // namespace aurora::imgui
 
 // The swapchain presents FIFO, always.
@@ -590,9 +585,4 @@ void aurora_gpu_frame_time(uint64_t* lastNs, uint64_t* meanNs, uint64_t* maxNs, 
   }
 }
 
-ImTextureID aurora_imgui_add_texture(uint32_t width, uint32_t height, const void* rgba8) {
-  (void)width;
-  (void)height;
-  (void)rgba8;
-  return ImTextureID{};
-}
+// aurora_imgui_add_texture is ui.cpp's.

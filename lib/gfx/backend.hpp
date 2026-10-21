@@ -32,6 +32,10 @@ namespace aurora::gfx {
 struct TextureSet;
 } // namespace aurora::gfx
 
+namespace aurora::gfx::ui {
+struct Frame;
+} // namespace aurora::gfx::ui
+
 // A backend also defines imgui.hpp's initialize, shutdown, process_event and new_frame, and the C calls left to it:
 // aurora_enable_vsync, aurora_present_waits_for_vblank, aurora_set_resampler, aurora_get_available_backends,
 // aurora_gpu_frame_time and aurora_imgui_add_texture.
@@ -156,6 +160,7 @@ void start_frame(detail::FramePacket& frame) noexcept;
 void finish_frame(detail::FramePacket& frame) noexcept;
 // Render worker: one recorded op of the frame, in order.
 void encode(detail::FramePacket& frame, const detail::FrameOp& op) noexcept;
-// Render worker: submits the frame and presents it with the overlay.
-void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay) noexcept;
+// Render worker: submits the frame and presents it with ImGui's overlay and, on a backend that draws it, RmlUi's list
+// (ui.hpp).
+void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const ui::Frame& ui) noexcept;
 } // namespace aurora::gfx::backend

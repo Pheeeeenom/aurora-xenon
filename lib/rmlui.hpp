@@ -9,6 +9,8 @@
 #include "webgpu/gpu.hpp"
 
 #include <dawn/webgpu_cpp.h>
+#else
+#include "gfx/ui.hpp"
 #endif
 
 namespace aurora::rmlui {
@@ -25,8 +27,8 @@ void handle_event(SDL_Event& event) noexcept;
 #ifdef AURORA_RMLUI_DRAWS
 RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept;
 #else
-// Runs the documents a frame, for a backend that doesn't draw them.
-void update() noexcept;
+// Runs the documents a frame and, where something shows, records what they draw, swapped into frame.
+void update(gfx::ui::Frame& frame) noexcept;
 #endif
 void shutdown() noexcept;
 

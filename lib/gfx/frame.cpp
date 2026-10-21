@@ -5,6 +5,7 @@
 #include "recording.hpp"
 #include "render_worker.hpp"
 #include "texture_replacement.hpp"
+#include "ui.hpp"
 #include "../gx/fifo.hpp"
 #include "../gx/gx.hpp"
 #include "../imgui.hpp"
@@ -74,10 +75,12 @@ uint32_t g_frameIndex = UINT32_MAX;
 std::array<FramePacket, FrameSlotCount> g_framePackets;
 uint64_t g_nextFrameId = 1;
 render_worker::FrameSlotPool g_frameSlots{FrameSlotCount};
-// What the game thread hands a frame's end, kept by slot until the frame is closed.
+// What the game thread hands a frame's end, kept by slot until the frame is closed; RmlUi's list until the slot is
+// taken again, as the render worker reads it.
 struct FrameEndData {
   imgui::DrawData overlay;
   std::string capturePath;
+  ui::Frame ui;
 };
 std::array<FrameEndData, FrameSlotCount> g_frameEnds;
 
@@ -230,8 +233,8 @@ FrameEnding end_frame(imgui::DrawData overlay, std::string capturePath) {
   const bool close = !rmlui::is_initialized();
 #else
 #ifdef AURORA_ENABLE_RMLUI
-  // A backend that doesn't draw RmlUi still runs its documents, a frame at a time.
-  rmlui::update();
+  // RmlUi records what it draws, for a backend that draws it with the frame.
+  rmlui::update(ending.ui);
 #endif
   constexpr bool close = true;
 #endif
@@ -290,7 +293,7 @@ void close_frame(size_t slot) noexcept {
   // The backend submits and presents the packet; the slot is free once the packet is cleared.
   render_worker::enqueue_end_frame(frameId, [slot, overlay = std::move(ending.overlay)] {
     auto& packet = g_framePackets[slot];
-    backend::end_frame(packet, overlay);
+    backend::end_frame(packet, overlay, g_frameEnds[slot].ui);
     packet = {};
     g_frameSlots.release(slot);
   });

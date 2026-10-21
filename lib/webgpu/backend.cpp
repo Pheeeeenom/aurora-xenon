@@ -564,7 +564,9 @@ void finish_frame(FramePacket& frame) noexcept {
 #endif
 }
 
-void end_frame(FramePacket& frame, const imgui::DrawData& overlay) noexcept {
+// RmlUi records its own passes here (finish_frame), so its list is empty.
+void end_frame(FramePacket& frame, const imgui::DrawData& overlay, const ui::Frame& ui) noexcept {
+  (void)ui;
   auto& state = g_frames[frame.slot];
   const size_t stagingSlot = state.stagingBuffer;
   g_stagingBuffers[stagingSlot].Unmap();

@@ -126,6 +126,10 @@ bool converts(GXTexFmt format) noexcept;
 std::string depth_peek_fragment();
 // An EFB copy's 4- or 8-bit indices through the palette at set 1; the second push vector is (1, 0, 0.5, 0.5 N) / N.
 std::string palette_fragment(bool fourBit);
+// RmlUi's and ImGui's: position at 0, colour at 1 and texture coordinates at 2, the position plus the push constant's
+// translation (bytes 64 to 79) through its matrix (bytes 0 to 63, columns); the colour times set 0's binding 0.
+std::string ui_vertex();
+std::string ui_fragment();
 // Every one of those programs, and whether it's a fragment program, for the recorder.
 std::vector<std::pair<std::string, bool>> fixed_programs();
 

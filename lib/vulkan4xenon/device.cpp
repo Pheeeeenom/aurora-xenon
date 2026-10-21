@@ -95,6 +95,8 @@ VkSampleCountFlagBits g_efbSamples = VK_SAMPLE_COUNT_1_BIT;
 std::array<VkRenderPass, 3> g_colorPasses{};
 // The swapchain's, cleared and left as it is, by Load.
 std::array<VkRenderPass, 3> g_presentPasses{};
+// The UI's, by colour load op, then depth and stencil's: Load or Clear.
+std::array<std::array<VkRenderPass, 2>, 2> g_uiPasses{};
 
 std::mutex g_memoryMutex;
 std::array<MemoryPool, 3> g_pools{
@@ -231,9 +233,11 @@ bool add_block(MemoryPool& pool, VkDeviceSize minSize) noexcept {
 
 // At 2 or 4 samples, a scene's: its colour's average goes into a third attachment at one sample, which the layer
 // resolves at the pass's end (its docs/SUPPORT.md, Render passes).
+// With stencil, the depth attachment's stencil is loaded or cleared with its depth, and stored, as the UI's clip masks
+// last from one of its passes to the next.
 bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore depthStore, bool fromRead,
                         VkRenderPass& out, VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM,
-                        VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) noexcept {
+                        VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, bool stencil = false) noexcept {
   const bool multisampled = samples != VK_SAMPLE_COUNT_1_BIT;
   const auto load_op = [](Load load) {
     switch (load) {
@@ -272,8 +276,8 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore d
           .loadOp = load_op(depthLoad),
           .storeOp = depthStore == DepthStore::Dropped ? VK_ATTACHMENT_STORE_OP_DONT_CARE
                                                        : VK_ATTACHMENT_STORE_OP_STORE,
-          .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-          .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+          .stencilLoadOp = stencil ? load_op(depthLoad) : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+          .stencilStoreOp = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
           .initialLayout = depthBefore,
           .finalLayout = depthAfter,
       },
@@ -371,6 +375,15 @@ bool create_render_passes() noexcept {
     if (!create_render_pass(false, color, Load::DontCare, DepthStore::Kept, false,
                             g_presentPasses[static_cast<size_t>(color)], VK_FORMAT_B8G8R8A8_UNORM)) {
       return false;
+    }
+  }
+  for (const Load color : {Load::Load, Load::Clear}) {
+    for (const Load depth : {Load::Load, Load::Clear}) {
+      if (!create_render_pass(true, color, depth, DepthStore::Kept, false,
+                              g_uiPasses[static_cast<size_t>(color)][static_cast<size_t>(depth)],
+                              VK_FORMAT_R8G8B8A8_UNORM, VK_SAMPLE_COUNT_1_BIT, true)) {
+        return false;
+      }
     }
   }
   return true;
@@ -750,6 +763,12 @@ void shutdown_device() noexcept {
     vkDestroyRenderPass(g_device, pass, nullptr);
     pass = VK_NULL_HANDLE;
   }
+  for (auto& passes : g_uiPasses) {
+    for (auto& pass : passes) {
+      vkDestroyRenderPass(g_device, pass, nullptr);
+      pass = VK_NULL_HANDLE;
+    }
+  }
   for (auto& pool : g_pools) {
     for (const auto& block : pool.blocks) {
       vkFreeMemory(g_device, block.memory, nullptr);
@@ -941,6 +960,10 @@ VkSampleCountFlagBits efb_samples() noexcept { return g_efbSamples; }
 VkRenderPass color_pass(Load color) noexcept { return g_colorPasses[static_cast<size_t>(color)]; }
 
 VkRenderPass present_pass(Load color) noexcept { return g_presentPasses[static_cast<size_t>(color)]; }
+
+VkRenderPass ui_pass(Load color, Load depthStencil) noexcept {
+  return g_uiPasses[static_cast<size_t>(color)][static_cast<size_t>(depthStencil)];
+}
 
 VkExtent2D swapchain_extent() noexcept { return g_swapchainExtent; }
 

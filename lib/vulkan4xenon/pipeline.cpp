@@ -34,6 +34,7 @@ VkPipelineLayout g_gxLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_clearLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_copyLayout = VK_NULL_HANDLE;
 VkPipelineLayout g_paletteLayout = VK_NULL_HANDLE;
+VkPipelineLayout g_uiLayout = VK_NULL_HANDLE;
 Buffer g_triangle;
 VkPipeline g_presentPipeline = VK_NULL_HANDLE;
 
@@ -47,6 +48,13 @@ std::array<std::optional<VkPipeline>, 2> g_palettePipelines;
 std::array<std::string, 2> g_paletteFragments;
 // Made on GXPeekZ's first snapshot.
 std::optional<VkPipeline> g_depthPeekPipeline;
+// Render worker only. The UI's, made at the first frame that draws them: RmlUi's by ui::Pipeline, ImGui's, and the
+// present's composite.
+std::string g_uiVertex;
+std::string g_uiFragment;
+std::array<std::optional<VkPipeline>, 6> g_uiPipelines;
+std::optional<VkPipeline> g_imguiPipeline;
+std::optional<VkPipeline> g_uiPresentPipeline;
 
 bool create_module(Program program, VkShaderModule& out) noexcept {
   const VkShaderModuleCreateInfo info{
@@ -74,6 +82,10 @@ struct PipelineDesc {
       .colorWriteMask =
           VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
   };
+  // Both faces' stencil, its reference set by the draw: the UI's clip mask.
+  bool stencilTest = false;
+  VkCompareOp stencilCompare = VK_COMPARE_OP_ALWAYS;
+  VkStencilOp stencilPass = VK_STENCIL_OP_KEEP;
 };
 
 // Under g_pipelineMutex.
@@ -132,21 +144,33 @@ VkPipeline create_pipeline(const PipelineDesc& desc) noexcept {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
       .rasterizationSamples = desc.samples,
   };
+  const VkStencilOpState stencil{
+      .failOp = VK_STENCIL_OP_KEEP,
+      .passOp = desc.stencilPass,
+      .depthFailOp = VK_STENCIL_OP_KEEP,
+      .compareOp = desc.stencilCompare,
+      .compareMask = 0xFF,
+      .writeMask = 0xFF,
+  };
   const VkPipelineDepthStencilStateCreateInfo depthStencil{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
       .depthTestEnable = desc.depthTest,
       .depthWriteEnable = desc.depthWrite,
       .depthCompareOp = desc.depthCompare,
+      .stencilTestEnable = desc.stencilTest,
+      .front = stencil,
+      .back = stencil,
   };
   const VkPipelineColorBlendStateCreateInfo blend{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
       .attachmentCount = 1,
       .pAttachments = &desc.blend,
   };
-  const std::array dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+  const std::array dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE};
   const VkPipelineDynamicStateCreateInfo dynamic{
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-      .dynamicStateCount = dynamicStates.size(),
+      .dynamicStateCount = desc.stencilTest ? 3u : 2u,
       .pDynamicStates = dynamicStates.data(),
   };
   const VkGraphicsPipelineCreateInfo info{
@@ -230,7 +254,8 @@ bool create_layouts() noexcept {
          create_layout({}, VK_SHADER_STAGE_FRAGMENT_BIT, 16, g_clearLayout) &&
          create_layout(std::span{&g_sourceSetLayout, 1}, VK_SHADER_STAGE_VERTEX_BIT, 16, g_copyLayout) &&
          create_layout(std::array{g_sourceSetLayout, g_sourceSetLayout},
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 32, g_paletteLayout);
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 32, g_paletteLayout) &&
+         create_layout(std::span{&g_sourceSetLayout, 1}, VK_SHADER_STAGE_VERTEX_BIT, UiPushBytes, g_uiLayout);
 }
 
 // GX's blend, depth and cull state as Dawn's backend sets it (webgpu/backend.cpp, build_pipeline).
@@ -368,8 +393,24 @@ std::array<VkVertexInputAttributeDescription, 2> triangle_attributes() noexcept 
   };
 }
 
-// A copy's pipeline into a render pass of the target's format; null when glslang refuses its programs.
-VkPipeline make_copy_pipeline(GXTexFmt format, bool opaqueAlpha, VkRenderPass renderPass) noexcept {
+// Each channel the source plus the destination times one minus the source's alpha: premultiplied colour over what's
+// there.
+constexpr VkPipelineColorBlendAttachmentState PremultipliedBlend{
+    .blendEnable = VK_TRUE,
+    .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+    .colorBlendOp = VK_BLEND_OP_ADD,
+    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+    .alphaBlendOp = VK_BLEND_OP_ADD,
+    .colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+};
+
+// A copy's pipeline into a render pass of the target's format, blended as given or not at all; null when glslang
+// refuses its programs.
+VkPipeline make_copy_pipeline(GXTexFmt format, bool opaqueAlpha, VkRenderPass renderPass,
+                              const VkPipelineColorBlendAttachmentState* blend = nullptr) noexcept {
   const auto attributes = triangle_attributes();
   std::lock_guard lock{g_pipelineMutex};
   const auto vertex = find_program(g_copyVertex, false);
@@ -377,13 +418,49 @@ VkPipeline make_copy_pipeline(GXTexFmt format, bool opaqueAlpha, VkRenderPass re
   if (vertex.empty() || fragment.empty()) {
     return VK_NULL_HANDLE;
   }
-  return create_pipeline({
+  PipelineDesc desc{
       .vertex = vertex,
       .fragment = fragment,
       .layout = g_copyLayout,
       .renderPass = renderPass,
       .stride = TriangleStride,
       .attributes = attributes,
+  };
+  if (blend != nullptr) {
+    desc.blend = *blend;
+  }
+  return create_pipeline(desc);
+}
+
+// The UI programs' pipeline over vertices of 20 bytes: the position at 0, the colour and texture coordinates where
+// given.
+VkPipeline make_ui_pipeline(VkFormat colorFormat, uint32_t colorOffset, uint32_t uvOffset,
+                            const VkPipelineColorBlendAttachmentState& blend, bool stencilTest = false,
+                            VkCompareOp stencilCompare = VK_COMPARE_OP_ALWAYS,
+                            VkStencilOp stencilPass = VK_STENCIL_OP_KEEP) noexcept {
+  const std::array attributes{
+      VkVertexInputAttributeDescription{.location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 0},
+      VkVertexInputAttributeDescription{.location = 1, .binding = 0, .format = colorFormat, .offset = colorOffset},
+      VkVertexInputAttributeDescription{
+          .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = uvOffset},
+  };
+  std::lock_guard lock{g_pipelineMutex};
+  const auto vertex = find_program(g_uiVertex, false);
+  const auto fragment = find_program(g_uiFragment, true);
+  if (vertex.empty() || fragment.empty()) {
+    return VK_NULL_HANDLE;
+  }
+  return create_pipeline({
+      .vertex = vertex,
+      .fragment = fragment,
+      .layout = g_uiLayout,
+      .renderPass = ui_pass(Load::Load, Load::Load),
+      .stride = 20,
+      .attributes = attributes,
+      .blend = blend,
+      .stencilTest = stencilTest,
+      .stencilCompare = stencilCompare,
+      .stencilPass = stencilPass,
   });
 }
 } // namespace
@@ -400,6 +477,8 @@ bool initialize_pipelines() noexcept {
   g_copyVertex = glsl::copy_vertex();
   g_paletteFragments[0] = glsl::palette_fragment(false);
   g_paletteFragments[1] = glsl::palette_fragment(true);
+  g_uiVertex = glsl::ui_vertex();
+  g_uiFragment = glsl::ui_fragment();
   initialize_programs();
   // The present copies the EFB to the swapchain's B8G8R8A8 images.
   g_presentPipeline = make_copy_pipeline(GX_TF_RGBA8, false, present_pass(Load::DontCare));
@@ -421,9 +500,21 @@ void shutdown_pipelines() noexcept {
     vkDestroyPipeline(g_device, *g_depthPeekPipeline, nullptr);
   }
   g_depthPeekPipeline.reset();
+  for (auto* pipeline : {&g_imguiPipeline, &g_uiPresentPipeline}) {
+    if (*pipeline) {
+      vkDestroyPipeline(g_device, **pipeline, nullptr);
+    }
+    pipeline->reset();
+  }
+  for (auto& pipeline : g_uiPipelines) {
+    if (pipeline) {
+      vkDestroyPipeline(g_device, *pipeline, nullptr);
+    }
+    pipeline.reset();
+  }
   vkDestroyPipeline(g_device, g_presentPipeline, nullptr);
   g_presentPipeline = VK_NULL_HANDLE;
-  for (auto* layout : {&g_gxLayout, &g_clearLayout, &g_copyLayout, &g_paletteLayout}) {
+  for (auto* layout : {&g_gxLayout, &g_clearLayout, &g_copyLayout, &g_paletteLayout, &g_uiLayout}) {
     vkDestroyPipelineLayout(g_device, *layout, nullptr);
     *layout = VK_NULL_HANDLE;
   }
@@ -444,6 +535,8 @@ VkDescriptorSetLayout source_set_layout() noexcept { return g_sourceSetLayout; }
 VkPipelineLayout copy_layout() noexcept { return g_copyLayout; }
 
 VkPipelineLayout palette_layout() noexcept { return g_paletteLayout; }
+
+VkPipelineLayout ui_pipeline_layout() noexcept { return g_uiLayout; }
 
 VkBuffer triangle_buffer() noexcept { return g_triangle.buffer; }
 
@@ -597,6 +690,72 @@ VkPipeline depth_peek_pipeline() noexcept {
 }
 
 VkPipeline present_pipeline() noexcept { return g_presentPipeline; }
+
+// RmlUi's colour is bytes in R, G, B, A order (rmlui:Include/RmlUi/Core/Vertex.h:12-18), at 8, and its texture
+// coordinates at 12. Its blending is premultiplied, and the clip mask's stencil Dawn's (rmlui/pipeline.cpp,
+// create_pipeline).
+VkPipeline ui_pipeline(ui::Pipeline kind) noexcept {
+  auto& pipeline = g_uiPipelines[static_cast<size_t>(kind)];
+  if (pipeline) {
+    return *pipeline;
+  }
+  constexpr VkPipelineColorBlendAttachmentState Replace{
+      .colorWriteMask =
+          VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+  };
+  constexpr VkPipelineColorBlendAttachmentState NoColour{};
+  constexpr VkFormat Bytes = VK_FORMAT_R8G8B8A8_UNORM;
+  switch (kind) {
+  case ui::Pipeline::Blend:
+    pipeline = make_ui_pipeline(Bytes, 8, 12, PremultipliedBlend);
+    break;
+  case ui::Pipeline::BlendMasked:
+    pipeline = make_ui_pipeline(Bytes, 8, 12, PremultipliedBlend, true, VK_COMPARE_OP_EQUAL);
+    break;
+  case ui::Pipeline::Replace:
+    pipeline = make_ui_pipeline(Bytes, 8, 12, Replace);
+    break;
+  case ui::Pipeline::ReplaceMasked:
+    pipeline = make_ui_pipeline(Bytes, 8, 12, Replace, true, VK_COMPARE_OP_EQUAL);
+    break;
+  case ui::Pipeline::ClipReplace:
+    pipeline = make_ui_pipeline(Bytes, 8, 12, NoColour, true, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE);
+    break;
+  case ui::Pipeline::ClipIntersect:
+    pipeline = make_ui_pipeline(Bytes, 8, 12, NoColour, true, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_INCREMENT_AND_CLAMP);
+    break;
+  }
+  return *pipeline;
+}
+
+// ImGui's colour is a word IM_COL32 makes, red in its low byte (imgui:imgui.h:2882-2889), at 16, and its texture
+// coordinates at 8. Its blend leaves premultiplied colour in the UI image
+// (imgui:backends/imgui_impl_vulkan.cpp:968-972).
+VkPipeline imgui_pipeline() noexcept {
+  if (!g_imguiPipeline) {
+    constexpr VkPipelineColorBlendAttachmentState Blend{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    g_imguiPipeline = make_ui_pipeline(VK_FORMAT_A8B8G8R8_UNORM_PACK32, 16, 8, Blend);
+  }
+  return *g_imguiPipeline;
+}
+
+// Dawn's premultiplied copy (webgpu/present.cpp:216-219): the UI image over the swapchain image, sampled as the EFB is.
+VkPipeline ui_present_pipeline() noexcept {
+  if (!g_uiPresentPipeline) {
+    g_uiPresentPipeline = make_copy_pipeline(GX_TF_RGBA8, false, present_pass(Load::DontCare), &PremultipliedBlend);
+  }
+  return *g_uiPresentPipeline;
+}
 } // namespace aurora::gfx::vulkan4xenon
 
 namespace aurora::gfx::backend {

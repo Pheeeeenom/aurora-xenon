@@ -69,6 +69,8 @@ if (AURORA_ENABLE_RMLUI)
                 lib/rmlui/GlassFilter.cpp
                 lib/rmlui/ImageEffects.cpp
         )
+    else ()
+        target_sources(aurora_core PRIVATE lib/rmlui/RecordingRenderInterface.cpp)
     endif ()
     target_link_libraries(aurora_core PUBLIC rmlui)
 

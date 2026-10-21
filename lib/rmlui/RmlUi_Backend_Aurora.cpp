@@ -4,6 +4,8 @@
 #include "SystemInterface_Aurora.h"
 #ifdef AURORA_RMLUI_DRAWS
 #include "WebGPURenderInterface.hpp"
+#else
+#include "RecordingRenderInterface.hpp"
 #endif
 
 namespace Backend {
@@ -11,26 +13,7 @@ namespace Backend {
 #ifdef AURORA_RMLUI_DRAWS
 using RenderInterface = aurora::rmlui::WebGPURenderInterface;
 #else
-// A backend that doesn't draw RmlUi: geometry and textures get handles, and nothing reaches the screen.
-class RenderInterface final : public Rml::RenderInterface {
-public:
-  Rml::CompiledGeometryHandle CompileGeometry(Rml::Span<const Rml::Vertex>, Rml::Span<const int>) override {
-    return ++m_lastHandle;
-  }
-  void RenderGeometry(Rml::CompiledGeometryHandle, Rml::Vector2f, Rml::TextureHandle) override {}
-  void ReleaseGeometry(Rml::CompiledGeometryHandle) override {}
-  Rml::TextureHandle LoadTexture(Rml::Vector2i& dimensions, const Rml::String&) override {
-    dimensions = {1, 1};
-    return ++m_lastHandle;
-  }
-  Rml::TextureHandle GenerateTexture(Rml::Span<const Rml::byte>, Rml::Vector2i) override { return ++m_lastHandle; }
-  void ReleaseTexture(Rml::TextureHandle) override {}
-  void EnableScissorRegion(bool) override {}
-  void SetScissorRegion(Rml::Rectanglei) override {}
-
-private:
-  uintptr_t m_lastHandle = 0;
-};
+using RenderInterface = aurora::rmlui::RecordingRenderInterface;
 #endif
 
 RenderInterface* g_RenderInterface = nullptr;

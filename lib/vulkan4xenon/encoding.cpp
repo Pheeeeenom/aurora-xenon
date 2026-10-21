@@ -11,6 +11,7 @@
 #include "../window.hpp"
 #include "glsl.hpp"
 #include "tiled_index.hpp"
+#include "ui_layout.hpp"
 
 #include <xxhash.h>
 
@@ -190,27 +191,47 @@ uint32_t g_cacheFrames = 0;
 std::atomic<uint64_t> g_acquireNs = 0;
 #endif
 
+} // namespace
+
+// A tiled R8G8B8A8 image's pitch is a multiple of 32 texels (xsdk:include/xsdk/texture.h), and its texels' bytes run
+// red to alpha in memory (xsdk:docs/HARDWARE.md, "Byte-order resolves"). Write-combined memory, so a word at a time:
+// each read goes to memory.
+std::array<uint8_t, 4> read_texel(const backend::Texture& image, uint32_t x, uint32_t y) noexcept {
+  const auto* texels = reinterpret_cast<const volatile uint32_t*>(image.memory.mapped);
+  const uint32_t texel = texels[tiled_index(x, y, (image.width + 31) & ~31u)];
+  std::array<uint8_t, 4> bytes;
+  std::memcpy(bytes.data(), &texel, bytes.size());
+  return bytes;
+}
+
+namespace {
 // A capture (aurora_capture_frame): the frame's EFB as a binary PPM, as the WebGPU backend writes its present source,
-// once the GPU has drawn it. The EFB is a tiled R8G8B8A8 image, its pitch a multiple of 32 texels
-// (xsdk:include/xsdk/texture.h), whose texels' bytes run red to alpha in memory (xsdk:docs/HARDWARE.md, "Byte-order
-// resolves"). Xenia puts a resolve in memory only with --readback_resolve=full.
-void write_capture(const backend::Texture& efb, uint64_t serial, const std::string& path) noexcept {
+// once the GPU has drawn it, with the UI image over it as the present composites them where the UI drew. Xenia puts a
+// resolve in memory only with --readback_resolve=full.
+void write_capture(const backend::Texture& efb, const backend::Texture* ui, uint64_t serial,
+                   const std::string& path) noexcept {
   if (!wait_for_frame(serial) || efb.memory.mapped == nullptr) {
     Log.warn("Frame capture: could not write {}", path);
     return;
   }
+  if (ui != nullptr && (ui->width != efb.width || ui->height != efb.height)) {
+    Log.warn("Frame capture: the UI is {}x{} and the EFB {}x{}, so {} shows the EFB alone", ui->width, ui->height,
+             efb.width, efb.height, path);
+    ui = nullptr;
+  }
   const std::string header = fmt::format("P6\n{} {}\n255\n", efb.width, efb.height);
   std::vector<uint8_t> ppm(header.begin(), header.end());
   ppm.reserve(header.size() + size_t{efb.width} * efb.height * 3);
-  // Write-combined memory, so a word at a time: each read goes to memory.
-  const auto* texels = reinterpret_cast<const volatile uint32_t*>(efb.memory.mapped);
-  const uint32_t pitch = (efb.width + 31) & ~31u;
   for (uint32_t y = 0; y < efb.height; ++y) {
     for (uint32_t x = 0; x < efb.width; ++x) {
-      const uint32_t texel = texels[tiled_index(x, y, pitch)];
-      uint8_t bytes[4];
-      std::memcpy(bytes, &texel, sizeof(bytes));
-      ppm.insert(ppm.end(), bytes, bytes + 3);
+      auto bytes = read_texel(efb, x, y);
+      if (ui != nullptr) {
+        const auto over = read_texel(*ui, x, y);
+        for (size_t channel = 0; channel < 3; ++channel) {
+          bytes[channel] = ui_layout::composite(bytes[channel], over[channel], over[3]);
+        }
+      }
+      ppm.insert(ppm.end(), bytes.begin(), bytes.begin() + 3);
     }
   }
   if (io::write_file(io::fs_path_from_string(path), ppm)) {
@@ -313,10 +334,12 @@ VkRect2D to_scissor(const ClipRect& scissor, const TextureExtent& size) noexcept
   };
 }
 
-// A colour target's framebuffer, alone or with a depth target; the multisampled EFB's with its depth and the EFB its
-// colour's average goes into, which update_efb makes and replaces together.
+} // namespace
+
+// The multisampled EFB's with its depth and the EFB its colour's average goes into, which update_efb makes and
+// replaces together.
 VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture* depth,
-                                 const backend::Texture* resolve = nullptr) noexcept {
+                                 const backend::Texture* resolve) noexcept {
   if (color.framebuffer != VK_NULL_HANDLE && color.framebufferDepth == depth) {
     return color.framebuffer;
   }
@@ -371,6 +394,7 @@ VkDescriptorSet source_set(backend::Texture& texture, bool linear) noexcept {
   return set;
 }
 
+namespace {
 // A pass drawing the triangle over a target through layout's sets and push constants.
 void draw_triangle(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
                    const VkViewport& viewport, VkPipeline pipeline, VkPipelineLayout layout,
@@ -400,13 +424,16 @@ void draw_triangle(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer f
   vkCmdEndRenderPass(cmd);
 }
 
-// A pass drawing one texture over a target, for copies and the present. source is offset and scale in it.
+} // namespace
+
 void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
                   const VkViewport& viewport, VkPipeline pipeline, VkDescriptorSet set,
                   const std::array<float, 4>& source) noexcept {
   draw_triangle(cmd, renderPass, framebuffer, extent, viewport, pipeline, copy_layout(), std::span{&set, 1},
                 VK_SHADER_STAGE_VERTEX_BIT, source);
 }
+
+namespace {
 
 // The bytes the game recorded into a CPU pool since the last copy, up to the op's high-water mark, into the GPU's.
 void copy_recorded(const CpuPool& from, Buffer& to, uint32_t& copied, uint32_t highWater) noexcept {
@@ -994,6 +1021,45 @@ void resolve_depth(const backend::Texture& depth, const backend::Texture& read, 
   vkCmdResolveImage(cmd, depth.image, VK_IMAGE_LAYOUT_GENERAL, read.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
+// The EFB copied into the swapchain image, then the UI image over it, premultiplied, where the UI drew: Dawn's present
+// (webgpu/present.cpp:209-221), in one pass.
+void present_efb(VkCommandBuffer cmd, VkFramebuffer framebuffer, VkExtent2D extent, const VkViewport& viewport,
+                 bool covered, backend::Texture& efb, backend::Texture* ui) noexcept {
+  const VkPipeline pipeline = present_pipeline();
+  const VkDescriptorSet set = source_set(efb, true);
+  if (pipeline == VK_NULL_HANDLE || set == VK_NULL_HANDLE) {
+    return;
+  }
+  const VkClearValue black{};
+  const VkRenderPassBeginInfo begin{
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+      .renderPass = present_pass(covered ? Load::DontCare : Load::Clear),
+      .framebuffer = framebuffer,
+      .renderArea = {{0, 0}, extent},
+      .clearValueCount = 1,
+      .pClearValues = &black,
+  };
+  vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  const VkRect2D scissor{{0, 0}, extent};
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
+  const VkBuffer vertices = triangle_buffer();
+  const VkDeviceSize offset = 0;
+  vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copy_layout(), 0, 1, &set, 0, nullptr);
+  vkCmdPushConstants(cmd, copy_layout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(WholeSource), WholeSource.data());
+  vkCmdDraw(cmd, 3, 1, 0, 0);
+  const VkPipeline composite = ui != nullptr ? ui_present_pipeline() : VK_NULL_HANDLE;
+  const VkDescriptorSet uiSet = composite != VK_NULL_HANDLE ? source_set(*ui, false) : VK_NULL_HANDLE;
+  if (uiSet != VK_NULL_HANDLE) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composite);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copy_layout(), 0, 1, &uiSet, 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+  }
+  vkCmdEndRenderPass(cmd);
+}
+
 void encode_pass(const detail::FramePacket& frame, FrameState& state, const detail::FrameOp& op,
                  detail::RenderPass& pass, VkCommandBuffer cmd) noexcept {
   if (!pass.sealed) {
@@ -1278,10 +1344,11 @@ void encode(detail::FramePacket& frame, const detail::FrameOp& op) noexcept {
   }
 }
 
-void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay) noexcept {
-  (void)overlay;
+void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const ui::Frame& ui) noexcept {
   auto& state = g_frames[frame.slot];
   const VkCommandBuffer cmd = slot_commands(frame.slot);
+  // Drawn whether or not a swapchain image is acquired, so a capture shows it.
+  backend::Texture* const uiImage = state.recording ? encode_ui(frame.slot, ui, overlay, cmd) : nullptr;
   uint32_t image = 0;
   VkFramebuffer framebuffer = VK_NULL_HANDLE;
 #ifdef AURORA_DIAGNOSTICS
@@ -1297,18 +1364,16 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay) noexc
     const VkExtent2D extent = swapchain_extent();
     const auto viewport = present_viewport(extent, state.efbColor->width, state.efbColor->height);
     const bool covered = viewport.width == extent.width && viewport.height == extent.height;
-    const VkPipeline pipeline = present_pipeline();
-    const VkDescriptorSet set = source_set(*state.efbColor, true);
-    if (pipeline != VK_NULL_HANDLE && set != VK_NULL_HANDLE) {
-      draw_texture(cmd, present_pass(covered ? Load::DontCare : Load::Clear), framebuffer, extent, viewport, pipeline,
-                   set, WholeSource);
-    }
+    present_efb(cmd, framebuffer, extent, viewport, covered, *state.efbColor, uiImage);
   }
   const uint64_t serial = next_frame_serial();
   submit_frame(frame.slot, image, present, frame.frameId);
   if (!frame.capturePath.empty()) {
-    write_capture(*state.efbColor, serial, frame.capturePath);
+    write_capture(*state.efbColor, uiImage, serial, frame.capturePath);
   }
+#ifdef AURORA_DIAGNOSTICS
+  read_back_ui(*state.efbColor, uiImage, serial);
+#endif
   state.recording = false;
   reset_bindings();
   g_passDraws.clear();

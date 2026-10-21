@@ -5,6 +5,7 @@
 #include "../gfx/backend.hpp"
 #include "../gfx/clear.hpp"
 #include "../gfx/frame.hpp"
+#include "../gfx/ui.hpp"
 #include "../gx/pipeline.hpp"
 #include "../internal.hpp"
 #include "decode.hpp"
@@ -113,6 +114,8 @@ VkRenderPass color_pass(Load color) noexcept;
 // B8G8R8A8 colour, the swapchain's only format (vulkan4xenon's docs/SUPPORT.md, Display and swapchain), cleared or
 // left as it is: what the present draws into.
 VkRenderPass present_pass(Load color) noexcept;
+// The UI's: RGBA8 colour and a D24S8 whose stencil holds RmlUi's clip mask, each loaded or cleared, and stored.
+VkRenderPass ui_pass(Load color, Load depthStencil) noexcept;
 
 VkExtent2D swapchain_extent() noexcept;
 // Render worker: waits on the CPU for the next image to leave the screen (vulkan4xenon's docs/SUPPORT.md, Display
@@ -180,15 +183,25 @@ VkPipeline palette_pipeline(bool fourBit) noexcept;
 VkPipeline depth_peek_pipeline() noexcept;
 // The copy of the EFB into a swapchain image; null when its programs aren't in the pack.
 VkPipeline present_pipeline() noexcept;
+// Render worker: the UI's pipelines over glsl.hpp's ui programs, through ui_pipeline_layout, in ui_pass; null when they
+// can't be made. RmlUi's by ui::Pipeline, its vertices Rml::Vertex; ImGui's, its vertices ImDrawVert; and the UI
+// image's premultiplied composite over the swapchain image, through the copy layout in present_pass.
+VkPipeline ui_pipeline(ui::Pipeline pipeline) noexcept;
+VkPipeline imgui_pipeline() noexcept;
+VkPipeline ui_present_pipeline() noexcept;
+// The UI's: set 0 the texture sampled, and the vertex stage's push constant, a matrix's columns then a translation.
+VkPipelineLayout ui_pipeline_layout() noexcept;
+inline constexpr uint32_t UiPushBytes = 80;
 
 // backend.cpp: textures and descriptor sets.
 bool initialize_textures() noexcept;
 // Tiled, as every image the layer makes is. R32Float only sampled, as the range fog table; R8 and RG8 only sampled, as
 // intensity, and as intensity and alpha. At 2 or 4 samples, the EFB's colour or depth, never sampled; transfer adds
 // the usages a resolve takes.
+// A depth target made with depthSampled false is never sampled, and takes no memory but eDRAM.
 std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc,
                                                VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
-                                               VkImageUsageFlags transfer = 0) noexcept;
+                                               VkImageUsageFlags transfer = 0, bool depthSampled = true) noexcept;
 void shutdown_textures() noexcept;
 VkDescriptorSet allocate_set(VkDescriptorSetLayout layout) noexcept;
 void free_set(VkDescriptorSet set) noexcept;
@@ -202,6 +215,30 @@ void expire_texture_sets() noexcept;
 bool initialize_frames() noexcept;
 void shutdown_frames() noexcept;
 TextureExtent efb_size() noexcept;
+// A colour target's framebuffer, alone or with a depth target.
+VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture* depth,
+                                 const backend::Texture* resolve = nullptr) noexcept;
+// The set a copy or the present samples a texture through, filtered or not.
+VkDescriptorSet source_set(backend::Texture& texture, bool linear) noexcept;
+// A tiled R8G8B8A8 image's texel, its bytes red to alpha, read on the CPU; once the GPU is done with it.
+std::array<uint8_t, 4> read_texel(const backend::Texture& image, uint32_t x, uint32_t y) noexcept;
+// A pass drawing one texture over a target, for copies and the present. source is offset and scale in it.
+void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
+                  const VkViewport& viewport, VkPipeline pipeline, VkDescriptorSet set,
+                  const std::array<float, 4>& source) noexcept;
+
+// ui.cpp: RmlUi's list and ImGui's lists drawn into the UI image, made while something shows.
+bool initialize_ui() noexcept;
+void shutdown_ui() noexcept;
+// Render worker, before the frame's present: the textures staged for the UI copied in, then, if either draws, the
+// UI's passes. The UI image they drew into, or null when nothing drew: then no pass was recorded, and the UI's
+// targets are released.
+backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::DrawData& imgui,
+                            VkCommandBuffer cmd) noexcept;
+#ifdef AURORA_DIAGNOSTICS
+// Render worker, after a frame's submission: the EFB and the UI image read back once the frame is done, if asked for.
+void read_back_ui(const backend::Texture& efb, const backend::Texture* ui, uint64_t serial) noexcept;
+#endif
 } // namespace aurora::gfx::vulkan4xenon
 
 namespace aurora::gfx::backend {

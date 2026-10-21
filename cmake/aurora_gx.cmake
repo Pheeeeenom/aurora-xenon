@@ -78,6 +78,8 @@ elseif (AURORA_GFX_BACKEND STREQUAL "vulkan4xenon")
             lib/vulkan4xenon/glsl.cpp
             lib/vulkan4xenon/pipeline.cpp
             lib/vulkan4xenon/program.cpp
+            lib/vulkan4xenon/ui.cpp
+            lib/vulkan4xenon/ui_layout.cpp
             lib/null/texture_replacement.cpp
     )
     target_compile_definitions(aurora_gx PRIVATE

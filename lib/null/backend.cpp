@@ -203,8 +203,9 @@ void encode(detail::FramePacket& frame, const detail::FrameOp& op) noexcept {
   (void)op;
 }
 
-void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay) noexcept {
+void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const ui::Frame& ui) noexcept {
   (void)overlay;
+  (void)ui;
   if (!frame.capturePath.empty()) {
     static std::once_flag once;
     std::call_once(once, [] { Log.warn("Frame capture: the null backend draws nothing"); });
