@@ -490,15 +490,22 @@ backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::Draw
 #ifdef AURORA_DIAGNOSTICS
   ++g_counts[0];
 #endif
-  if (rml.ops.empty() && !imguiDraws) {
+  const bool draws = !rml.ops.empty() || imguiDraws;
+  if (!draws) {
     // Nothing shows: no pass, and the targets go once the frames before are done with them.
     g_targets = {};
     return nullptr;
   }
-  const uint32_t width =
-      !rml.ops.empty() ? rml.width : static_cast<uint32_t>(lists->DisplaySize.x * lists->FramebufferScale.x);
-  const uint32_t height =
-      !rml.ops.empty() ? rml.height : static_cast<uint32_t>(lists->DisplaySize.y * lists->FramebufferScale.y);
+  // RmlUi's context, or ImGui's display, or the EFB's.
+  TextureExtent size = efb_size();
+  if (!rml.ops.empty()) {
+    size = {rml.width, rml.height};
+  } else if (imguiDraws) {
+    size = {static_cast<uint32_t>(lists->DisplaySize.x * lists->FramebufferScale.x),
+            static_cast<uint32_t>(lists->DisplaySize.y * lists->FramebufferScale.y)};
+  }
+  const uint32_t width = size.width;
+  const uint32_t height = size.height;
   if (width == 0 || height == 0 || !make_targets(width, height)) {
     return nullptr;
   }
