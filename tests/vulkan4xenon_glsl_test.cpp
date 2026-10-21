@@ -624,6 +624,19 @@ TEST(DepthPrograms, TakeGXsZFromTheSampledDepth) {
   }
 }
 
+// RmlUi's and ImGui's pair: the position plus the translation through the matrix's columns, the colour times the
+// texture, both among the backend's own programs, so the pack holds them.
+TEST(UiPrograms, TransformThePositionAndModulateTheTexture) {
+  EXPECT_TRUE(has(glsl::ui_vertex(), "vec4 position = vec4(in_position, 0.0, 0.0) + upush.translation;"));
+  EXPECT_TRUE(has(glsl::ui_vertex(),
+                  "gl_Position = upush.column0 * position.xxxx + upush.column1 * position.yyyy + upush.column3;"));
+  EXPECT_TRUE(has(glsl::ui_fragment(), "o_color = in_color * texture(source, in_uv);"));
+  const auto programs = glsl::fixed_programs();
+  EXPECT_NE(std::ranges::find(programs, std::pair{glsl::ui_vertex(), false}), programs.end());
+  EXPECT_NE(std::ranges::find(programs, std::pair{glsl::ui_fragment(), true}), programs.end());
+  named_programs("ui", glsl::ui_vertex(), glsl::ui_fragment());
+}
+
 // An EFB copy's index, 8 or 4 bits, scaled back from the copy's texel and looked up halfway into its palette entry.
 TEST(PaletteConversion, ScalesTheIndexByItsBitsAndReadsTheEntrysMiddle) {
   EXPECT_TRUE(has(glsl::palette_fragment(false), "floor(texture(source, in_uv) * 255.0 + 0.5)"));

@@ -249,6 +249,37 @@ target_link_libraries(vulkan4xenon_glsl_tests PRIVATE
 )
 gtest_discover_tests(vulkan4xenon_glsl_tests)
 
+# The vulkan4xenon backend's UI data, which needs no GPU
+add_executable(vulkan4xenon_ui_tests
+  vulkan4xenon_ui_test.cpp
+  ../lib/vulkan4xenon/ui_layout.cpp
+)
+target_include_directories(vulkan4xenon_ui_tests PRIVATE
+  ../include
+  ../lib
+)
+target_link_libraries(vulkan4xenon_ui_tests PRIVATE gtest gtest_main imgui)
+gtest_discover_tests(vulkan4xenon_ui_tests)
+
+# RmlUi's recorder for the vulkan4xenon backend, on RmlUi with no GPU
+if (AURORA_ENABLE_RMLUI AND NOT AURORA_RMLUI_DRAWS)
+  add_executable(rmlui_recorder_tests
+    rmlui_recorder_test.cpp
+    ../lib/rmlui/RecordingRenderInterface.cpp
+    ../lib/rmlui/RuntimeTextureProvider.cpp
+    ../lib/rmlui/FileInterface_SDL.cpp
+    ../lib/logging.cpp
+  )
+  target_include_directories(rmlui_recorder_tests PRIVATE
+    ../include
+    ../lib
+  )
+  target_compile_definitions(rmlui_recorder_tests PRIVATE AURORA TARGET_PC AURORA_ENABLE_RMLUI)
+  target_link_libraries(rmlui_recorder_tests PRIVATE gtest gtest_main rmlui fmt::fmt xxHash::xxhash absl::flat_hash_map
+                        Tracy::TracyClient ${AURORA_SDL3_TARGET})
+  gtest_discover_tests(rmlui_recorder_tests)
+endif ()
+
 add_executable(os_alloc_tests
   os_alloc_test.cpp
   os_test_globals.cpp
