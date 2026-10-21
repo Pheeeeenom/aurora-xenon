@@ -293,10 +293,11 @@ void set_thread_name(const std::string& name) noexcept {
 constexpr Module Log{"aurora::thread"};
 
 // The hardware thread each named thread runs on, as "name=thread,...". A thread not named here stays where the kernel
-// starts it, on its creator's (xsdk:SCOPE.md, milestone 26).
+// starts it, on its creator's (xsdk:SCOPE.md, milestone 26). The FIFO processor, which the game waits for every frame,
+// shares its core only with threads that run in bursts; the render worker shares its own with its decode helper.
 std::string sHardwareThreads =
-    "Main thread=0,Aurora GPU waiter=1,Aurora render worker=2,Aurora tex preconv=3,Pipeline compilation thread=3,"
-    "Pipeline cache writer thread=3,Aurora FIFO processor=4,Aurora decode helper=5";
+    "Main thread=0,Aurora GPU waiter=1,Aurora FIFO processor=2,Aurora tex preconv=3,Pipeline compilation thread=3,"
+    "Pipeline cache writer thread=3,Aurora render worker=4,Aurora decode helper=5";
 
 std::optional<uint32_t> hardware_thread_for(std::string_view name) noexcept {
   std::string_view list = sHardwareThreads;
