@@ -55,7 +55,7 @@ extern VkQueue g_queue;
 
 bool initialize_device() noexcept;
 void shutdown_device() noexcept;
-// Whether the layer samples BC1 images, by the format's properties; vulkan4xenon doesn't yet (its
+// Whether the layer samples BC1 images, by the format's properties, as vulkan4xenon has since its milestone 20 (its
 // docs/SUPPORT.md, Formats).
 bool samples_bc1() noexcept;
 
