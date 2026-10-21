@@ -222,12 +222,12 @@ struct DrawCache {
 DrawCache sDrawCache;
 
 // A config's shader info depends on the config alone, and its pipeline on the config and the render target layout,
-// so each pair is analysed and looked up once.
+// so each pair is analysed and looked up once, by pipeline_memo_key.
 struct PipelineMemo {
   ShaderInfo shaderInfo;
   gfx::PipelineRef pipelineRef;
 };
-absl::flat_hash_map<HashType, PipelineMemo> sPipelineMemo;
+absl::flat_hash_map<uint64_t, PipelineMemo> sPipelineMemo;
 
 // The state populate_pipeline_config (gx.cpp) reads, and the render target layout the pipeline is looked up for, as
 // the last rebuild read them. A config built from the same state comes out the same, with the same shader info and
@@ -438,6 +438,17 @@ u8 line_mode_for_prim(GXPrimitive prim) noexcept {
   }
 }
 } // namespace
+
+// The TEV stages past tevStageCount are always the reset's (populate_pipeline_config), so the key leaves them out:
+// most of the config's 2.7 KB. XXH64 read 1 KB 1.4 to 1.6 times as fast as XXH3 on the Xbox 360 (milestone 34).
+uint64_t pipeline_memo_key(const PipelineConfig& config, uint64_t targetLayoutKey) noexcept {
+  constexpr size_t StagesAt = offsetof(PipelineConfig, shaderConfig) + offsetof(ShaderConfig, tevStages);
+  constexpr size_t CountAt = offsetof(PipelineConfig, shaderConfig) + offsetof(ShaderConfig, tevStageCount);
+  const auto* bytes = reinterpret_cast<const u8*>(&config);
+  const size_t stages = std::min<size_t>(config.shaderConfig.tevStageCount, MaxTevStages);
+  const uint64_t head = XXH64(bytes, StagesAt + stages * sizeof(TevStage), targetLayoutKey);
+  return XXH64(bytes + CountAt, sizeof(PipelineConfig) - CountAt, head);
+}
 
 static void handle_draw(u8 cmd, ByteReader& reader) noexcept;
 // Returns the display list a GX_AURORA_CALL_DISPLAY_LIST names, or no bytes.
@@ -654,7 +665,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     // PipelineInputs.
     if (update_pipeline_inputs(sPipelineInputs, fmt, lineMode, targetLayoutKey) || !hadPipeline) {
       populate_pipeline_config(cache.config, prim, fmt);
-      const HashType memoKey = xxh3_hash(cache.config, targetLayoutKey);
+      const uint64_t memoKey = pipeline_memo_key(cache.config, targetLayoutKey);
       if (const auto it = sPipelineMemo.find(memoKey); it != sPipelineMemo.end()) {
         cache.shaderInfo = it->second.shaderInfo;
         cache.pipelineRef = it->second.pipelineRef;

@@ -287,23 +287,23 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     }
     return factor;
   };
-  config = {
-      .shaderConfig = config.shaderConfig,
-      .depthFunc = g_gxState.depthFunc,
-      .cullMode = cullMode,
-      .blendMode = g_gxState.blendMode,
-      .blendFacSrc = blendFactor(g_gxState.blendFacSrc),
-      .blendFacDst = blendFactor(g_gxState.blendFacDst),
-      .blendOp = g_gxState.blendOp,
-      .dstAlpha = alphaUpdate ? g_gxState.dstAlpha : UINT32_MAX,
-      .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
-      .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
-      .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
-      .depthCompare = g_gxState.depthCompare,
-      .depthUpdate = g_gxState.depthUpdate && !cullAll,
-      .alphaUpdate = alphaUpdate,
-      .colorUpdate = g_gxState.colorUpdate && !cullAll,
-  };
+  // Each field in place: a new config built around the shader config was 2.7 KB more to copy at every change.
+  config.version = GXPipelineConfigVersion;
+  config.msaaSamples = 1;
+  config.depthFunc = g_gxState.depthFunc;
+  config.cullMode = cullMode;
+  config.blendMode = g_gxState.blendMode;
+  config.blendFacSrc = blendFactor(g_gxState.blendFacSrc);
+  config.blendFacDst = blendFactor(g_gxState.blendFacDst);
+  config.blendOp = g_gxState.blendOp;
+  config.dstAlpha = alphaUpdate ? g_gxState.dstAlpha : UINT32_MAX;
+  config.polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset);
+  config.polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale);
+  config.polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp);
+  config.depthCompare = g_gxState.depthCompare;
+  config.depthUpdate = g_gxState.depthUpdate && !cullAll;
+  config.alphaUpdate = alphaUpdate;
+  config.colorUpdate = g_gxState.colorUpdate && !cullAll;
 }
 
 void shutdown() noexcept {

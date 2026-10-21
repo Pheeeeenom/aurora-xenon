@@ -9,6 +9,10 @@
 #include <cstdint>
 #include <optional>
 
+namespace aurora::gx {
+struct PipelineConfig;
+} // namespace aurora::gx
+
 namespace aurora::gx::fifo {
 
 // Writes the u16 indices that draw prim's vtxCount vertices from vtxStart as triangles, returning how many. u32, since
@@ -42,6 +46,9 @@ struct ProcessResult {
 // Process GX FIFO commands until the next draw done event, display list call, frame end, or end of buffer
 ProcessResult process(const uint8_t* data, uint32_t size) noexcept;
 void clear_draw_cache() noexcept;
+// The pipeline memo's key for a config populate_pipeline_config filled, looked up for a render target layout: equal for
+// equal configs and layouts, and 64 bits on every host.
+uint64_t pipeline_memo_key(const PipelineConfig& config, uint64_t targetLayoutKey) noexcept;
 // Forgets the arrays the frame's storage pool holds, at the frame's end and when vertex data changes.
 void clear_array_ranges() noexcept;
 

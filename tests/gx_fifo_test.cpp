@@ -4715,3 +4715,72 @@ TEST_F(GXFifoTest, Composite_TevSetup) {
   EXPECT_EQ(g_gxState.tevStages[0].colorPass.d, GX_CC_TEXC);
   EXPECT_EQ(g_gxState.tevStages[0].alphaPass.d, GX_CA_TEXA);
 }
+
+// ============================================================================
+// The pipeline memo's key
+// ============================================================================
+
+namespace {
+// A config as populate_pipeline_config leaves it: two stages in use, the rest the reset's.
+aurora::gx::PipelineConfig memo_config() {
+  aurora::gx::PipelineConfig config{};
+  config.shaderConfig.tevStageCount = 2;
+  config.shaderConfig.tevStages[0].colorPass.d = GX_CC_TEXC;
+  config.shaderConfig.tevStages[1].alphaOp.op = GX_TEV_SUB;
+  config.shaderConfig.numIndStages = 1;
+  config.depthFunc = GX_LEQUAL;
+  config.colorUpdate = true;
+  return config;
+}
+
+uint64_t memo_key_with_byte(const aurora::gx::PipelineConfig& config, size_t at) {
+  aurora::gx::PipelineConfig changed = config;
+  reinterpret_cast<uint8_t*>(&changed)[at] ^= 0x01;
+  return aurora::gx::fifo::pipeline_memo_key(changed, 7);
+}
+} // namespace
+
+TEST(PipelineMemoKey, EqualConfigsShareAKey) {
+  const auto config = memo_config();
+  const auto copy = config;
+  EXPECT_EQ(aurora::gx::fifo::pipeline_memo_key(copy, 7), aurora::gx::fifo::pipeline_memo_key(config, 7));
+  EXPECT_NE(aurora::gx::fifo::pipeline_memo_key(config, 8), aurora::gx::fifo::pipeline_memo_key(config, 7));
+}
+
+TEST(PipelineMemoKey, EveryByteBeforeAndInTheStagesInUseCounts) {
+  using aurora::gx::PipelineConfig;
+  using aurora::gx::ShaderConfig;
+  const auto config = memo_config();
+  const uint64_t key = aurora::gx::fifo::pipeline_memo_key(config, 7);
+  const size_t end = offsetof(PipelineConfig, shaderConfig) + offsetof(ShaderConfig, tevStages) +
+                     config.shaderConfig.tevStageCount * sizeof(aurora::gx::TevStage);
+  for (size_t at = 0; at < end; ++at) {
+    EXPECT_NE(memo_key_with_byte(config, at), key) << "byte " << at;
+  }
+}
+
+TEST(PipelineMemoKey, EveryByteFromTheStageCountOnCounts) {
+  using aurora::gx::PipelineConfig;
+  using aurora::gx::ShaderConfig;
+  const auto config = memo_config();
+  const uint64_t key = aurora::gx::fifo::pipeline_memo_key(config, 7);
+  for (size_t at = offsetof(PipelineConfig, shaderConfig) + offsetof(ShaderConfig, tevStageCount);
+       at < sizeof(PipelineConfig); ++at) {
+    EXPECT_NE(memo_key_with_byte(config, at), key) << "byte " << at;
+  }
+}
+
+TEST(PipelineMemoKey, AStageCountChangesTheKey) {
+  const auto config = memo_config();
+  auto more = config;
+  more.shaderConfig.tevStageCount = 3;
+  EXPECT_NE(aurora::gx::fifo::pipeline_memo_key(more, 7), aurora::gx::fifo::pipeline_memo_key(config, 7));
+}
+
+// The stages past tevStageCount are the reset's in every config populate_pipeline_config fills, so the key reads none.
+TEST(PipelineMemoKey, StagesPastTheCountAreLeftOut) {
+  const auto config = memo_config();
+  auto other = config;
+  other.shaderConfig.tevStages[5].colorOp.op = GX_TEV_SUB;
+  EXPECT_EQ(aurora::gx::fifo::pipeline_memo_key(other, 7), aurora::gx::fifo::pipeline_memo_key(config, 7));
+}
