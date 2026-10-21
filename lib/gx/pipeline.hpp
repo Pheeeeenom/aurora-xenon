@@ -17,7 +17,7 @@ struct DrawData {
   uint32_t dstAlpha;
   // idxRange is in the index patterns (fifo::index_patterns), which the backend keeps apart, not in the frame's pool.
   bool patternIndices = false;
-  // With backend::Limits::contentHashes, XXH3-64 of vertRange's bytes as the frame's pool holds them; zero when not
+  // With backend::Limits::contentHashes, run_hash of vertRange's bytes as the frame's pool holds them; zero when not
   // hashed (draws merged into one, or the limit off).
   uint64_t vertHash = 0;
 };

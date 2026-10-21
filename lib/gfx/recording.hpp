@@ -69,7 +69,7 @@ struct ConvRequest;
 void queue_palette_conv(tex_palette_conv::ConvRequest req);
 
 Range push_verts(const uint8_t* data, size_t length, size_t alignment);
-// As push_verts, and hash is XXH3-64 of the bytes as the pool holds them, hashed while they're warm.
+// As push_verts, and hash is run_hash of the bytes as the pool holds them, hashed while they're warm.
 Range push_verts_hashed(const uint8_t* data, size_t length, size_t alignment, uint64_t& hash);
 template <typename T>
 Range push_verts(ArrayRef<T> data, size_t alignment) {
@@ -99,7 +99,7 @@ Range push_storage(const T& data) {
 }
 // A GX vertex array, into the storage pool as push_storage puts it; with backend::Limits::arraySizes, its size in bytes
 // goes first, a u32 in the four bytes before the returned offset, so a backend can tell where the array ends, and with
-// backend::Limits::contentHashes its XXH3-64 in the eight bytes before that.
+// backend::Limits::contentHashes its run_hash in the eight bytes before that.
 Range push_array(const uint8_t* data, size_t length);
 Range push_texture_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage, uint32_t alignment);
 

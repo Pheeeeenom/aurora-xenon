@@ -2,6 +2,7 @@
 // gx/shader.cpp fetches it out of its storage buffers.
 #include "decode.hpp"
 
+#include "../gfx/hash.hpp"
 #include "../internal.hpp"
 #include "../thread.hpp"
 
@@ -675,7 +676,7 @@ uint64_t hash_taken(void* work) noexcept {
   for (size_t i = hashes.next.fetch_add(1, std::memory_order_relaxed); i < hashes.ranges.size();
        i = hashes.next.fetch_add(1, std::memory_order_relaxed)) {
     HashRange& range = hashes.ranges[i];
-    range.hash = XXH3_64bits(range.data, range.size);
+    range.hash = run_hash(range.data, range.size);
     bytes += range.size;
   }
   return bytes;

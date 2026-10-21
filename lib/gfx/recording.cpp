@@ -891,7 +891,7 @@ Range push_verts_hashed(const uint8_t* data, size_t length, size_t alignment, ui
   }
   auto& verts = current_frame_packet().verts;
   const Range range = push(verts, data, length, alignment);
-  hash = XXH3_64bits(verts.data() + range.offset, range.size);
+  hash = run_hash(verts.data() + range.offset, range.size);
   return range;
 }
 
@@ -949,7 +949,7 @@ Range push_array(const uint8_t* data, size_t length) {
   std::memcpy(storage.data() + header.offset + header.size - sizeof(size), &size, sizeof(size));
   const Range range = push(storage, data, length, alignment);
   if (limits.contentHashes) {
-    const u64 hash = XXH3_64bits(storage.data() + range.offset, range.size);
+    const u64 hash = run_hash(storage.data() + range.offset, range.size);
     std::memcpy(storage.data() + range.offset - sizeof(size) - sizeof(hash), &hash, sizeof(hash));
   }
   return range;

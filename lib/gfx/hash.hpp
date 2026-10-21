@@ -24,6 +24,10 @@ HashType xxh3_hash(const T& input, HashType seed = 0) {
   return xxh3_hash_s(&input, sizeof(T), seed);
 }
 
+// For bytes whose hash stays in the run, never on disk: a draw's vertices and the arrays it reads. XXH64, which read
+// 256 B to 64 KB 1.2 to 1.7 times as fast as XXH3 on the Xbox 360 (vulkan4xenon milestone 34).
+inline uint64_t run_hash(const void* data, size_t size) { return XXH64(data, size, 0); }
+
 class Hasher {
 public:
   explicit Hasher(XXH64_hash_t seed = 0) {

@@ -130,7 +130,7 @@ struct Limits {
   // Each vertex array in the storage pool has its size in bytes, a u32, in the four bytes before it (push_array).
   bool arraySizes = false;
   // With arraySizes, for a backend that keys a cache by the content of the pools: the FIFO worker hashes each GX draw's
-  // vertex bytes and each array as it copies them, XXH3-64 of the bytes as the pool holds them. A draw's is its
+  // vertex bytes and each array as it copies them, run_hash of the bytes as the pool holds them. A draw's is its
   // gx::DrawData::vertHash; an array's is the eight bytes before its size. The backend then needn't read them again.
   bool contentHashes = false;
   // Range fog's factor for each target column, as close as the backend comes to what its GPU works out, from the fog's

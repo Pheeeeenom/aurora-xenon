@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "gfx/frame_packet.hpp"
+#include "gfx/hash.hpp"
 #include "gfx/lru_cache.hpp"
 #include "gfx/recording.hpp"
 #include "gfx/texture.hpp"
@@ -11,6 +12,7 @@
 #include <bit>
 #include <memory>
 #include <random>
+#include <vector>
 
 namespace aurora::gfx {
 namespace {
@@ -384,6 +386,42 @@ TEST(TextureSetHash, AsTheStreamedFieldsGave) {
       };
     }
     ASSERT_EQ(set.hash(), streamed_hash(set)) << "round " << round;
+  }
+}
+
+std::vector<uint8_t> random_bytes(size_t size, uint64_t seed) {
+  std::mt19937_64 rng(seed);
+  std::vector<uint8_t> bytes(size);
+  for (uint8_t& byte : bytes) {
+    byte = static_cast<uint8_t>(rng());
+  }
+  return bytes;
+}
+
+// The vertex cache's keys hash a draw's vertex bytes and arrays where the frame's pools hold them, at any alignment.
+TEST(RunHash, EqualBytesHashEqualAtAnyAlignment) {
+  const auto bytes = random_bytes(4096, 34);
+  for (const size_t size : {1u, 7u, 64u, 241u, 1000u, 4096u}) {
+    std::vector<uint8_t> moved(size + 16);
+    for (size_t at = 0; at < 16; ++at) {
+      std::copy_n(bytes.begin(), size, moved.begin() + at);
+      EXPECT_EQ(run_hash(moved.data() + at, size), run_hash(bytes.data(), size)) << size << " bytes at " << at;
+    }
+  }
+}
+
+// Two blocks that differ in one bit never share a key, or the vertex cache would draw one's vertices for the other.
+TEST(RunHash, EverySingleBitChangesIt) {
+  auto bytes = random_bytes(4096, 3434);
+  for (const size_t size : {1u,  2u,  3u,   4u,   7u,   8u,   9u,   15u,  16u,   17u,   31u,   32u,   33u,  63u,
+                            64u, 65u, 127u, 128u, 129u, 255u, 256u, 257u, 1023u, 1024u, 1025u, 4095u, 4096u}) {
+    const uint64_t hash = run_hash(bytes.data(), size);
+    for (size_t bit = 0; bit < size * 8; ++bit) {
+      bytes[bit / 8] ^= static_cast<uint8_t>(1u << bit % 8);
+      const uint64_t changed = run_hash(bytes.data(), size);
+      bytes[bit / 8] ^= static_cast<uint8_t>(1u << bit % 8);
+      ASSERT_NE(changed, hash) << size << " bytes, bit " << bit;
+    }
   }
 }
 

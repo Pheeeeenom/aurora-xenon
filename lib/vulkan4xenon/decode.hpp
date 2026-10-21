@@ -112,7 +112,7 @@ class IndexLists {
 public:
   explicit IndexLists(uint64_t capacity) noexcept : m_capacity(capacity) {}
 
-  // The list for a draw's vertex bytes, count vertices of stride bytes whose XXH3-64 is hash, built if none is kept.
+  // The list for a draw's vertex bytes, count vertices of stride bytes whose run_hash is hash, built if none is kept.
   // It stays valid until the next begin_frame.
   const IndexList& get(uint64_t hash, std::span<const uint8_t> vertices, uint32_t stride, uint32_t count);
 
@@ -143,7 +143,7 @@ private:
 // attribute's GX layout and place in the decoded vertex.
 uint64_t decode_format(const gx::ShaderConfig& config, const VertexLayout& layout) noexcept;
 
-// A range of a frame's pools for hash_ranges, and its XXH3-64 once hash_ranges returns.
+// A range of a frame's pools for hash_ranges, and its run_hash once hash_ranges returns.
 struct HashRange {
   const uint8_t* data;
   size_t size;
@@ -183,7 +183,7 @@ public:
   void compute(std::span<const KeyedDraw> draws, std::span<const uint8_t> verts, std::span<const uint8_t> storage,
                std::span<std::optional<DecodeKey>> keys, std::span<ArrayEnds> ends, bool poolHashes = false);
 
-  // From the last compute: the XXH3-64 of a draw's vertex bytes as its key has it, for a draw with a key.
+  // From the last compute: the run_hash of a draw's vertex bytes as its key has it, for a draw with a key.
   uint64_t vertex_hash(size_t draw) const noexcept { return m_vertexHashes[draw]; }
 
 private:
