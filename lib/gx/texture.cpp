@@ -643,7 +643,8 @@ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
     if (cache.tlutTexture.handle && cache.tlutTexture.tlutDataVersion == tlut.tlutDataVersion) {
       return cache.tlutTexture.handle;
     }
-    cache.dynamicPaletteTextures.clear();
+    // Dynamic palette textures stay: resolve_dynamic_palette_texture converts them again for the new TLUT. Made anew,
+    // one a frame for a TLUT the game rewrites each frame, the Xbox 360 ran out of memory in the map.
     for (const u32 texObjId : cache.staticTextureUsers) {
       if (const auto textureIt = s_textureObjectCaches.find(texObjId); textureIt != s_textureObjectCaches.end()) {
         const uint64_t replacementId = textureIt->second.replacementId;
