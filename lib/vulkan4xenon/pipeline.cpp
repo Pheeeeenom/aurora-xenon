@@ -55,6 +55,9 @@ std::string g_uiFragment;
 std::array<std::optional<VkPipeline>, 6> g_uiPipelines;
 std::optional<VkPipeline> g_imguiPipeline;
 std::optional<VkPipeline> g_uiPresentPipeline;
+#ifdef AURORA_DIAGNOSTICS
+std::optional<VkPipeline> g_uiCheckPipeline;
+#endif
 
 bool create_module(Program program, VkShaderModule& out) noexcept {
   const VkShaderModuleCreateInfo info{
@@ -407,6 +410,9 @@ constexpr VkPipelineColorBlendAttachmentState PremultipliedBlend{
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
 };
 
+// The present's composite of the UI image, premultiplied, as Dawn's (webgpu/present.cpp:216-219).
+constexpr VkPipelineColorBlendAttachmentState PresentBlend = PremultipliedBlend;
+
 // A copy's pipeline into a render pass of the target's format, blended as given or not at all; null when glslang
 // refuses its programs.
 VkPipeline make_copy_pipeline(GXTexFmt format, bool opaqueAlpha, VkRenderPass renderPass,
@@ -500,6 +506,12 @@ void shutdown_pipelines() noexcept {
     vkDestroyPipeline(g_device, *g_depthPeekPipeline, nullptr);
   }
   g_depthPeekPipeline.reset();
+#ifdef AURORA_DIAGNOSTICS
+  if (g_uiCheckPipeline) {
+    vkDestroyPipeline(g_device, *g_uiCheckPipeline, nullptr);
+  }
+  g_uiCheckPipeline.reset();
+#endif
   for (auto* pipeline : {&g_imguiPipeline, &g_uiPresentPipeline}) {
     if (*pipeline) {
       vkDestroyPipeline(g_device, **pipeline, nullptr);
@@ -752,10 +764,19 @@ VkPipeline imgui_pipeline() noexcept {
 // Dawn's premultiplied copy (webgpu/present.cpp:216-219): the UI image over the swapchain image, sampled as the EFB is.
 VkPipeline ui_present_pipeline() noexcept {
   if (!g_uiPresentPipeline) {
-    g_uiPresentPipeline = make_copy_pipeline(GX_TF_RGBA8, false, present_pass(Load::DontCare), &PremultipliedBlend);
+    g_uiPresentPipeline = make_copy_pipeline(GX_TF_RGBA8, false, present_pass(Load::DontCare), &PresentBlend);
   }
   return *g_uiPresentPipeline;
 }
+
+#ifdef AURORA_DIAGNOSTICS
+VkPipeline ui_check_pipeline() noexcept {
+  if (!g_uiCheckPipeline) {
+    g_uiCheckPipeline = make_copy_pipeline(GX_TF_RGBA8, false, color_pass(Load::Load), &PresentBlend);
+  }
+  return *g_uiCheckPipeline;
+}
+#endif
 } // namespace aurora::gfx::vulkan4xenon
 
 namespace aurora::gfx::backend {

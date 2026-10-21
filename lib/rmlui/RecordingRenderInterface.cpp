@@ -15,6 +15,8 @@
 #include <SDL3/SDL_surface.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
@@ -35,7 +37,28 @@ constexpr uint8_t MaxStencilRef = 255;
 
 struct Texture {
   std::shared_ptr<gfx::backend::Texture> gpu;
+#ifdef AURORA_DIAGNOSTICS
+  // Its texels' bytes, and whether a layer was saved into it.
+  uint64_t bytes = 0;
+  bool saved = false;
+#endif
 };
+
+#ifdef AURORA_DIAGNOSTICS
+// The bytes of the textures RmlUi holds: made from texels, and saved from layers.
+std::array<std::atomic<uint64_t>, 2> g_textureBytes{};
+
+Rml::TextureHandle counted(Texture* texture, Rml::Vector2i size, bool saved) noexcept {
+  texture->bytes = static_cast<uint64_t>(size.x) * static_cast<uint64_t>(size.y) * 4;
+  texture->saved = saved;
+  g_textureBytes[saved ? 1 : 0] += texture->bytes;
+  return reinterpret_cast<Rml::TextureHandle>(texture);
+}
+#else
+Rml::TextureHandle counted(Texture* texture, Rml::Vector2i, bool) noexcept {
+  return reinterpret_cast<Rml::TextureHandle>(texture);
+}
+#endif
 
 struct Filter {
   float opacity;
@@ -205,7 +228,7 @@ Rml::TextureHandle RecordingRenderInterface::make_texture(const Rml::byte* rgba,
     return 0;
   }
   m_frame.uploads.push_back({.texture = gpu, .data = std::move(data), .width = width, .height = height});
-  return reinterpret_cast<Rml::TextureHandle>(new Texture{std::move(gpu)});
+  return counted(new Texture{std::move(gpu)}, size, false);
 }
 
 // Runtime textures are made as Dawn makes them (WebGPURenderInterface.cpp, LoadTexture), without the mips some ask for.
@@ -241,7 +264,11 @@ Rml::TextureHandle RecordingRenderInterface::GenerateTexture(Rml::Span<const Rml
 }
 
 void RecordingRenderInterface::ReleaseTexture(Rml::TextureHandle texture) {
-  delete reinterpret_cast<Texture*>(texture);
+  auto* released = reinterpret_cast<Texture*>(texture);
+#ifdef AURORA_DIAGNOSTICS
+  g_textureBytes[released->saved ? 1 : 0] -= released->bytes;
+#endif
+  delete released;
 }
 
 void RecordingRenderInterface::EnableScissorRegion(bool enable) { m_scissorEnabled = enable; }
@@ -390,7 +417,7 @@ Rml::TextureHandle RecordingRenderInterface::SaveLayerAsTexture() {
       .scissor = region,
       .texture = gpu,
   });
-  return reinterpret_cast<Rml::TextureHandle>(new Texture{std::move(gpu)});
+  return counted(new Texture{std::move(gpu)}, {region.width, region.height}, true);
 }
 
 Rml::CompiledFilterHandle RecordingRenderInterface::CompileFilter(const Rml::String& name,
@@ -419,3 +446,11 @@ void register_identity_filters() noexcept {
   Rml::Factory::RegisterFilterInstancer("drop-shadow", &dropShadow);
 }
 } // namespace aurora::rmlui
+
+#ifdef AURORA_DIAGNOSTICS
+// The bytes of the textures RmlUi holds: made from texels, and saved from layers.
+extern "C" void aurora_rmlui_texture_bytes(unsigned long long* out) {
+  out[0] = aurora::rmlui::g_textureBytes[0].load(std::memory_order_relaxed);
+  out[1] = aurora::rmlui::g_textureBytes[1].load(std::memory_order_relaxed);
+}
+#endif

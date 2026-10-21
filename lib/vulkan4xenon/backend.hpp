@@ -189,6 +189,10 @@ VkPipeline present_pipeline() noexcept;
 VkPipeline ui_pipeline(ui::Pipeline pipeline) noexcept;
 VkPipeline imgui_pipeline() noexcept;
 VkPipeline ui_present_pipeline() noexcept;
+#ifdef AURORA_DIAGNOSTICS
+// The present's composite into an RGBA8 target, for the console checks to read back.
+VkPipeline ui_check_pipeline() noexcept;
+#endif
 // The UI's: set 0 the texture sampled, and the vertex stage's push constant, a matrix's columns then a translation.
 VkPipelineLayout ui_pipeline_layout() noexcept;
 inline constexpr uint32_t UiPushBytes = 80;
@@ -236,7 +240,10 @@ void shutdown_ui() noexcept;
 backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::DrawData& imgui,
                             VkCommandBuffer cmd) noexcept;
 #ifdef AURORA_DIAGNOSTICS
-// Render worker, after a frame's submission: the EFB and the UI image read back once the frame is done, if asked for.
+// Render worker, before a frame's submission: when a readback is asked for, the EFB and the UI image composited as the
+// present composites them, into an image of the EFB's size.
+void compose_for_readback(VkCommandBuffer cmd, backend::Texture& efb, backend::Texture* ui) noexcept;
+// Render worker, after it: the EFB, the UI image and that composite read back once the frame is done.
 void read_back_ui(const backend::Texture& efb, const backend::Texture* ui, uint64_t serial) noexcept;
 #endif
 } // namespace aurora::gfx::vulkan4xenon

@@ -1,6 +1,8 @@
 #include "rmlui.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <thread>
 
@@ -567,6 +569,11 @@ bool shows_anything(Rml::Context& context) noexcept {
 }
 } // namespace
 
+#ifdef AURORA_DIAGNOSTICS
+// The game thread's nanoseconds in Update, then in Render and its recording, frames Rendered and frames updated.
+std::array<std::atomic<uint64_t>, 4> g_times{};
+#endif
+
 // Context::Render runs only on frames where something may draw: measured on the console, it took 0.19 ms a frame
 // with no more than one toast up (vulkan4xenon milestone 16, step 1).
 void update(gfx::ui::Frame& frame) noexcept {
@@ -576,10 +583,26 @@ void update(gfx::ui::Frame& frame) noexcept {
     return;
   }
   sync_context_metrics(presentation_dimensions_from_window_size(window::get_window_size()));
+#ifdef AURORA_DIAGNOSTICS
+  using Clock = std::chrono::steady_clock;
+  const auto ns = [](Clock::duration time) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(time).count());
+  };
+  const auto start = Clock::now();
+#endif
   g_context->Update();
+#ifdef AURORA_DIAGNOSTICS
+  const auto updated = Clock::now();
+  g_times[0] += ns(updated - start);
+  ++g_times[3];
+#endif
   if (shows_anything(*g_context)) {
     recorder->BeginFrame(g_context->GetDimensions());
     g_context->Render();
+#ifdef AURORA_DIAGNOSTICS
+    g_times[1] += ns(Clock::now() - updated);
+    ++g_times[2];
+#endif
   }
   recorder->TakeFrame(frame);
 }
@@ -600,3 +623,13 @@ void shutdown() noexcept {
 #endif
 }
 } // namespace aurora::rmlui
+
+#if defined(AURORA_DIAGNOSTICS) && !defined(AURORA_RMLUI_DRAWS)
+// The game thread's nanoseconds in Update, then in Render and its recording, frames Rendered and frames updated, since
+// the last call.
+extern "C" void aurora_rmlui_take_times(unsigned long long* out) {
+  for (size_t i = 0; i < aurora::rmlui::g_times.size(); ++i) {
+    out[i] = aurora::rmlui::g_times[i].exchange(0, std::memory_order_relaxed);
+  }
+}
+#endif

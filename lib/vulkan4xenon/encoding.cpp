@@ -1366,6 +1366,9 @@ void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const
     const bool covered = viewport.width == extent.width && viewport.height == extent.height;
     present_efb(cmd, framebuffer, extent, viewport, covered, *state.efbColor, uiImage);
   }
+#ifdef AURORA_DIAGNOSTICS
+  compose_for_readback(cmd, *state.efbColor, uiImage);
+#endif
   const uint64_t serial = next_frame_serial();
   submit_frame(frame.slot, image, present, frame.frameId);
   if (!frame.capturePath.empty()) {

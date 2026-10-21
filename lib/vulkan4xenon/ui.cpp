@@ -67,9 +67,11 @@ std::chrono::steady_clock::time_point g_lastNewFrame{};
 ui_layout::ImGuiLayout g_imguiLayout;
 
 #ifdef AURORA_DIAGNOSTICS
-// Frames ended, frames whose UI drew, UI passes and composites at the present, since the last take.
-std::array<std::atomic<uint64_t>, 4> g_counts{};
-// The next frame's EFB and UI image, read back once it's done, as bytes red to alpha a texel, row by row.
+// Frames ended, frames whose UI drew, UI passes, composites at the present and the render worker's time in encode_ui,
+// since the last take.
+std::array<std::atomic<uint64_t>, 5> g_counts{};
+// The next frame's EFB, UI image and their composite, read back once it's done, as bytes red to alpha a texel, row by
+// row.
 std::mutex g_readbackMutex;
 bool g_readbackWanted = false;
 bool g_readbackReady = false;
@@ -77,6 +79,9 @@ uint32_t g_readbackWidth = 0;
 uint32_t g_readbackHeight = 0;
 std::vector<uint8_t> g_readbackEfb;
 std::vector<uint8_t> g_readbackUi;
+std::vector<uint8_t> g_readbackComposite;
+// Render worker only: the composite's target while a readback is pending.
+std::shared_ptr<backend::Texture> g_composite;
 #endif
 
 std::shared_ptr<backend::Texture> make_target(uint32_t width, uint32_t height, bool depth, const char* label) noexcept {
@@ -463,6 +468,16 @@ void shutdown_ui() noexcept {
 
 backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::DrawData& imgui,
                             VkCommandBuffer cmd) noexcept {
+#ifdef AURORA_DIAGNOSTICS
+  const auto start = std::chrono::steady_clock::now();
+  struct Timer {
+    std::chrono::steady_clock::time_point start;
+    ~Timer() {
+      g_counts[4] +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    }
+  } timer{start};
+#endif
   {
     std::lock_guard lock{g_imguiMutex};
     std::swap(g_imguiTaken, g_imguiUploads);
@@ -507,6 +522,34 @@ backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::Draw
 }
 
 #ifdef AURORA_DIAGNOSTICS
+void compose_for_readback(VkCommandBuffer cmd, backend::Texture& efb, backend::Texture* ui) noexcept {
+  {
+    std::lock_guard lock{g_readbackMutex};
+    if (!g_readbackWanted) {
+      return;
+    }
+  }
+  if (!g_composite || g_composite->width != efb.width || g_composite->height != efb.height) {
+    g_composite = make_target(efb.width, efb.height, false, "UI check composite");
+  }
+  const VkPipeline copy = copy_pipeline(GX_TF_RGBA8, false);
+  const VkPipeline composite = ui_check_pipeline();
+  const VkFramebuffer framebuffer = g_composite ? target_framebuffer(*g_composite, nullptr) : VK_NULL_HANDLE;
+  const VkDescriptorSet efbSet = source_set(efb, false);
+  if (copy == VK_NULL_HANDLE || composite == VK_NULL_HANDLE || framebuffer == VK_NULL_HANDLE ||
+      efbSet == VK_NULL_HANDLE) {
+    return;
+  }
+  const VkExtent2D extent{efb.width, efb.height};
+  const VkViewport viewport{0.f, 0.f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.f, 1.f};
+  constexpr std::array<float, 4> whole{0.f, 0.f, 1.f, 1.f};
+  draw_texture(cmd, color_pass(Load::DontCare), framebuffer, extent, viewport, copy, efbSet, whole);
+  const VkDescriptorSet uiSet = ui != nullptr ? source_set(*ui, false) : VK_NULL_HANDLE;
+  if (uiSet != VK_NULL_HANDLE && ui->width == efb.width && ui->height == efb.height) {
+    draw_texture(cmd, color_pass(Load::Load), framebuffer, extent, viewport, composite, uiSet, whole);
+  }
+}
+
 void read_back_ui(const backend::Texture& efb, const backend::Texture* ui, uint64_t serial) noexcept {
   {
     std::lock_guard lock{g_readbackMutex};
@@ -529,11 +572,14 @@ void read_back_ui(const backend::Texture& efb, const backend::Texture* ui, uint6
   };
   std::lock_guard lock{g_readbackMutex};
   read(efb, g_readbackEfb);
-  if (ui != nullptr && ui->width == efb.width && ui->height == efb.height) {
+  if (ui != nullptr && ui->width == efb.width && ui->height == efb.height && g_composite) {
     read(*ui, g_readbackUi);
+    read(*g_composite, g_readbackComposite);
   } else {
     g_readbackUi.clear();
+    g_readbackComposite.clear();
   }
+  g_composite.reset();
   g_readbackWidth = efb.width;
   g_readbackHeight = efb.height;
   g_readbackReady = true;
@@ -581,7 +627,8 @@ ImTextureID aurora_imgui_add_texture(uint32_t width, uint32_t height, const void
 }
 
 #ifdef AURORA_DIAGNOSTICS
-// Frames ended, frames whose UI drew, the UI's passes and the present's composites, since the last call.
+// Frames ended, frames whose UI drew, the UI's passes, the present's composites and the render worker's nanoseconds
+// in the UI, since the last call.
 extern "C" void aurora_vulkan4xenon_take_ui_counts(unsigned long long* counts) {
   for (size_t i = 0; i < aurora::gfx::vulkan4xenon::g_counts.size(); ++i) {
     counts[i] = aurora::gfx::vulkan4xenon::g_counts[i].exchange(0, std::memory_order_relaxed);
@@ -613,10 +660,11 @@ extern "C" void aurora_vulkan4xenon_request_ui_readback() {
   aurora::gfx::vulkan4xenon::g_readbackReady = false;
 }
 
-// The frame read back, its bytes red to alpha a texel, row by row, valid till the next request; ui null when the UI
-// drew nothing. False until it's ready.
+// The frame read back, its bytes red to alpha a texel, row by row, valid till the next request: the EFB, the UI image
+// and their composite on the GPU, ui and composite null when the UI drew nothing. False until it's ready.
 extern "C" bool aurora_vulkan4xenon_take_ui_readback(const unsigned char** efb, const unsigned char** ui,
-                                                     unsigned int* width, unsigned int* height) {
+                                                     const unsigned char** composite, unsigned int* width,
+                                                     unsigned int* height) {
   using namespace aurora::gfx::vulkan4xenon;
   std::lock_guard lock{g_readbackMutex};
   if (!g_readbackReady) {
@@ -624,6 +672,7 @@ extern "C" bool aurora_vulkan4xenon_take_ui_readback(const unsigned char** efb, 
   }
   *efb = g_readbackEfb.data();
   *ui = g_readbackUi.empty() ? nullptr : g_readbackUi.data();
+  *composite = g_readbackComposite.empty() ? nullptr : g_readbackComposite.data();
   *width = g_readbackWidth;
   *height = g_readbackHeight;
   return true;
