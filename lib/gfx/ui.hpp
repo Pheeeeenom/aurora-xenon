@@ -93,15 +93,12 @@ struct Frame {
   // Each a projection times a transform, column by column; the first is the projection alone.
   std::vector<std::array<float, 16>> matrices;
   std::vector<Upload> uploads;
-  // The most layers pushed at once.
-  uint8_t layers = 0;
 
   // Emptied, its vectors keeping their room for the next frame.
   void clear() noexcept {
     ops.clear();
     matrices.clear();
     uploads.clear();
-    layers = 0;
   }
 };
 } // namespace aurora::gfx::ui

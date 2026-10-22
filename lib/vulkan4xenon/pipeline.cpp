@@ -711,32 +711,28 @@ VkPipeline ui_pipeline(ui::Pipeline kind) noexcept {
   if (pipeline) {
     return *pipeline;
   }
-  constexpr VkPipelineColorBlendAttachmentState Replace{
+  static constexpr VkPipelineColorBlendAttachmentState Replace{
       .colorWriteMask =
           VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
   };
-  constexpr VkPipelineColorBlendAttachmentState NoColour{};
-  constexpr VkFormat Bytes = VK_FORMAT_R8G8B8A8_UNORM;
-  switch (kind) {
-  case ui::Pipeline::Blend:
-    pipeline = make_ui_pipeline(Bytes, 8, 12, PremultipliedBlend);
-    break;
-  case ui::Pipeline::BlendMasked:
-    pipeline = make_ui_pipeline(Bytes, 8, 12, PremultipliedBlend, true, VK_COMPARE_OP_EQUAL);
-    break;
-  case ui::Pipeline::Replace:
-    pipeline = make_ui_pipeline(Bytes, 8, 12, Replace);
-    break;
-  case ui::Pipeline::ReplaceMasked:
-    pipeline = make_ui_pipeline(Bytes, 8, 12, Replace, true, VK_COMPARE_OP_EQUAL);
-    break;
-  case ui::Pipeline::ClipReplace:
-    pipeline = make_ui_pipeline(Bytes, 8, 12, NoColour, true, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE);
-    break;
-  case ui::Pipeline::ClipIntersect:
-    pipeline = make_ui_pipeline(Bytes, 8, 12, NoColour, true, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_INCREMENT_AND_CLAMP);
-    break;
-  }
+  static constexpr VkPipelineColorBlendAttachmentState NoColour{};
+  // By ui::Pipeline: the blend, whether the stencil is tested, its test, and what a passing draw does to it.
+  struct Kind {
+    const VkPipelineColorBlendAttachmentState* blend;
+    bool stencil;
+    VkCompareOp compare;
+    VkStencilOp pass;
+  };
+  static constexpr std::array<Kind, 6> Kinds{{
+      {&PremultipliedBlend, false, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_KEEP},
+      {&PremultipliedBlend, true, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP},
+      {&Replace, false, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_KEEP},
+      {&Replace, true, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP},
+      {&NoColour, true, VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE},
+      {&NoColour, true, VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_INCREMENT_AND_CLAMP},
+  }};
+  const Kind& made = Kinds[static_cast<size_t>(kind)];
+  pipeline = make_ui_pipeline(VK_FORMAT_R8G8B8A8_UNORM, 8, 12, *made.blend, made.stencil, made.compare, made.pass);
   return *pipeline;
 }
 

@@ -112,6 +112,13 @@ std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept {
   return std::make_shared<Texture>();
 }
 
+#ifdef AURORA_DIAGNOSTICS
+size_t texture_bytes(const Texture& texture) noexcept {
+  (void)texture;
+  return 0;
+}
+#endif
+
 std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
                                            bool ui) noexcept {
   (void)data;

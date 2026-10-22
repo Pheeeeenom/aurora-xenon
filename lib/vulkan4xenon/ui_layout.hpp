@@ -10,7 +10,7 @@
 
 namespace aurora::gfx::vulkan4xenon::ui_layout {
 // ImGui's atlas words, IM_COL32's 0xAABBGGRR (imgui:imgui.h:2882-2889), as bytes in R, G, B, A order on any host,
-// which R8G8B8A8_UNORM reads.
+// which R8G8B8A8_UNORM reads; out may be the words' own memory, each word read before its bytes are written.
 void atlas_bytes(std::span<const uint32_t> words, uint8_t* out) noexcept;
 
 // One ImGui command: its indices, 16-bit, copied to start on 4 bytes, the only alignment the console has drawn index

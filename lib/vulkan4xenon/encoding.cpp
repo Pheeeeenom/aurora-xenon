@@ -336,8 +336,8 @@ VkRect2D to_scissor(const ClipRect& scissor, const TextureExtent& size) noexcept
 
 } // namespace
 
-// The multisampled EFB's with its depth and the EFB its colour's average goes into, which update_efb makes and
-// replaces together.
+// A colour target's framebuffer, alone or with a depth target, or the multisampled EFB's with its depth and the EFB
+// its colour's average goes into, which update_efb makes and replaces together.
 VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture* depth,
                                  const backend::Texture* resolve) noexcept {
   if (color.framebuffer != VK_NULL_HANDLE && color.framebufferDepth == depth) {
@@ -395,11 +395,12 @@ VkDescriptorSet source_set(backend::Texture& texture, bool linear) noexcept {
 }
 
 namespace {
-// A pass drawing the triangle over a target through layout's sets and push constants.
+// A pass drawing the triangle over a target through layout's sets and push constants, then, given over, again through
+// its pipeline and set: the present's UI over the EFB, in one pass.
 void draw_triangle(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
                    const VkViewport& viewport, VkPipeline pipeline, VkPipelineLayout layout,
-                   std::span<const VkDescriptorSet> sets, VkShaderStageFlags pushStages,
-                   std::span<const float> push) noexcept {
+                   std::span<const VkDescriptorSet> sets, VkShaderStageFlags pushStages, std::span<const float> push,
+                   VkPipeline overPipeline = VK_NULL_HANDLE, VkDescriptorSet overSet = VK_NULL_HANDLE) noexcept {
   const VkClearValue black{};
   const VkRenderPassBeginInfo begin{
       .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -421,6 +422,11 @@ void draw_triangle(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer f
   const VkDeviceSize offset = 0;
   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
   vkCmdDraw(cmd, 3, 1, 0, 0);
+  if (overPipeline != VK_NULL_HANDLE && overSet != VK_NULL_HANDLE) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &overSet, 0, nullptr);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+  }
   vkCmdEndRenderPass(cmd);
 }
 
@@ -428,9 +434,9 @@ void draw_triangle(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer f
 
 void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
                   const VkViewport& viewport, VkPipeline pipeline, VkDescriptorSet set,
-                  const std::array<float, 4>& source) noexcept {
+                  const std::array<float, 4>& source, VkPipeline overPipeline, VkDescriptorSet overSet) noexcept {
   draw_triangle(cmd, renderPass, framebuffer, extent, viewport, pipeline, copy_layout(), std::span{&set, 1},
-                VK_SHADER_STAGE_VERTEX_BIT, source);
+                VK_SHADER_STAGE_VERTEX_BIT, source, overPipeline, overSet);
 }
 
 namespace {
@@ -1030,34 +1036,10 @@ void present_efb(VkCommandBuffer cmd, VkFramebuffer framebuffer, VkExtent2D exte
   if (pipeline == VK_NULL_HANDLE || set == VK_NULL_HANDLE) {
     return;
   }
-  const VkClearValue black{};
-  const VkRenderPassBeginInfo begin{
-      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-      .renderPass = present_pass(covered ? Load::DontCare : Load::Clear),
-      .framebuffer = framebuffer,
-      .renderArea = {{0, 0}, extent},
-      .clearValueCount = 1,
-      .pClearValues = &black,
-  };
-  vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
-  vkCmdSetViewport(cmd, 0, 1, &viewport);
-  const VkRect2D scissor{{0, 0}, extent};
-  vkCmdSetScissor(cmd, 0, 1, &scissor);
-  const VkBuffer vertices = triangle_buffer();
-  const VkDeviceSize offset = 0;
-  vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &offset);
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copy_layout(), 0, 1, &set, 0, nullptr);
-  vkCmdPushConstants(cmd, copy_layout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(WholeSource), WholeSource.data());
-  vkCmdDraw(cmd, 3, 1, 0, 0);
   const VkPipeline composite = ui != nullptr ? ui_present_pipeline() : VK_NULL_HANDLE;
   const VkDescriptorSet uiSet = composite != VK_NULL_HANDLE ? source_set(*ui, false) : VK_NULL_HANDLE;
-  if (uiSet != VK_NULL_HANDLE) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, composite);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, copy_layout(), 0, 1, &uiSet, 0, nullptr);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-  }
-  vkCmdEndRenderPass(cmd);
+  draw_texture(cmd, present_pass(covered ? Load::DontCare : Load::Clear), framebuffer, extent, viewport, pipeline, set,
+               WholeSource, composite, uiSet);
 }
 
 void encode_pass(const detail::FramePacket& frame, FrameState& state, const detail::FrameOp& op,
@@ -1347,8 +1329,14 @@ void encode(detail::FramePacket& frame, const detail::FrameOp& op) noexcept {
 void end_frame(detail::FramePacket& frame, const imgui::DrawData& overlay, const ui::Frame& ui) noexcept {
   auto& state = g_frames[frame.slot];
   const VkCommandBuffer cmd = slot_commands(frame.slot);
-  // Drawn whether or not a swapchain image is acquired, so a capture shows it.
-  backend::Texture* const uiImage = state.recording ? encode_ui(frame.slot, ui, overlay, cmd) : nullptr;
+  // Drawn whether or not a swapchain image is acquired, so a capture shows it. A frame not recorded keeps RmlUi's
+  // uploads for the next, as RmlUi holds their textures.
+  backend::Texture* uiImage = nullptr;
+  if (state.recording) {
+    uiImage = encode_ui(frame.slot, ui, overlay, {state.efbColor->width, state.efbColor->height}, cmd);
+  } else {
+    keep_ui_uploads(ui);
+  }
   uint32_t image = 0;
   VkFramebuffer framebuffer = VK_NULL_HANDLE;
 #ifdef AURORA_DIAGNOSTICS

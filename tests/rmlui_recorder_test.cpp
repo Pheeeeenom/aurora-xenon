@@ -198,7 +198,6 @@ TEST(RmlUiRecorder, PushCompositePopAndSaveTouchTheirLayers) {
   ASSERT_EQ(ops.size(), 8u);
   EXPECT_EQ(layer, 1u);
   EXPECT_EQ(saved, 1u);
-  EXPECT_EQ(r.frame.layers, 1);
   EXPECT_EQ(ops[0].type, ui::OpType::PushLayer);
   EXPECT_EQ(ops[0].destination, 1);
   EXPECT_EQ(ops[2].type, ui::OpType::Composite);

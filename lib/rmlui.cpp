@@ -567,18 +567,15 @@ bool shows_anything(Rml::Context& context) noexcept {
   }
   return false;
 }
-} // namespace
-
 #ifdef AURORA_DIAGNOSTICS
 // The game thread's nanoseconds in Update, then in Render and its recording, frames Rendered and frames updated.
 std::array<std::atomic<uint64_t>, 4> g_times{};
 #endif
+} // namespace
 
 // Context::Render runs only on frames where something may draw: measured on the console, it took 0.19 ms a frame
-// with no more than one toast up (vulkan4xenon milestone 16, step 1). Once nothing shows, RmlUi's textures and the
-// recorder's copies of its geometry go, made again as something next shows: Dusklight runs with 42 to 70 MB free.
+// with no more than one toast up (vulkan4xenon milestone 16, step 1).
 void update(gfx::ui::Frame& frame) noexcept {
-  static bool rendered = false;
   auto* recorder = static_cast<RecordingRenderInterface*>(Backend::GetRenderInterface()); // NOLINT
   if (g_context == nullptr || recorder == nullptr) {
     frame.clear();
@@ -601,15 +598,10 @@ void update(gfx::ui::Frame& frame) noexcept {
   if (shows_anything(*g_context)) {
     recorder->BeginFrame(g_context->GetDimensions());
     g_context->Render();
-    rendered = true;
 #ifdef AURORA_DIAGNOSTICS
     g_times[1] += ns(Clock::now() - updated);
     ++g_times[2];
 #endif
-  } else if (rendered) {
-    rendered = false;
-    Rml::ReleaseTextures(recorder);
-    Rml::ReleaseCompiledGeometry(recorder);
   }
   recorder->TakeFrame(frame);
 }

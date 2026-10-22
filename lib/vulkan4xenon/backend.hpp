@@ -203,7 +203,8 @@ bool initialize_textures() noexcept;
 // Tiled, as every image the layer makes is. R32Float only sampled, as the range fog table; R8 and RG8 only sampled, as
 // intensity, and as intensity and alpha. At 2 or 4 samples, the EFB's colour or depth, never sampled; transfer adds
 // the usages a resolve takes.
-// A depth target made with depthSampled false is never sampled, and takes no memory but eDRAM.
+// A depth target made with depthSampled false is never sampled, and takes the 4 KB the layer gives such a depth
+// image besides eDRAM (vulkan4xenon:src/image.c:16, 224).
 std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc,
                                                VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
                                                VkImageUsageFlags transfer = 0, bool depthSampled = true) noexcept;
@@ -227,18 +228,23 @@ VkFramebuffer target_framebuffer(backend::Texture& color, const backend::Texture
 VkDescriptorSet source_set(backend::Texture& texture, bool linear) noexcept;
 // A tiled R8G8B8A8 image's texel, its bytes red to alpha, read on the CPU; once the GPU is done with it.
 std::array<uint8_t, 4> read_texel(const backend::Texture& image, uint32_t x, uint32_t y) noexcept;
-// A pass drawing one texture over a target, for copies and the present. source is offset and scale in it.
+// A pass drawing one texture over a target, for copies and the present, and, given over, a second over it through
+// its pipeline and set. source is offset and scale in each.
 void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer framebuffer, VkExtent2D extent,
                   const VkViewport& viewport, VkPipeline pipeline, VkDescriptorSet set,
-                  const std::array<float, 4>& source) noexcept;
+                  const std::array<float, 4>& source, VkPipeline overPipeline = VK_NULL_HANDLE,
+                  VkDescriptorSet overSet = VK_NULL_HANDLE) noexcept;
 
 // ui.cpp: RmlUi's list and ImGui's lists drawn into the UI image, made while something shows.
 void shutdown_ui() noexcept;
 // Render worker, before the frame's present: the textures staged for the UI copied in, then, if either draws, the
-// UI's passes. The UI image they drew into, or null when nothing drew: then no pass was recorded, and the UI's
-// targets are released.
-backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::DrawData& imgui,
+// UI's passes, at the size RmlUi's context or ImGui's display gives, else the EFB's. The UI image they drew into, or
+// null when nothing drew: then no pass was recorded, and the UI's targets are released. A frame without the memory
+// for a target draws no UI, and the next tries again.
+backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::DrawData& imgui, TextureExtent efb,
                             VkCommandBuffer cmd) noexcept;
+// Render worker: a frame not recorded hands its RmlUi uploads to the next one encode_ui draws.
+void keep_ui_uploads(const ui::Frame& rml) noexcept;
 #ifdef AURORA_DIAGNOSTICS
 // Render worker, before a frame's submission: when a readback is asked for, the EFB and the UI image composited as the
 // present composites them, into an image of the EFB's size.

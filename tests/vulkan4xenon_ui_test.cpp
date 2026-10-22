@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 namespace {
 namespace ui_layout = aurora::gfx::vulkan4xenon::ui_layout;
@@ -45,11 +46,12 @@ struct Lists {
 };
 
 // IM_COL32's words, 0xAABBGGRR (imgui:imgui.h:2882-2889), come out red first, as R8G8B8A8_UNORM reads them, whatever
-// the host's byte order: the atlas's white texels FF FF FF and their alpha.
+// the host's byte order: the atlas's white texels FF FF FF and their alpha. In place, as new_frame converts them.
 TEST(ImGuiAtlas, WordsBecomeBytesRedFirst) {
-  const std::array<uint32_t, 2> words{IM_COL32(255, 255, 255, 0x40), IM_COL32(1, 2, 3, 4)};
+  std::array<uint32_t, 2> words{IM_COL32(255, 255, 255, 0x40), IM_COL32(1, 2, 3, 4)};
+  ui_layout::atlas_bytes(words, reinterpret_cast<uint8_t*>(words.data()));
   std::array<uint8_t, 8> bytes{};
-  ui_layout::atlas_bytes(words, bytes.data());
+  std::memcpy(bytes.data(), words.data(), bytes.size());
   EXPECT_EQ(bytes, (std::array<uint8_t, 8>{0xFF, 0xFF, 0xFF, 0x40, 1, 2, 3, 4}));
 }
 

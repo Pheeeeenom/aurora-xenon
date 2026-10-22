@@ -332,8 +332,7 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc,
   }
   VkMemoryRequirements requirements;
   vkGetImageMemoryRequirements(g_device, texture->image, &requirements);
-  // A target that takes no memory, as the UI's D24S8, binds the game's: it would take a block of the UI's.
-  if (!allocate(requirements, texture->memory, desc.ui && requirements.size != 0) ||
+  if (!allocate(requirements, texture->memory, desc.ui) ||
       !succeeded(vkBindImageMemory(g_device, texture->image, texture->memory.memory, texture->memory.offset),
                  "vkBindImageMemory")) {
     Log.error("No memory for {} ({}x{})", desc.label, desc.width, desc.height);
@@ -477,6 +476,10 @@ void refresh_surface() noexcept {}
 
 // Every texture tiled, whatever its size (vulkan4xenon's docs/SUPPORT.md, Images).
 std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept { return make_texture(desc); }
+
+#ifdef AURORA_DIAGNOSTICS
+size_t texture_bytes(const Texture& texture) noexcept { return texture.memory.size; }
+#endif
 
 std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
                                            bool ui) noexcept {

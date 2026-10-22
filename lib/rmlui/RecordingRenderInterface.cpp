@@ -45,7 +45,7 @@ struct Texture {
 };
 
 #ifdef AURORA_DIAGNOSTICS
-// The bytes of the textures RmlUi holds: made from texels, and saved from layers.
+// The bytes of the textures RmlUi holds, as the backend holds them: made from texels, and saved from layers.
 std::array<std::atomic<uint64_t>, 2> g_textureBytes{};
 // The bytes of the geometry RmlUi has compiled, copied; in 32 bits, as GCC's 64-bit sums are rldic, which Xenia skips
 // (xsdk's CLAUDE.md).
@@ -55,16 +55,14 @@ size_t bytes_of(const gfx::ui::Geometry& geometry) noexcept {
   return geometry.vertices.size() * sizeof(gfx::ui::Vertex) + geometry.indices.size() * sizeof(uint32_t);
 }
 
-Rml::TextureHandle counted(Texture* texture, Rml::Vector2i size, bool saved) noexcept {
-  texture->bytes = static_cast<uint64_t>(size.x) * static_cast<uint64_t>(size.y) * 4;
+Rml::TextureHandle counted(Texture* texture, bool saved) noexcept {
+  texture->bytes = gfx::backend::texture_bytes(*texture->gpu);
   texture->saved = saved;
   g_textureBytes[saved ? 1 : 0] += texture->bytes;
   return reinterpret_cast<Rml::TextureHandle>(texture);
 }
 #else
-Rml::TextureHandle counted(Texture* texture, Rml::Vector2i, bool) noexcept {
-  return reinterpret_cast<Rml::TextureHandle>(texture);
-}
+Rml::TextureHandle counted(Texture* texture, bool) noexcept { return reinterpret_cast<Rml::TextureHandle>(texture); }
 #endif
 
 struct Filter {
@@ -243,7 +241,7 @@ Rml::TextureHandle RecordingRenderInterface::make_texture(const Rml::byte* rgba,
     return 0;
   }
   m_frame.uploads.push_back({.texture = gpu, .data = std::move(data), .width = width, .height = height});
-  return counted(new Texture{std::move(gpu)}, size, false);
+  return counted(new Texture{std::move(gpu)}, false);
 }
 
 // Runtime textures are made as Dawn makes them (WebGPURenderInterface.cpp, LoadTexture), without the mips some ask for.
@@ -369,7 +367,6 @@ void RecordingRenderInterface::SetTransform(const Rml::Matrix4f* transform) {
 Rml::LayerHandle RecordingRenderInterface::PushLayer() {
   const auto layer = static_cast<uint8_t>(m_layers.size());
   m_layers.push_back(layer);
-  m_frame.layers = std::max(m_frame.layers, layer);
   m_frame.ops.push_back({.type = gfx::ui::OpType::PushLayer, .destination = layer});
   return layer;
 }
@@ -433,7 +430,7 @@ Rml::TextureHandle RecordingRenderInterface::SaveLayerAsTexture() {
       .scissor = region,
       .texture = gpu,
   });
-  return counted(new Texture{std::move(gpu)}, {region.width, region.height}, true);
+  return counted(new Texture{std::move(gpu)}, true);
 }
 
 Rml::CompiledFilterHandle RecordingRenderInterface::CompileFilter(const Rml::String& name,

@@ -18,8 +18,8 @@
 
 namespace aurora::gfx::vulkan4xenon {
 namespace {
-// A frame slot's room for the UI's vertices and indices: Dusklight's menu took at most 73 KB a frame on the console
-// (milestone 16's first step).
+// A frame slot's room for the UI's vertices and indices: Dusklight's menu took at most 73.2 KB a frame (vulkan4xenon
+// milestone 16's first step, the console run of 2026-10-21).
 constexpr VkDeviceSize RingBytes = 256 * 1024;
 
 // A slot's vertices and indices, write-combined; gone once the GPU is done with every frame that read it.
@@ -36,10 +36,10 @@ struct Ring {
   }
 };
 
-// Made at the first frame anything shows and released at the first that shows nothing, as Dusklight runs with 42 to 70
-// MB free: the UI image the present composites, a D24S8 for RmlUi's clip mask, which takes no memory as it's never
-// sampled, a white texel drawn with where RmlUi samples nothing, as Dawn's null texture is
-// (rmlui/WebGPURenderInterface.cpp, CreateNullTexture), RmlUi's layers from 1, and a ring for each slot.
+// Made at the first frame anything shows and released at the first that shows nothing, from the UI's pools, which give
+// their blocks back: the UI image the present composites, a D24S8 for RmlUi's clip mask, 4 KB as it's never sampled,
+// a white texel drawn with where RmlUi samples nothing, as Dawn's null texture is (rmlui/WebGPURenderInterface.cpp,
+// CreateNullTexture), RmlUi's layers from 1, and a ring for each slot.
 struct Targets {
   uint32_t width = 0;
   uint32_t height = 0;
@@ -50,12 +50,19 @@ struct Targets {
   std::array<std::shared_ptr<Ring>, detail::FrameSlotCount> rings;
 };
 Targets g_targets;
+// Whether the frame before that showed something lacked the memory for a target, so a run of them logs once.
+bool g_lacking = false;
+// RmlUi's uploads from frames not recorded, copied in before the next frame's: RmlUi holds their textures, which
+// would otherwise be sampled uninitialised. Render worker only.
+std::vector<ui::Upload> g_rmlWaiting;
 
 // ImGui's textures: its atlas, uploaded once ImGui draws, and aurora_imgui_add_texture's.
 struct ImGuiTexture {
   std::shared_ptr<backend::Texture> gpu;
 };
 ImGuiTexture g_atlas;
+// Game thread: whether the atlas lacked memory at its last try, so a run of them logs once.
+bool g_atlasLacking = false;
 // Staged on the game thread, copied in by the render worker before the frame's UI.
 std::mutex g_imguiMutex;
 std::vector<ui::Upload> g_imguiUploads;
@@ -65,9 +72,10 @@ std::chrono::steady_clock::time_point g_lastNewFrame{};
 ui_layout::ImGuiLayout g_imguiLayout;
 
 #ifdef AURORA_DIAGNOSTICS
-// Frames ended, frames whose UI drew, UI passes, composites at the present and the render worker's time in encode_ui,
-// since the last take.
-std::array<std::atomic<uint64_t>, 5> g_counts{};
+// Frames ended, frames whose UI drew, UI passes and the render worker's time in encode_ui, since the last take.
+std::array<std::atomic<uint64_t>, 4> g_counts{};
+// The targets' memory, the render worker's to write: the UI image, the D24S8, the layers and the rings.
+std::array<std::atomic<uint64_t>, 4> g_targetBytes{};
 // The next frame's EFB, UI image and their composite, read back once it's done, as bytes red to alpha a texel, row by
 // row.
 std::mutex g_readbackMutex;
@@ -115,7 +123,6 @@ bool make_targets(uint32_t width, uint32_t height) noexcept {
       .ui = true,
   });
   if (!image || !stencil || !white) {
-    Log.error("No memory for the UI's {}x{} image; it isn't drawn", width, height);
     return false;
   }
   // Its whole memory, which is the texel whatever the tiling.
@@ -150,7 +157,39 @@ struct Replay {
   bool imageCleared = false;
   VkPipeline bound = VK_NULL_HANDLE;
   uint32_t passes = 0;
+  // A layer had no memory: the frame draws no UI.
+  bool lacking = false;
 };
+
+// Diagnostics: the targets' memory, after a frame changes them.
+void count_targets() noexcept {
+#ifdef AURORA_DIAGNOSTICS
+  const auto size = [](const std::shared_ptr<backend::Texture>& texture) -> uint64_t {
+    return texture ? texture->memory.size : 0;
+  };
+  uint64_t layers = 0;
+  for (const auto& layer : g_targets.layers) {
+    layers += size(layer);
+  }
+  uint64_t rings = 0;
+  for (const auto& ring : g_targets.rings) {
+    rings += ring ? ring->buffer.size : 0;
+  }
+  g_targetBytes[0] = size(g_targets.image);
+  g_targetBytes[1] = size(g_targets.stencil);
+  g_targetBytes[2] = layers;
+  g_targetBytes[3] = rings;
+#endif
+}
+
+// A frame without the memory for a target draws no UI; the next asks again.
+backend::Texture* lacking(uint32_t width, uint32_t height) noexcept {
+  if (!g_lacking) {
+    Log.error("No memory for the UI's {}x{} targets; no UI is drawn until there is", width, height);
+  }
+  g_lacking = true;
+  return nullptr;
+}
 
 backend::Texture* layer_image(uint8_t layer) noexcept {
   if (layer == 0) {
@@ -159,7 +198,6 @@ backend::Texture* layer_image(uint8_t layer) noexcept {
   while (g_targets.layers.size() < layer) {
     auto image = make_target(g_targets.width, g_targets.height, false, "UI layer");
     if (!image) {
-      Log.error("No memory for RmlUi's layer {}; it isn't drawn", g_targets.layers.size() + 1);
       return nullptr;
     }
     g_targets.layers.push_back(std::move(image));
@@ -178,6 +216,7 @@ void end_pass(Replay& replay) noexcept {
 bool begin_pass(Replay& replay, uint8_t layer, bool clearColor) noexcept {
   end_pass(replay);
   backend::Texture* const image = layer_image(layer);
+  replay.lacking = replay.lacking || image == nullptr;
   const VkFramebuffer framebuffer =
       image != nullptr ? target_framebuffer(*image, g_targets.stencil.get()) : VK_NULL_HANDLE;
   if (framebuffer == VK_NULL_HANDLE) {
@@ -281,6 +320,7 @@ void draw(Replay& replay, const ui::Op& op, const ui::Vertex* vertices, size_t v
 void composite(Replay& replay, const ui::Op& op) noexcept {
   backend::Texture* const source = layer_image(op.source);
   if (source == nullptr) {
+    replay.lacking = true;
     return;
   }
   if (replay.open == op.source) {
@@ -328,7 +368,8 @@ void replay_rml(Replay& replay) noexcept {
     switch (op.type) {
     case ui::OpType::Draw:
       draw(replay, op, op.geometry->vertices.data(), op.geometry->vertices.size(), op.geometry->indices.data(),
-           op.geometry->indices.size(), op.texture ? *op.texture : *g_targets.white, true, replay.rml.matrices[op.matrix]);
+           op.geometry->indices.size(), op.texture ? *op.texture : *g_targets.white, true,
+           replay.rml.matrices[op.matrix]);
       break;
     case ui::OpType::PushLayer:
       replay.top = op.destination;
@@ -426,7 +467,7 @@ void upload(VkCommandBuffer cmd, const std::vector<ui::Upload>& uploads) noexcep
   }
 }
 
-// ImGui's texture of RGBA8 texels, staged for the render worker.
+// ImGui's texture of RGBA8 texels, staged for the render worker; null without the memory.
 ImTextureID make_imgui_texture(ImGuiTexture& texture, uint32_t width, uint32_t height, const uint8_t* rgba8) noexcept {
   auto gpu = make_texture({
       .width = width,
@@ -440,7 +481,6 @@ ImTextureID make_imgui_texture(ImGuiTexture& texture, uint32_t width, uint32_t h
   });
   auto data = gpu ? backend::stage_upload(rgba8, width * 4, height, true) : nullptr;
   if (!data) {
-    Log.error("No memory for ImGui's {}x{} texture", width, height);
     return ImTextureID{};
   }
   {
@@ -452,22 +492,27 @@ ImTextureID make_imgui_texture(ImGuiTexture& texture, uint32_t width, uint32_t h
 }
 } // namespace
 
+void keep_ui_uploads(const ui::Frame& rml) noexcept {
+  g_rmlWaiting.insert(g_rmlWaiting.end(), rml.uploads.begin(), rml.uploads.end());
+}
+
 void shutdown_ui() noexcept {
   g_targets = {};
+  g_rmlWaiting.clear();
   g_atlas.gpu.reset();
   std::lock_guard lock{g_imguiMutex};
   g_imguiUploads.clear();
   g_imguiTaken.clear();
 }
 
-backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::DrawData& imgui,
+backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::DrawData& imgui, TextureExtent efb,
                             VkCommandBuffer cmd) noexcept {
 #ifdef AURORA_DIAGNOSTICS
   const auto start = std::chrono::steady_clock::now();
   struct Timer {
     std::chrono::steady_clock::time_point start;
     ~Timer() {
-      g_counts[4] +=
+      g_counts[3] +=
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
     }
   } timer{start};
@@ -478,6 +523,8 @@ backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::Draw
   }
   upload(cmd, g_imguiTaken);
   g_imguiTaken.clear();
+  upload(cmd, g_rmlWaiting);
+  g_rmlWaiting.clear();
   upload(cmd, rml.uploads);
   const ImDrawData* const lists = imgui.data();
   const bool imguiDraws = lists != nullptr && lists->CmdListsCount > 0 && lists->TotalIdxCount > 0;
@@ -488,10 +535,10 @@ backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::Draw
   if (!draws) {
     // Nothing shows: no pass, and the targets go once the frames before are done with them.
     g_targets = {};
+    count_targets();
     return nullptr;
   }
-  // RmlUi's context, or ImGui's display, or the EFB's.
-  TextureExtent size = efb_size();
+  TextureExtent size = efb;
   if (!rml.ops.empty()) {
     size = {rml.width, rml.height};
   } else if (imguiDraws) {
@@ -500,8 +547,12 @@ backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::Draw
   }
   const uint32_t width = size.width;
   const uint32_t height = size.height;
-  if (width == 0 || height == 0 || !make_targets(width, height)) {
+  if (width == 0 || height == 0) {
     return nullptr;
+  }
+  if (!make_targets(width, height)) {
+    count_targets();
+    return lacking(width, height);
   }
   Replay replay{.cmd = cmd, .rml = rml, .ring = *g_targets.rings[slot]};
   replay_rml(replay);
@@ -511,13 +562,20 @@ backend::Texture* encode_ui(size_t slot, const ui::Frame& rml, const imgui::Draw
   // A frame whose draws were all refused still clears the image, so the composite shows nothing.
   open_pass(replay, 0);
   end_pass(replay);
+  count_targets();
+  if (replay.lacking) {
+    return lacking(width, height);
+  }
+  if (g_lacking) {
+    Log.info("The UI has its targets again");
+    g_lacking = false;
+  }
   if (replay.skipped != 0) {
     Log.error("No room for {} of the UI's draws in the frame's {} bytes; they were skipped", replay.skipped, RingBytes);
   }
 #ifdef AURORA_DIAGNOSTICS
   ++g_counts[1];
   g_counts[2] += replay.passes;
-  ++g_counts[3];
 #endif
   return g_targets.image.get();
 }
@@ -544,11 +602,9 @@ void compose_for_readback(VkCommandBuffer cmd, backend::Texture& efb, backend::T
   const VkExtent2D extent{efb.width, efb.height};
   const VkViewport viewport{0.f, 0.f, static_cast<float>(extent.width), static_cast<float>(extent.height), 0.f, 1.f};
   constexpr std::array<float, 4> whole{0.f, 0.f, 1.f, 1.f};
-  draw_texture(cmd, color_pass(Load::DontCare), framebuffer, extent, viewport, copy, efbSet, whole);
-  const VkDescriptorSet uiSet = ui != nullptr ? source_set(*ui, false) : VK_NULL_HANDLE;
-  if (uiSet != VK_NULL_HANDLE && ui->width == efb.width && ui->height == efb.height) {
-    draw_texture(cmd, color_pass(Load::Load), framebuffer, extent, viewport, composite, uiSet, whole);
-  }
+  const bool over = ui != nullptr && ui->width == efb.width && ui->height == efb.height;
+  draw_texture(cmd, color_pass(Load::DontCare), framebuffer, extent, viewport, copy, efbSet, whole, composite,
+               over ? source_set(*ui, false) : VK_NULL_HANDLE);
 }
 
 void read_back_ui(const backend::Texture& efb, const backend::Texture* ui, uint64_t serial) noexcept {
@@ -605,11 +661,22 @@ void new_frame(const AuroraWindowSize& size) noexcept {
     int width = 0;
     int height = 0;
     io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
-    std::vector<uint8_t> bytes(static_cast<size_t>(width) * height * 4);
-    ui_layout::atlas_bytes({reinterpret_cast<const uint32_t*>(pixels), static_cast<size_t>(width) * height},
-                           bytes.data());
-    io.Fonts->SetTexID(make_imgui_texture(g_atlas, width, height, bytes.data()));
-    io.Fonts->ClearTexData();
+    // In place, the upload copying it before ImGui's copies go.
+    ui_layout::atlas_bytes({reinterpret_cast<const uint32_t*>(pixels), static_cast<size_t>(width) * height}, pixels);
+    const ImTextureID atlas = make_imgui_texture(g_atlas, width, height, pixels);
+    if (atlas != ImTextureID{}) {
+      io.Fonts->SetTexID(atlas);
+      io.Fonts->ClearTexData();
+      g_atlasLacking = false;
+    } else {
+      // The next frame tries again from a copy made afresh, this one converted.
+      if (!g_atlasLacking) {
+        Log.error("No memory for ImGui's {}x{} atlas; it's tried again each frame ImGui draws", width, height);
+      }
+      g_atlasLacking = true;
+      IM_FREE(io.Fonts->TexPixelsRGBA32);
+      io.Fonts->TexPixelsRGBA32 = nullptr;
+    }
   }
   const auto now = std::chrono::steady_clock::now();
   if (g_lastNewFrame != std::chrono::steady_clock::time_point{}) {
@@ -624,34 +691,31 @@ void new_frame(const AuroraWindowSize& size) noexcept {
 // Kept for the life of the title, as nothing releases them.
 ImTextureID aurora_imgui_add_texture(uint32_t width, uint32_t height, const void* rgba8) {
   using namespace aurora::gfx::vulkan4xenon;
-  return make_imgui_texture(*new ImGuiTexture{}, width, height, static_cast<const uint8_t*>(rgba8));
+  auto* const texture = new ImGuiTexture{};
+  const ImTextureID id = make_imgui_texture(*texture, width, height, static_cast<const uint8_t*>(rgba8));
+  if (id == ImTextureID{}) {
+    Log.error("No memory for ImGui's {}x{} texture", width, height);
+    delete texture;
+  }
+  return id;
 }
 
 #ifdef AURORA_DIAGNOSTICS
-// Frames ended, frames whose UI drew, the UI's passes, the present's composites and the render worker's nanoseconds
-// in the UI, since the last call.
+// Frames ended, frames whose UI drew, the UI's passes and the render worker's nanoseconds in the UI, since the last
+// call.
 extern "C" void aurora_vulkan4xenon_take_ui_counts(unsigned long long* counts) {
   for (size_t i = 0; i < aurora::gfx::vulkan4xenon::g_counts.size(); ++i) {
     counts[i] = aurora::gfx::vulkan4xenon::g_counts[i].exchange(0, std::memory_order_relaxed);
   }
 }
 
-// The UI's memory by kind, in bytes: its image, its D24S8, its layers and its rings.
+// Game thread: the UI's memory by kind, in bytes: its image, its D24S8, its layers, its rings, and ImGui's atlas.
 extern "C" void aurora_vulkan4xenon_ui_memory(unsigned long long* bytes) {
   using namespace aurora::gfx::vulkan4xenon;
-  const auto size = [](const std::shared_ptr<aurora::gfx::backend::Texture>& texture) -> unsigned long long {
-    return texture ? texture->memory.size : 0;
-  };
-  bytes[0] = size(g_targets.image);
-  bytes[1] = size(g_targets.stencil);
-  bytes[2] = 0;
-  for (const auto& layer : g_targets.layers) {
-    bytes[2] += size(layer);
+  for (size_t i = 0; i < g_targetBytes.size(); ++i) {
+    bytes[i] = g_targetBytes[i].load(std::memory_order_relaxed);
   }
-  bytes[3] = 0;
-  for (const auto& ring : g_targets.rings) {
-    bytes[3] += ring ? ring->buffer.size : 0;
-  }
+  bytes[4] = g_atlas.gpu ? g_atlas.gpu->memory.size : 0;
 }
 
 // Asks for the next frame's EFB and UI image to be read back once it's done.

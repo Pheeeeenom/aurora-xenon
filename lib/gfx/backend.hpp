@@ -88,6 +88,10 @@ std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept;
 // pool's row pitch, or one of the UI's (ui), as TextureDesc::ui. Null when there is no memory for it.
 std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
                                            bool ui = false) noexcept;
+#ifdef AURORA_DIAGNOSTICS
+// The memory the texture takes, padding included, on the backends RmlUi's recorder draws through.
+size_t texture_bytes(const Texture& texture) noexcept;
+#endif
 } // namespace aurora::gfx::backend
 
 namespace aurora::gfx {

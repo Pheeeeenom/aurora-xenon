@@ -26,9 +26,10 @@ namespace {
 // 8 MiB blocks while it can, then exact ones, the second in exact ones. The third takes the layer's cached type, which
 // it offers only to buffers that are only copied from: copies run on the CPU, which reads cached memory at the cache's
 // speed, where the GPU's is read uncached. The UI's two, one of each type, take 1 MiB blocks and keep no empty one, so
-// what the UI releases when nothing shows goes back: Dusklight runs with 42 to 70 MB free (vulkan4xenon milestone 16).
+// what the UI releases when nothing shows goes back to the game.
 constexpr VkDeviceSize MemoryBlockSize = 8 * 1024 * 1024;
-// RmlUi's textures share them: 1.06 MB of fonts and images, and up to 3.12 MB of saved layers, on the console.
+// RmlUi's textures share them: 0.94 to 1.06 MB of fonts and images, and up to 3.12 MB of saved layers, in Dusklight's
+// menus (vulkan4xenon milestone 16, the console runs of 2026-10-21).
 constexpr VkDeviceSize UiBlockSize = 1024 * 1024;
 constexpr VkDeviceSize VideoRamGranularity = 64 * 1024;
 constexpr VkDeviceSize MainRamGranularity = 64 * 1024;
@@ -55,8 +56,9 @@ struct MemoryPool {
   const char* name;
   VkDeviceSize granularity;
   VkDeviceSize blockSize = MemoryBlockSize;
-  // An empty block is kept, so a load's uploads don't take and give back a kernel block every frame.
-  bool keepsEmpty = true;
+  // The UI's: no empty block is kept, which the game's pools keep so a load's uploads don't take and give back a
+  // kernel block every frame, and a refused size is asked for again, as the UI makes its targets again each frame.
+  bool ui = false;
   bool wholeBlocksFirst = true;
   uint32_t type = UINT32_MAX;
   bool wholeBlocks = true;
@@ -114,12 +116,9 @@ std::array<MemoryPool, 5> g_pools{
                .wholeBlocksFirst = false,
                .wholeBlocks = false},
     MemoryPool{.name = "cached memory", .granularity = CachedGranularity},
+    MemoryPool{.name = "the UI's memory", .granularity = VideoRamGranularity, .blockSize = UiBlockSize, .ui = true},
     MemoryPool{
-        .name = "the UI's memory", .granularity = VideoRamGranularity, .blockSize = UiBlockSize, .keepsEmpty = false},
-    MemoryPool{.name = "the UI's cached memory",
-               .granularity = CachedGranularity,
-               .blockSize = UiBlockSize,
-               .keepsEmpty = false},
+        .name = "the UI's cached memory", .granularity = CachedGranularity, .blockSize = UiBlockSize, .ui = true},
 };
 
 // Whether the cached pool can hold what has these memory type bits: a type of its own the requirements list.
@@ -201,7 +200,7 @@ bool take_range(MemoryBlock& block, VkDeviceSize size, VkDeviceSize alignment, V
 
 bool add_block(MemoryPool& pool, VkDeviceSize minSize) noexcept {
   const VkDeviceSize exactSize = align_up(minSize, pool.granularity);
-  if (pool.refused != 0 && exactSize >= pool.refused) {
+  if (!pool.ui && pool.refused != 0 && exactSize >= pool.refused) {
     return false;
   }
   VkDeviceSize size = pool.wholeBlocks ? std::max(pool.blockSize, exactSize) : exactSize;
@@ -224,8 +223,10 @@ bool add_block(MemoryPool& pool, VkDeviceSize minSize) noexcept {
   }
   if (result != VK_SUCCESS) {
     // The first pool running out is expected; the second takes over.
-    Log.warn("vkAllocateMemory: {} bytes of {}: {}", size, pool.name, static_cast<int>(result));
-    pool.refused = size;
+    if (!pool.ui) {
+      Log.warn("vkAllocateMemory: {} bytes of {}: {}", size, pool.name, static_cast<int>(result));
+      pool.refused = size;
+    }
     return false;
   }
   void* mapped = nullptr;
@@ -288,8 +289,8 @@ bool create_render_pass(bool depth, Load colorLoad, Load depthLoad, DepthStore d
           .format = VK_FORMAT_D24_UNORM_S8_UINT,
           .samples = samples,
           .loadOp = load_op(depthLoad),
-          .storeOp = depthStore == DepthStore::Dropped ? VK_ATTACHMENT_STORE_OP_DONT_CARE
-                                                       : VK_ATTACHMENT_STORE_OP_STORE,
+          .storeOp =
+              depthStore == DepthStore::Dropped ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
           .stencilLoadOp = stencil ? load_op(depthLoad) : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
           .stencilStoreOp = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
           .initialLayout = depthBefore,
@@ -873,7 +874,7 @@ void free_allocation(const Allocation& allocation) noexcept {
     }
   }
   block->free.emplace(start, end - start);
-  if (!block->empty() || (pool.keepsEmpty && std::ranges::count_if(pool.blocks, &MemoryBlock::empty) < 2)) {
+  if (!block->empty() || (!pool.ui && std::ranges::count_if(pool.blocks, &MemoryBlock::empty) < 2)) {
     return;
   }
   vkFreeMemory(g_device, block->memory, nullptr);
