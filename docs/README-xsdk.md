@@ -40,7 +40,7 @@ Aurora builds inside a game's CMake build, with xsdk's toolchain file, as Duskli
 -   **Frame captures:** `aurora_capture_frame` writes a presented frame as a PPM, as Xenia shows none of vulkan4xenon's
     frames.
 -   **Libraries built for xsdk:** abseil, sqlite (`lib/sqlite_os_xsdk.c`), Tracy (`lib/tracy_xsdk.cpp`) and ImGui; RmlUi
-    runs on a backend that doesn't draw it, drawing nothing.
+    records what it draws on the game thread (`lib/rmlui/RecordingRenderInterface.cpp`), for the backend to draw.
 -   `AURORA_ENABLE_DIAGNOSTICS` times the workers, the GPU and each frame's path, and keeps memory's peaks.
 
 ## What it draws on the console
@@ -50,11 +50,12 @@ Aurora builds inside a game's CMake build, with xsdk's toolchain file, as Duskli
 -   The EFB at 1280x720 at 1, 2 or 4 samples, past eDRAM in vulkan4xenon's tiled passes; EFB copies, depth copies and
     `GXPeekZ`; palette conversions of EFB copies of 8-bit indices, such as Twilight Princess's minimap.
 -   Textures as upstream converts them, to RGBA8, but CMPR as BC1 where it's opaque, and I8 as R8.
+-   RmlUi's documents, Dusklight's menus among them, and Aurora's ImGui overlay, into a UI image the present composites
+    over the EFB (`ui.cpp`), on frames where something shows. RmlUi's opacity filter is drawn; its blur and drop-shadow
+    filters, its other filters and its shaders draw nothing.
 
 Not yet, each skipped where the backend meets it:
 
--   RmlUi's documents, Dusklight's menus among them, and Aurora's ImGui overlay (`encoding.cpp`). vulkan4xenon's
-    milestone 16 is to draw Dusklight's menus.
 -   The WebGPU extension's custom draws, texture copies and encoder tasks, which mods use.
 -   Pipelines with destination alpha, a logic op other than clear, copy and noop, or polygon offset: their draws are
     skipped and logged (`pipeline.cpp`, `unsupported`).
