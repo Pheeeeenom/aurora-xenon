@@ -233,7 +233,6 @@ void draw_texture(VkCommandBuffer cmd, VkRenderPass renderPass, VkFramebuffer fr
                   const std::array<float, 4>& source) noexcept;
 
 // ui.cpp: RmlUi's list and ImGui's lists drawn into the UI image, made while something shows.
-bool initialize_ui() noexcept;
 void shutdown_ui() noexcept;
 // Render worker, before the frame's present: the textures staged for the UI copied in, then, if either draws, the
 // UI's passes. The UI image they drew into, or null when nothing drew: then no pass was recorded, and the UI's

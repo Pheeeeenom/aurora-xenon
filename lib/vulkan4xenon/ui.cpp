@@ -38,20 +38,18 @@ struct Ring {
 
 // Made at the first frame anything shows and released at the first that shows nothing, as Dusklight runs with 42 to 70
 // MB free: the UI image the present composites, a D24S8 for RmlUi's clip mask, which takes no memory as it's never
-// sampled, RmlUi's layers from 1, and a ring for each slot.
+// sampled, a white texel drawn with where RmlUi samples nothing, as Dawn's null texture is
+// (rmlui/WebGPURenderInterface.cpp, CreateNullTexture), RmlUi's layers from 1, and a ring for each slot.
 struct Targets {
   uint32_t width = 0;
   uint32_t height = 0;
   std::shared_ptr<backend::Texture> image;
   std::shared_ptr<backend::Texture> stencil;
+  std::shared_ptr<backend::Texture> white;
   std::vector<std::shared_ptr<backend::Texture>> layers;
   std::array<std::shared_ptr<Ring>, detail::FrameSlotCount> rings;
 };
 Targets g_targets;
-
-// Drawn with where RmlUi samples nothing, as Dawn's null texture is (rmlui/WebGPURenderInterface.cpp,
-// CreateNullTexture).
-std::shared_ptr<backend::Texture> g_white;
 
 // ImGui's textures: its atlas, uploaded once ImGui draws, and aurora_imgui_add_texture's.
 struct ImGuiTexture {
@@ -106,10 +104,22 @@ bool make_targets(uint32_t width, uint32_t height) noexcept {
   g_targets = {};
   auto image = make_target(width, height, false, "UI image");
   auto stencil = make_target(width, height, true, "UI stencil");
-  if (!image || !stencil) {
+  auto white = make_texture({
+      .width = 1,
+      .height = 1,
+      .mips = 1,
+      .format = TextureFormat::RGBA8Unorm,
+      .gxFormat = InvalidTextureFormat,
+      .usage = backend::TextureUsage::Sampled,
+      .label = "UI white",
+      .ui = true,
+  });
+  if (!image || !stencil || !white) {
     Log.error("No memory for the UI's {}x{} image; it isn't drawn", width, height);
     return false;
   }
+  // Its whole memory, which is the texel whatever the tiling.
+  std::memset(white->memory.mapped, 0xFF, white->memory.size);
   for (auto& ring : g_targets.rings) {
     ring = std::make_shared<Ring>();
     if (!create_buffer(RingBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true, "UI ring",
@@ -122,6 +132,7 @@ bool make_targets(uint32_t width, uint32_t height) noexcept {
   g_targets.height = height;
   g_targets.image = std::move(image);
   g_targets.stencil = std::move(stencil);
+  g_targets.white = std::move(white);
   return true;
 }
 
@@ -317,7 +328,7 @@ void replay_rml(Replay& replay) noexcept {
     switch (op.type) {
     case ui::OpType::Draw:
       draw(replay, op, op.geometry->vertices.data(), op.geometry->vertices.size(), op.geometry->indices.data(),
-           op.geometry->indices.size(), op.texture ? *op.texture : *g_white, true, replay.rml.matrices[op.matrix]);
+           op.geometry->indices.size(), op.texture ? *op.texture : *g_targets.white, true, replay.rml.matrices[op.matrix]);
       break;
     case ui::OpType::PushLayer:
       replay.top = op.destination;
@@ -441,27 +452,8 @@ ImTextureID make_imgui_texture(ImGuiTexture& texture, uint32_t width, uint32_t h
 }
 } // namespace
 
-bool initialize_ui() noexcept {
-  g_white = make_texture({
-      .width = 1,
-      .height = 1,
-      .mips = 1,
-      .format = TextureFormat::RGBA8Unorm,
-      .gxFormat = InvalidTextureFormat,
-      .usage = backend::TextureUsage::Sampled,
-      .label = "UI white",
-  });
-  if (!g_white) {
-    return false;
-  }
-  // Its whole memory, which is the texel whatever the tiling.
-  std::memset(g_white->memory.mapped, 0xFF, g_white->memory.size);
-  return true;
-}
-
 void shutdown_ui() noexcept {
   g_targets = {};
-  g_white.reset();
   g_atlas.gpu.reset();
   std::lock_guard lock{g_imguiMutex};
   g_imguiUploads.clear();

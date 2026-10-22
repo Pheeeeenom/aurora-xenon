@@ -450,11 +450,6 @@ bool initialize(AuroraBackend& backend) noexcept {
     return false;
   }
   log_memory_step("the frames");
-  if (!initialize_ui()) {
-    shutdown();
-    return false;
-  }
-  log_memory_step("the UI");
   backend = BACKEND_VULKAN;
   Log.info("vulkan4xenon backend: {}x{} EFB", efb_size().width, efb_size().height);
   return true;
