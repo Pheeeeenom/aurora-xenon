@@ -60,7 +60,8 @@ void shutdown_device() noexcept;
 // docs/SUPPORT.md, Formats).
 bool samples_bc1() noexcept;
 
-// Sub-allocated from blocks of the layer's one memory type: whole blocks while it can, then exact ones.
+// Sub-allocated from blocks of the layer's one memory type: whole blocks while it can, then exact ones. The UI's (ui)
+// come from pools of their own, whose blocks go back to the layer as they empty.
 struct Allocation {
   VkDeviceMemory memory = VK_NULL_HANDLE;
   VkDeviceSize offset = 0;
@@ -68,7 +69,7 @@ struct Allocation {
   uint8_t* mapped = nullptr;
   uint32_t pool = 0;
 };
-bool allocate(const VkMemoryRequirements& requirements, Allocation& out) noexcept;
+bool allocate(const VkMemoryRequirements& requirements, Allocation& out, bool ui = false) noexcept;
 void free_allocation(const Allocation& allocation) noexcept;
 
 // A buffer with memory of its own, mapped for its whole life.

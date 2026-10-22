@@ -25,14 +25,19 @@ namespace {
 // (vulkan4xenon's docs/SUPPORT.md, Memory and buffers). The GPU's memory type is both the first pools': the first in
 // 8 MiB blocks while it can, then exact ones, the second in exact ones. The third takes the layer's cached type, which
 // it offers only to buffers that are only copied from: copies run on the CPU, which reads cached memory at the cache's
-// speed, where the GPU's is read uncached.
+// speed, where the GPU's is read uncached. The UI's two, one of each type, take 1 MiB blocks and keep no empty one, so
+// what the UI releases when nothing shows goes back: Dusklight runs with 42 to 70 MB free (vulkan4xenon milestone 16).
 constexpr VkDeviceSize MemoryBlockSize = 8 * 1024 * 1024;
+// RmlUi's textures share them: 1.06 MB of fonts and images, and up to 3.12 MB of saved layers, on the console.
+constexpr VkDeviceSize UiBlockSize = 1024 * 1024;
 constexpr VkDeviceSize VideoRamGranularity = 64 * 1024;
 constexpr VkDeviceSize MainRamGranularity = 64 * 1024;
 constexpr VkDeviceSize CachedGranularity = 4 * 1024;
 constexpr uint32_t VideoPool = 0;
 constexpr uint32_t MainPool = 1;
 constexpr uint32_t CachedPool = 2;
+constexpr uint32_t UiPool = 3;
+constexpr uint32_t UiCachedPool = 4;
 // The waiter only waits: 64 KiB, not a pthread's default.
 constexpr size_t WaiterStackSize = 64 * 1024;
 
@@ -49,6 +54,9 @@ struct MemoryBlock {
 struct MemoryPool {
   const char* name;
   VkDeviceSize granularity;
+  VkDeviceSize blockSize = MemoryBlockSize;
+  // An empty block is kept, so a load's uploads don't take and give back a kernel block every frame.
+  bool keepsEmpty = true;
   bool wholeBlocksFirst = true;
   uint32_t type = UINT32_MAX;
   bool wholeBlocks = true;
@@ -99,13 +107,19 @@ std::array<VkRenderPass, 3> g_presentPasses{};
 std::array<std::array<VkRenderPass, 2>, 2> g_uiPasses{};
 
 std::mutex g_memoryMutex;
-std::array<MemoryPool, 3> g_pools{
+std::array<MemoryPool, 5> g_pools{
     MemoryPool{.name = "memory in whole blocks", .granularity = VideoRamGranularity},
     MemoryPool{.name = "memory in exact blocks",
                .granularity = MainRamGranularity,
                .wholeBlocksFirst = false,
                .wholeBlocks = false},
     MemoryPool{.name = "cached memory", .granularity = CachedGranularity},
+    MemoryPool{
+        .name = "the UI's memory", .granularity = VideoRamGranularity, .blockSize = UiBlockSize, .keepsEmpty = false},
+    MemoryPool{.name = "the UI's cached memory",
+               .granularity = CachedGranularity,
+               .blockSize = UiBlockSize,
+               .keepsEmpty = false},
 };
 
 // Whether the cached pool can hold what has these memory type bits: a type of its own the requirements list.
@@ -190,7 +204,7 @@ bool add_block(MemoryPool& pool, VkDeviceSize minSize) noexcept {
   if (pool.refused != 0 && exactSize >= pool.refused) {
     return false;
   }
-  VkDeviceSize size = pool.wholeBlocks ? std::max(MemoryBlockSize, exactSize) : exactSize;
+  VkDeviceSize size = pool.wholeBlocks ? std::max(pool.blockSize, exactSize) : exactSize;
   VkDeviceMemory memory = VK_NULL_HANDLE;
   VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
   while (true) {
@@ -438,6 +452,8 @@ bool find_memory_types() noexcept {
       break;
     }
   }
+  g_pools[UiPool].type = g_pools[VideoPool].type;
+  g_pools[UiCachedPool].type = g_pools[CachedPool].type;
   return true;
 }
 
@@ -792,12 +808,14 @@ void shutdown_device() noexcept {
 
 // A buffer can share a page with an image: the layer's bufferImageGranularity is 1 (its docs/SUPPORT.md, Physical
 // device).
-bool allocate(const VkMemoryRequirements& requirements, Allocation& out) noexcept {
+bool allocate(const VkMemoryRequirements& requirements, Allocation& out, bool ui) noexcept {
+  constexpr std::array<uint32_t, 3> GamePools{CachedPool, VideoPool, MainPool};
+  constexpr std::array<uint32_t, 2> UiPools{UiCachedPool, UiPool};
   std::lock_guard lock{g_memoryMutex};
-  for (uint32_t poolIndex : {CachedPool, VideoPool, MainPool}) {
+  for (uint32_t poolIndex : ui ? std::span<const uint32_t>{UiPools} : std::span<const uint32_t>{GamePools}) {
     auto& pool = g_pools[poolIndex];
     if ((requirements.memoryTypeBits & (1u << pool.type)) == 0 ||
-        (poolIndex == CachedPool && !fits_cached(requirements.memoryTypeBits))) {
+        ((poolIndex == CachedPool || poolIndex == UiCachedPool) && !fits_cached(requirements.memoryTypeBits))) {
       continue;
     }
     for (size_t attempt = 0; attempt < 2; ++attempt) {
@@ -855,17 +873,21 @@ void free_allocation(const Allocation& allocation) noexcept {
     }
   }
   block->free.emplace(start, end - start);
-  // An empty block goes back to the layer, but one is kept, so a load's uploads don't take and give back a kernel block
-  // every frame.
-  if (!block->empty() || std::ranges::count_if(pool.blocks, &MemoryBlock::empty) < 2) {
+  if (!block->empty() || (pool.keepsEmpty && std::ranges::count_if(pool.blocks, &MemoryBlock::empty) < 2)) {
     return;
   }
   vkFreeMemory(g_device, block->memory, nullptr);
 #ifdef AURORA_DIAGNOSTICS
   pool.taken -= block->size;
 #endif
+  const uint32_t type = pool.type;
   pool.blocks.erase(block);
-  given_back(pool);
+  // Every pool of its type may ask again: the UI's memory going back is the game's to take.
+  for (auto& other : g_pools) {
+    if (other.type == type) {
+      given_back(other);
+    }
+  }
 }
 
 bool create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool videoRam, const char* label,
@@ -1042,6 +1064,18 @@ bool submit_frame(size_t slot, uint32_t imageIndex, bool present, [[maybe_unused
 // The GPU's time since the last call, frame by frame as wait_for_frames measures it.
 extern "C" unsigned long long aurora_gpu_take_busy_ns() {
   return aurora::gfx::vulkan4xenon::g_gpuBusyNs.exchange(0, std::memory_order_relaxed);
+}
+
+// Each pool's memory now, three values a pool: taken from vulkan4xenon, in use, and its blocks; the game's whole
+// blocks, exact blocks and cached memory, then the UI's memory and cached memory.
+extern "C" void aurora_vulkan4xenon_pools(unsigned long long* out) {
+  using namespace aurora::gfx::vulkan4xenon;
+  std::lock_guard lock{g_memoryMutex};
+  for (size_t i = 0; i < g_pools.size(); ++i) {
+    out[i * 3] = g_pools[i].taken;
+    out[i * 3 + 1] = g_pools[i].used;
+    out[i * 3 + 2] = g_pools[i].blocks.size();
+  }
 }
 
 // Memory taken from vulkan4xenon at peak by each pool, and the part of it in use at peak.

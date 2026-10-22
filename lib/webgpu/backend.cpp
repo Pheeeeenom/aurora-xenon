@@ -161,7 +161,9 @@ std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept {
   });
 }
 
-std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage) noexcept {
+std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
+                                           bool ui) noexcept {
+  (void)ui;
   const auto copyBytesPerRow = AURORA_ALIGN(bytesPerRow, limits().textureRowAlignment);
   const uint64_t uploadSize = copyBytesPerRow * rowsPerImage;
   const wgpu::BufferDescriptor descriptor{

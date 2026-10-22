@@ -47,6 +47,13 @@ struct Texture {
 #ifdef AURORA_DIAGNOSTICS
 // The bytes of the textures RmlUi holds: made from texels, and saved from layers.
 std::array<std::atomic<uint64_t>, 2> g_textureBytes{};
+// The bytes of the geometry RmlUi has compiled, copied; in 32 bits, as GCC's 64-bit sums are rldic, which Xenia skips
+// (xsdk's CLAUDE.md).
+std::atomic<size_t> g_geometryBytes = 0;
+
+size_t bytes_of(const gfx::ui::Geometry& geometry) noexcept {
+  return geometry.vertices.size() * sizeof(gfx::ui::Vertex) + geometry.indices.size() * sizeof(uint32_t);
+}
 
 Rml::TextureHandle counted(Texture* texture, Rml::Vector2i size, bool saved) noexcept {
   texture->bytes = static_cast<uint64_t>(size.x) * static_cast<uint64_t>(size.y) * 4;
@@ -179,6 +186,9 @@ Rml::CompiledGeometryHandle RecordingRenderInterface::CompileGeometry(Rml::Span<
   data.vertices.resize(vertices.size());
   std::memcpy(data.vertices.data(), vertices.data(), vertices.size() * sizeof(Rml::Vertex));
   data.indices.assign(indices.begin(), indices.end());
+#ifdef AURORA_DIAGNOSTICS
+  g_geometryBytes += bytes_of(data);
+#endif
   return reinterpret_cast<Rml::CompiledGeometryHandle>(geometry);
 }
 
@@ -204,7 +214,11 @@ void RecordingRenderInterface::RenderGeometry(Rml::CompiledGeometryHandle geomet
 }
 
 void RecordingRenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry) {
-  delete reinterpret_cast<std::shared_ptr<gfx::ui::Geometry>*>(geometry);
+  auto* released = reinterpret_cast<std::shared_ptr<gfx::ui::Geometry>*>(geometry);
+#ifdef AURORA_DIAGNOSTICS
+  g_geometryBytes -= bytes_of(**released);
+#endif
+  delete released;
 }
 
 Rml::TextureHandle RecordingRenderInterface::make_texture(const Rml::byte* rgba, Rml::Vector2i size) noexcept {
@@ -221,8 +235,9 @@ Rml::TextureHandle RecordingRenderInterface::make_texture(const Rml::byte* rgba,
       .gxFormat = gfx::InvalidTextureFormat,
       .usage = gfx::backend::TextureUsage::Sampled,
       .label = "RmlUi texture",
+      .ui = true,
   });
-  auto data = gpu ? gfx::backend::stage_upload(rgba, width * 4, height) : nullptr;
+  auto data = gpu ? gfx::backend::stage_upload(rgba, width * 4, height, true) : nullptr;
   if (!data) {
     Log.error("No memory for a {}x{} texture", width, height);
     return 0;
@@ -406,6 +421,7 @@ Rml::TextureHandle RecordingRenderInterface::SaveLayerAsTexture() {
       .gxFormat = gfx::InvalidTextureFormat,
       .usage = gfx::backend::TextureUsage::Render,
       .label = "RmlUi saved layer",
+      .ui = true,
   });
   if (!gpu) {
     Log.error("No memory for a {}x{} saved layer", region.width, region.height);
@@ -452,5 +468,10 @@ void register_identity_filters() noexcept {
 extern "C" void aurora_rmlui_texture_bytes(unsigned long long* out) {
   out[0] = aurora::rmlui::g_textureBytes[0].load(std::memory_order_relaxed);
   out[1] = aurora::rmlui::g_textureBytes[1].load(std::memory_order_relaxed);
+}
+
+// The bytes of the geometry RmlUi has compiled, as the recorder copied it.
+extern "C" unsigned long long aurora_rmlui_geometry_bytes() {
+  return aurora::rmlui::g_geometryBytes.load(std::memory_order_relaxed);
 }
 #endif

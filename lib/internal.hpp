@@ -16,6 +16,14 @@
 
 using namespace std::string_view_literals;
 
+#if defined(AURORA_DIAGNOSTICS) && defined(__XSDK__)
+// The title's physical pages and newlib's heap in use after a step, and what the step took (aurora.cpp).
+extern "C" void aurora_log_memory_step(const char* step);
+inline void log_memory_step(const char* step) noexcept { aurora_log_memory_step(step); }
+#else
+inline void log_memory_step(const char*) noexcept {}
+#endif
+
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #ifndef SBIG
 #define SBIG(q)                                                                                                        \

@@ -79,12 +79,15 @@ struct TextureDesc {
   u32 gxFormat;
   TextureUsage usage;
   const char* label;
+  // The UI's, which a backend may keep apart from the game's memory, so that what the UI releases goes back at once.
+  bool ui = false;
 };
 
 std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept;
 // Game thread or FIFO worker: an upload too big for the frame's pool, its rows copied into memory of its own at the
-// pool's row pitch. Null when there is no memory for it.
-std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage) noexcept;
+// pool's row pitch, or one of the UI's (ui), as TextureDesc::ui. Null when there is no memory for it.
+std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
+                                           bool ui = false) noexcept;
 } // namespace aurora::gfx::backend
 
 namespace aurora::gfx {

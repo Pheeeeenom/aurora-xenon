@@ -94,6 +94,7 @@ std::shared_ptr<backend::Texture> make_target(uint32_t width, uint32_t height, b
           .gxFormat = InvalidTextureFormat,
           .usage = depth ? backend::TextureUsage::Depth : backend::TextureUsage::Render,
           .label = label,
+          .ui = true,
       },
       VK_SAMPLE_COUNT_1_BIT, 0, false);
 }
@@ -424,8 +425,9 @@ ImTextureID make_imgui_texture(ImGuiTexture& texture, uint32_t width, uint32_t h
       .gxFormat = InvalidTextureFormat,
       .usage = backend::TextureUsage::Sampled,
       .label = "ImGui texture",
+      .ui = true,
   });
-  auto data = gpu ? backend::stage_upload(rgba8, width * 4, height) : nullptr;
+  auto data = gpu ? backend::stage_upload(rgba8, width * 4, height, true) : nullptr;
   if (!data) {
     Log.error("No memory for ImGui's {}x{} texture", width, height);
     return ImTextureID{};
@@ -667,8 +669,18 @@ extern "C" void aurora_vulkan4xenon_request_ui_readback() {
   aurora::gfx::vulkan4xenon::g_readbackReady = false;
 }
 
-// The frame read back, its bytes red to alpha a texel, row by row, valid till the next request: the EFB, the UI image
-// and their composite on the GPU, ui and composite null when the UI drew nothing. False until it's ready.
+// Frees the frame read back, 11 MB at 1280x720.
+extern "C" void aurora_vulkan4xenon_release_ui_readback() {
+  using namespace aurora::gfx::vulkan4xenon;
+  std::lock_guard lock{g_readbackMutex};
+  g_readbackReady = false;
+  g_readbackEfb = {};
+  g_readbackUi = {};
+  g_readbackComposite = {};
+}
+
+// The frame read back, its bytes red to alpha a texel, row by row, valid till the next request or release: the EFB,
+// the UI image and their composite on the GPU, ui and composite null when the UI drew nothing. False until it's ready.
 extern "C" bool aurora_vulkan4xenon_take_ui_readback(const unsigned char** efb, const unsigned char** ui,
                                                      const unsigned char** composite, unsigned int* width,
                                                      unsigned int* height) {

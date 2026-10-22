@@ -332,7 +332,8 @@ std::shared_ptr<backend::Texture> make_texture(const backend::TextureDesc& desc,
   }
   VkMemoryRequirements requirements;
   vkGetImageMemoryRequirements(g_device, texture->image, &requirements);
-  if (!allocate(requirements, texture->memory) ||
+  // A target that takes no memory, as the UI's D24S8, binds the game's: it would take a block of the UI's.
+  if (!allocate(requirements, texture->memory, desc.ui && requirements.size != 0) ||
       !succeeded(vkBindImageMemory(g_device, texture->image, texture->memory.memory, texture->memory.offset),
                  "vkBindImageMemory")) {
     Log.error("No memory for {} ({}x{})", desc.label, desc.width, desc.height);
@@ -430,6 +431,7 @@ bool initialize(AuroraBackend& backend) noexcept {
   if (!initialize_device()) {
     return false;
   }
+  log_memory_step("vulkan4xenon's device");
   // CMPR without transparent texels goes to the GPU as BC1, an eighth of RGBA8's size, where the layer has it.
   g_limits.cmprAsBc1 = samples_bc1();
   Log.info("CMPR textures {}", g_limits.cmprAsBc1 ? "as BC1 where opaque" : "as RGBA8: vulkan4xenon has no BC1");
@@ -437,10 +439,22 @@ bool initialize(AuroraBackend& backend) noexcept {
     shutdown_device();
     return false;
   }
-  if (!initialize_textures() || !initialize_frames() || !initialize_ui()) {
+  log_memory_step("the pipelines and the shader pack");
+  if (!initialize_textures()) {
     shutdown();
     return false;
   }
+  log_memory_step("the textures");
+  if (!initialize_frames()) {
+    shutdown();
+    return false;
+  }
+  log_memory_step("the frames");
+  if (!initialize_ui()) {
+    shutdown();
+    return false;
+  }
+  log_memory_step("the UI");
   backend = BACKEND_VULKAN;
   Log.info("vulkan4xenon backend: {}x{} EFB", efb_size().width, efb_size().height);
   return true;
@@ -469,7 +483,8 @@ void refresh_surface() noexcept {}
 // Every texture tiled, whatever its size (vulkan4xenon's docs/SUPPORT.md, Images).
 std::shared_ptr<Texture> create_texture(const TextureDesc& desc) noexcept { return make_texture(desc); }
 
-std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage) noexcept {
+std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPerRow, uint32_t rowsPerImage,
+                                           bool ui) noexcept {
   const uint32_t pitch = AURORA_ALIGN(bytesPerRow, limits().textureRowAlignment);
   auto upload = std::make_shared<UploadBuffer>();
   const VkBufferCreateInfo info{
@@ -483,7 +498,7 @@ std::shared_ptr<UploadBuffer> stage_upload(const uint8_t* data, uint32_t bytesPe
   }
   VkMemoryRequirements requirements;
   vkGetBufferMemoryRequirements(g_device, upload->buffer, &requirements);
-  if (!allocate(requirements, upload->memory) ||
+  if (!allocate(requirements, upload->memory, ui) ||
       !succeeded(vkBindBufferMemory(g_device, upload->buffer, upload->memory.memory, upload->memory.offset),
                  "vkBindBufferMemory")) {
     Log.error("No memory for an upload of {} bytes past the frame's pool", info.size);

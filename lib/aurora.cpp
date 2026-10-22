@@ -28,6 +28,13 @@
 #include <SDL3/SDL_filesystem.h>
 #include <magic_enum.hpp>
 
+#if defined(AURORA_DIAGNOSTICS) && defined(__XSDK__)
+#include <malloc.h>
+#include <xsdk/kernel.h>
+
+#include <mutex>
+#endif
+
 #include "system_info.hpp"
 #include "tracy/Tracy.hpp"
 
@@ -83,6 +90,7 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 
 #ifdef AURORA_ENABLE_GX
   // The backend makes the window, device and surface.
+  log_memory_step("Aurora's start");
   AuroraBackend selectedBackend = config.desiredBackend;
   AURORA_ASSERT(gfx::backend::initialize(selectedBackend), "Error creating window: {}", SDL_GetError());
 #else
@@ -99,8 +107,11 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 
 #ifdef AURORA_ENABLE_GX
   gfx::initialize();
+  log_memory_step("gfx");
   gx::fifo::init();
+  log_memory_step("the FIFO");
   imgui::create_context();
+  log_memory_step("ImGui's context");
 #endif
   const auto size = window::get_window_size();
   Log.info("Using framebuffer size {}x{} scale {}", size.fb_width, size.fb_height, size.scale);
@@ -108,11 +119,14 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   if (g_config.imGuiInitCallback != nullptr) {
     g_config.imGuiInitCallback(&size);
   }
+  log_memory_step("the title's ImGui start");
   imgui::initialize();
+  log_memory_step("ImGui");
 #endif
 
 #ifdef AURORA_ENABLE_RMLUI
   rmlui::initialize(size);
+  log_memory_step("RmlUi");
 #endif
 
   g_initialFrame = true;
@@ -245,3 +259,26 @@ void aurora_set_resampler(AuroraSampler sampler) { (void)sampler; }
 #endif
 void aurora_set_timescale(float scale) { aurora::time::set_scale(scale); }
 float aurora_get_timescale() { return aurora::time::scale(); }
+
+#if defined(AURORA_DIAGNOSTICS) && defined(__XSDK__)
+// MmQueryStatistics counts 4 KB pages (xenia:src/xenia/kernel/xboxkrnl/xboxkrnl_memory.cc:496), the title's physical
+// ones the GPU's memory; newlib's heap holds the rest. From any thread.
+void aurora_log_memory_step(const char* step) {
+  static std::mutex mutex;
+  static int32_t lastPhysical = 0;
+  static int32_t lastHeap = 0;
+  MM_QUERY_STATISTICS_RESULT statistics{};
+  statistics.size = sizeof(statistics);
+  if (!NT_SUCCESS(MmQueryStatistics(&statistics))) {
+    return;
+  }
+  // In KB, in 32 bits: GCC's 64-bit arithmetic here is rldic, which Xenia skips (xsdk's CLAUDE.md).
+  const auto physical = static_cast<int32_t>(statistics.title.physical_pages * 4u);
+  const auto heap = static_cast<int32_t>(static_cast<uint32_t>(mallinfo().uordblks) / 1024u);
+  std::lock_guard lock{mutex};
+  aurora::Log.info("Memory, {}: {} KB physical, {} KB of newlib's heap in use; {:+} KB and {:+} KB since the last",
+                   step, physical, heap, physical - lastPhysical, heap - lastHeap);
+  lastPhysical = physical;
+  lastHeap = heap;
+}
+#endif

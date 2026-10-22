@@ -21,7 +21,7 @@ namespace aurora::gfx::backend {
 struct Texture {};
 struct UploadBuffer {};
 std::shared_ptr<Texture> create_texture(const TextureDesc&) noexcept { return std::make_shared<Texture>(); }
-std::shared_ptr<UploadBuffer> stage_upload(const uint8_t*, uint32_t, uint32_t) noexcept {
+std::shared_ptr<UploadBuffer> stage_upload(const uint8_t*, uint32_t, uint32_t, bool) noexcept {
   return std::make_shared<UploadBuffer>();
 }
 } // namespace aurora::gfx::backend
